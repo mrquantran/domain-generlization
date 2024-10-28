@@ -5,6 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models
 from torchvision import transforms
+from torchvision import models
+from transformers import ViTModel
+
 import numpy as np
 
 from domainbed.lib import wide_resnet
@@ -14,145 +17,225 @@ import copy
 from domainbed.cyclegan.networks import define_G
 from domainbed.cyclegan.utils import get_sources
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class GLOGenerator(nn.Module):
+    """Generator network following GLO paper architecture"""
+
+    def __init__(self, latent_dim=100, output_dim=3):
+        super(GLOGenerator, self).__init__()
+
+        # Following GLO paper architecture
+        self.fc = nn.Linear(latent_dim, 14 * 14 * 256)
+
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        x = self.fc(z)
+        x = x.view(-1, 256, 14, 14)
+        x = self.deconv(x)
+        return x
+
+
+class GLOModule(nn.Module):
+    def __init__(self, latent_dim=100, num_domains=3, batch_size=32):
+        super(GLOModule, self).__init__()
+        self.latent_dim = latent_dim
+        self.num_domains = num_domains
+        self.batch_size = batch_size
+
+        # Generator following GLO paper
+        self.generator = GLOGenerator(latent_dim)
+
+        # Learnable latent codes for each domain - key difference from original GLO
+        # We maintain separate latent codes for each domain
+        self.domain_latents = nn.Parameter(
+            torch.randn(num_domains, batch_size, latent_dim)
+        )
+
+        # Initialize with normal distribution as per GLO paper
+        nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
+
+    def forward(self, x, domain_idx):
+        batch_size = x.size(0)
+
+        # Get corresponding latent codes for the domain
+        z = self.domain_latents[domain_idx, :batch_size]
+
+        # Generate images
+        generated = self.generator(z)
+        return generated, z
+
+
+class ProjectionHead(nn.Module):
+    """Projection head for contrastive learning"""
+
+    def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
+        super(ProjectionHead, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class NTXentLoss(nn.Module):
+    """NT-Xent loss for contrastive learning"""
+
+    def __init__(self, temperature=0.5):
+        super(NTXentLoss, self).__init__()
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, z_i, z_j):
+        batch_size = z_i.size(0)
+
+        z = torch.cat([z_i, z_j], dim=0)
+        sim = torch.mm(z, z.t()) / self.temperature
+
+        sim_i_j = torch.diag(sim, batch_size)
+        sim_j_i = torch.diag(sim, -batch_size)
+
+        positive_samples = torch.cat([sim_i_j, sim_j_i], dim=0).reshape(-1, 1)
+        mask = torch.ones_like(sim, dtype=torch.bool)
+        mask.fill_diagonal_(0)
+
+        negative_samples = sim[mask].reshape(2 * batch_size, -1)
+
+        labels = torch.zeros(2 * batch_size).long().to(positive_samples.device)
+        logits = torch.cat([positive_samples, negative_samples], dim=1)
+
+        loss = self.criterion(logits, labels)
+        return loss
+
 
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
         super(CycleMixLayer, self).__init__()
-
-        if torch.cuda.is_available():
-            gpu_id = [0]
-        else:
-            gpu_id = []
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
-        if len(self.sources) == 3:
-            source1, source2, source3 = get_sources(hparams["dataset"], hparams["test_envs"])
+        # Use the same feature dimension as the featurizer
+        self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
-            self.source1 = source1
-            self.source2 = source2
-            self.source3 = source3
+        # GLO components
+        self.glo = GLOModule(
+            latent_dim=hparams.get("latent_dim", 100),
+            num_domains=len(self.sources),
+            batch_size=hparams["batch_size"],
+        ).to(device)
 
-            self.gan1_2 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
+        # Projection head for contrastive learning
+        self.projection = ProjectionHead(
+            input_dim=self.feature_dim,  # Using ResNet18 feature dimension
+            hidden_dim=hparams.get("proj_hidden_dim", 2048),
+            output_dim=hparams.get("proj_output_dim", 128),
+        ).to(device)
 
-            self.gan1_2.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source1 + '2' + source2 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan1_2.eval()
+        # Contrastive loss
+        self.nt_xent = NTXentLoss(temperature=hparams.get("temperature", 0.5))
 
-            self.gan1_3 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
-
-            self.gan1_3.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source1 + '2' + source3 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan1_3.eval()
-
-            self.gan2_1 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
-
-            self.gan2_1.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source2 + '2' + source1 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan2_1.eval()
-
-            self.gan2_3 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
-
-            self.gan2_3.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source2 + '2' + source3 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan2_3.eval()
-
-            self.gan3_1 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
-
-            self.gan3_1.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source3 + '2' + source1 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan3_1.eval()
-
-            self.gan3_2 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
-
-            self.gan3_2.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source3 + '2' + source2 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan3_2.eval()
-        elif len(self.sources) == 2:
-            source1, source2 = get_sources(hparams["dataset"], hparams["test_envs"])
-            self.source1 = source1
-            self.source2 = source2
-
-            self.gan1_2 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
-
-            self.gan1_2.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source1 + '2' + source2 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan1_2.eval()
-
-            self.gan2_1 = define_G(3, 3, 64, 'resnet_9blocks', 'instance',
-                                   False, 'normal', 0.02, gpu_id)
-
-            self.gan2_1.load_state_dict(
-                torch.load('./domainbed/cyclegan/weights/PACS/' + source2 + '2' + source1 + '.pth',
-                           map_location=torch.device(self.device)))
-            self.gan2_1.eval()
-        else:
-            raise NotImplementedError
-
-    def forward(self, x: list):
+    def forward(self, x: list, featurizer):
+        """
+        Args:
+            x: list of domain batches
+            featurizer: ResNet18 feature extractor from DomainBed
+        """
         if len(self.sources) == 3:
             b1, b2, b3 = x
             x_1, y_task_1 = b1
             x_2, y_task_2 = b2
             x_3, y_task_3 = b3
 
-            del b1, b2, b3
+            # Generate domain-mixed samples using GLO
+            x_1_hat, z1 = self.glo(x_1, 0)
+            x_2_hat, z2 = self.glo(x_2, 1)
+            x_3_hat, z3 = self.glo(x_3, 2)
 
-            # GAN TRANSFORMATIONS
-            norm = transforms.Compose([transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+            # Extract features using ResNet18 featurizer
+            feat_1 = featurizer(x_1)
+            feat_2 = featurizer(x_2)
+            feat_3 = featurizer(x_3)
 
-            alpha, beta = np.round(np.random.dirichlet(np.ones(2)), 2)
+            # Project features for contrastive learning
+            proj_1 = self.projection(feat_1)
+            proj_2 = self.projection(feat_2)
+            proj_3 = self.projection(feat_3)
 
-            x_1_hat = x_1 + (alpha * self.gan1_2(x_1)) + (beta * self.gan1_3(x_1))
-            x_1_hat.detach()
+            # Normalize projections
+            proj_1 = F.normalize(proj_1, dim=1)
+            proj_2 = F.normalize(proj_2, dim=1)
+            proj_3 = F.normalize(proj_3, dim=1)
+
+            # Apply normalization for consistency
+            norm = transforms.Compose(
+                [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
+            )
+
             x_1_hat = norm(x_1_hat)
+            x_2_hat = norm(x_2_hat)
+            x_3_hat = norm(x_3_hat)
 
-            x_2_hat = (alpha * self.gan2_1(x_2)) + x_2 + (beta * self.gan2_3(x_2))
-            x_2_hat.detach()
-            x_2_hat = norm(x_2)
-
-            x_3_hat = (alpha * self.gan3_1(x_3)) + (beta * self.gan3_2(x_3)) + x_3
-            x_3_hat.detach()
-            x_3_hat = norm(x_3)
-
-            return [(x_1, y_task_1), (x_2, y_task_2), (x_3, y_task_3),
-                    (x_1_hat, y_task_1), (x_2_hat, y_task_2), (x_3_hat, y_task_3)]
+            return [
+                (x_1, y_task_1),
+                (x_2, y_task_2),
+                (x_3, y_task_3),
+                (x_1_hat, y_task_1),
+                (x_2_hat, y_task_2),
+                (x_3_hat, y_task_3),
+            ], [(proj_1, proj_2, proj_3)]
 
         else:
             b1, b2 = x
             x_1, y_task_1 = b1
             x_2, y_task_2 = b2
 
-            del b1, b2
-            # GAN TRANSFORMATIONS
-            norm = transforms.Compose([transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+            # Generate domain-mixed samples using GLO
+            x_1_hat, z1 = self.glo(x_1, 0)
+            x_2_hat, z2 = self.glo(x_2, 1)
 
-            # alpha, beta = np.round(np.random.dirichlet(np.ones(2)), 2)
-            alpha = np.round(np.random.random(), 2)
+            # Extract features using ResNet18 featurizer
+            feat_1 = featurizer(x_1)
+            feat_2 = featurizer(x_2)
 
-            x_1_hat = x_1 + (alpha * self.gan1_2(x_1))
-            x_1_hat.detach()
-            x_1_hat = norm(x_1)
+            # Project features for contrastive learning
+            proj_1 = self.projection(feat_1)
+            proj_2 = self.projection(feat_2)
 
-            x_2_hat = (alpha * self.gan2_1(x_2)) + x_2
-            x_2_hat.detach()
-            x_2_hat = norm(x_2)
+            # Normalize projections
+            proj_1 = F.normalize(proj_1, dim=1)
+            proj_2 = F.normalize(proj_2, dim=1)
 
-            return [(x_1, y_task_1), (x_2, y_task_2),
-                    (x_1_hat, y_task_1), (x_2_hat, y_task_2)]
+            norm = transforms.Compose(
+                [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
+            )
+
+            x_1_hat = norm(x_1_hat)
+            x_2_hat = norm(x_2_hat)
+
+            return [
+                (x_1, y_task_1),
+                (x_2, y_task_2),
+                (x_1_hat, y_task_1),
+                (x_2_hat, y_task_2),
+            ], [(proj_1, proj_2)]
 
 
 def remove_batch_norm_from_resnet(model):
@@ -168,12 +251,16 @@ def remove_batch_norm_from_resnet(model):
                 for name2, module2 in bottleneck.named_modules():
                     if name2.startswith("conv"):
                         bn_name = "bn" + name2[-1]
-                        setattr(bottleneck, name2,
-                                fuse(module2, getattr(bottleneck, bn_name)))
+                        setattr(
+                            bottleneck,
+                            name2,
+                            fuse(module2, getattr(bottleneck, bn_name)),
+                        )
                         setattr(bottleneck, bn_name, Identity())
                 if isinstance(bottleneck.downsample, torch.nn.Sequential):
-                    bottleneck.downsample[0] = fuse(bottleneck.downsample[0],
-                                                    bottleneck.downsample[1])
+                    bottleneck.downsample[0] = fuse(
+                        bottleneck.downsample[0], bottleneck.downsample[1]
+                    )
                     bottleneck.downsample[1] = Identity()
     model.train()
     return model
@@ -181,6 +268,7 @@ def remove_batch_norm_from_resnet(model):
 
 class Identity(nn.Module):
     """An identity layer"""
+
     def __init__(self):
         super(Identity, self).__init__()
 
@@ -190,14 +278,18 @@ class Identity(nn.Module):
 
 class MLP(nn.Module):
     """Just  an MLP"""
+
     def __init__(self, n_inputs, n_outputs, hparams):
         super(MLP, self).__init__()
-        self.input = nn.Linear(n_inputs, hparams['mlp_width'])
-        self.dropout = nn.Dropout(hparams['mlp_dropout'])
-        self.hiddens = nn.ModuleList([
-            nn.Linear(hparams['mlp_width'], hparams['mlp_width'])
-            for _ in range(hparams['mlp_depth']-2)])
-        self.output = nn.Linear(hparams['mlp_width'], n_outputs)
+        self.input = nn.Linear(n_inputs, hparams["mlp_width"])
+        self.dropout = nn.Dropout(hparams["mlp_dropout"])
+        self.hiddens = nn.ModuleList(
+            [
+                nn.Linear(hparams["mlp_width"], hparams["mlp_width"])
+                for _ in range(hparams["mlp_depth"] - 2)
+            ]
+        )
+        self.output = nn.Linear(hparams["mlp_width"], n_outputs)
         self.n_outputs = n_outputs
 
     def forward(self, x):
@@ -214,9 +306,10 @@ class MLP(nn.Module):
 
 class ResNet(torch.nn.Module):
     """ResNet with the softmax chopped off and the batchnorm frozen"""
+
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
-        if hparams['resnet18']:
+        if hparams["resnet18"]:
             self.network = torchvision.models.resnet18(pretrained=True)
             self.n_outputs = 512
         else:
@@ -231,8 +324,8 @@ class ResNet(torch.nn.Module):
             tmp = self.network.conv1.weight.data.clone()
 
             self.network.conv1 = nn.Conv2d(
-                nc, 64, kernel_size=(7, 7),
-                stride=(2, 2), padding=(3, 3), bias=False)
+                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+            )
 
             for i in range(nc):
                 self.network.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
@@ -243,7 +336,7 @@ class ResNet(torch.nn.Module):
 
         self.freeze_bn()
         self.hparams = hparams
-        self.dropout = nn.Dropout(hparams['resnet_dropout'])
+        self.dropout = nn.Dropout(hparams["resnet_dropout"])
 
     def forward(self, x):
         """Encode x into a feature vector of size n_outputs."""
@@ -269,6 +362,7 @@ class MNIST_CNN(nn.Module):
     - adding a linear layer after the mean-pool in features hurts
         RotatedMNIST-100 generalization severely.
     """
+
     n_outputs = 128
 
     def __init__(self, input_shape):
@@ -327,16 +421,61 @@ class ContextNet(nn.Module):
         return self.context_net(x)
 
 
+class ViTFeaturizer(torch.nn.Module):
+    """ViT feature extractor with consistent output dimension"""
+
+    def __init__(self, input_shape, hparams):
+        super(ViTFeaturizer, self).__init__()
+        # Load pretrained ViT
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224")
+
+        # Match output dimension with original ResNet
+        if hparams.get("resnet18", True):
+            self.n_outputs = 512
+        else:
+            self.n_outputs = 2048
+
+        # Add linear projection to match expected feature dimension
+        self.feature_projection = nn.Linear(768, self.n_outputs)
+
+        self.dropout = nn.Dropout(hparams.get("vit_dropout", 0.1))
+        self.hparams = hparams
+
+    def forward(self, x):
+        """
+        Input: (batch_size, channels, height, width)
+        Output: (batch_size, n_outputs) where n_outputs matches ResNet
+        """
+        # ViT forward pass
+        outputs = self.vit(x)
+        # Get CLS token features
+        features = outputs.last_hidden_state[:, 0]  # Shape: (batch_size, 768)
+        # Project to match ResNet dimension
+        features = self.feature_projection(features)  # Shape: (batch_size, n_outputs)
+        return self.dropout(features)
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Keep batch norm in eval mode if it exists
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+
 def Featurizer(input_shape, hparams):
     """Auto-select an appropriate featurizer for the given input shape."""
+    print(input_shape)
     if len(input_shape) == 1:
         return MLP(input_shape[0], hparams["mlp_width"], hparams)
     elif input_shape[1:3] == (28, 28):
         return MNIST_CNN(input_shape)
     elif input_shape[1:3] == (32, 32):
-        return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.)
+        return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.0)
     elif input_shape[1:3] == (224, 224):
-        return ResNet(input_shape, hparams)
+        return ViTFeaturizer(input_shape, hparams)
     else:
         raise NotImplementedError
 
@@ -348,7 +487,8 @@ def Classifier(in_features, out_features, is_nonlinear=False):
             torch.nn.ReLU(),
             torch.nn.Linear(in_features // 2, in_features // 4),
             torch.nn.ReLU(),
-            torch.nn.Linear(in_features // 4, out_features))
+            torch.nn.Linear(in_features // 4, out_features),
+        )
     else:
         return torch.nn.Linear(in_features, out_features)
 
@@ -358,12 +498,9 @@ class WholeFish(nn.Module):
         super(WholeFish, self).__init__()
         featurizer = Featurizer(input_shape, hparams)
         classifier = Classifier(
-            featurizer.n_outputs,
-            num_classes,
-            hparams['nonlinear_classifier'])
-        self.net = nn.Sequential(
-            featurizer, classifier
+            featurizer.n_outputs, num_classes, hparams["nonlinear_classifier"]
         )
+        self.net = nn.Sequential(featurizer, classifier)
         if weights is not None:
             self.load_state_dict(copy.deepcopy(weights))
 
