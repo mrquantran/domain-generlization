@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import torch.autograd as autograd
 from torchvision import transforms
 from torchvision.transforms import v2
+from torch.autograd import Function
 
 import copy
 import numpy as np
@@ -39,69 +40,6 @@ import torch.nn.functional as F
 import numpy as np
 from torch.nn import Parameter
 import math
-
-
-class ProjectionHead(nn.Module):
-    """Projection head for contrastive learning"""
-
-    def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
-        super(ProjectionHead, self).__init__()
-        self.projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x):
-        return self.projection(x)
-
-
-class NTXentLoss(nn.Module):
-    """NT-Xent loss for contrastive learning"""
-
-    def __init__(self, temperature=0.5):
-        super(NTXentLoss, self).__init__()
-        self.temperature = temperature
-        self.criterion = nn.CrossEntropyLoss(reduction="sum")
-        self.similarity_f = nn.CosineSimilarity(dim=2)
-
-    def forward(self, z_i, z_j):
-        """
-        Calculate NT-Xent loss for batch of paired samples
-        Args:
-            z_i, z_j: Batch of paired embeddings [N, D]
-        Returns:
-            Loss value
-        """
-        batch_size = z_i.shape[0]
-
-        # Concatenate embeddings for positive and negative pairs
-        z = torch.cat([z_i, z_j], dim=0)
-
-        # Calculate similarity matrix
-        sim = torch.matmul(z, z.T) / self.temperature
-
-        # Create mask for positive pairs
-        sim_i_j = torch.diag(sim, batch_size)
-        sim_j_i = torch.diag(sim, -batch_size)
-
-        positive_samples = torch.cat([sim_i_j, sim_j_i], dim=0).reshape(
-            2 * batch_size, 1
-        )
-
-        # Create mask for negative samples
-        mask = ~torch.eye(2 * batch_size, dtype=torch.bool, device=z_i.device)
-        negative_samples = sim[mask].reshape(2 * batch_size, -1)
-
-        # Concatenate positive and negative samples
-        logits = torch.cat((positive_samples, negative_samples), dim=1)
-        labels = torch.zeros(2 * batch_size, dtype=torch.long, device=z_i.device)
-
-        loss = self.criterion(logits, labels)
-        loss = loss / (2 * batch_size)
-
-        return loss
-
 
 ALGORITHMS = [
     "ERM",
@@ -171,6 +109,211 @@ class Algorithm(torch.nn.Module):
 
     def predict(self, x):
         raise NotImplementedError
+
+
+class GradientReversalFunction(Function):
+    """Gradient Reversal Layer from original DANN paper"""
+
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+
+class GradientReversal(nn.Module):
+    def __init__(self):
+        super(GradientReversal, self).__init__()
+
+    def forward(self, x, alpha):
+        return GradientReversalFunction.apply(x, alpha)
+
+
+class DomainClassifier(nn.Module):
+    """Domain classifier network following DANN paper architecture"""
+
+    def __init__(self, input_dim, num_domains):
+        super(DomainClassifier, self).__init__()
+        self.input_dim = input_dim
+        self.num_domains = num_domains
+
+        # Following original DANN architecture
+        self.network = nn.Sequential(
+            nn.BatchNorm1d(input_dim),
+            nn.Linear(input_dim, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(1024, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(1024, 1024),
+            nn.BatchNorm1d(1024),
+            nn.ReLU(True),
+            nn.Dropout(0.5),
+            nn.Linear(1024, num_domains),
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight)
+            nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm1d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+
+    def forward(self, x, alpha):
+        x = GradientReversalFunction.apply(x, alpha)
+        return self.network(x)
+
+class CYCLEMIX(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
+        )
+
+        self.network = nn.Sequential(self.featurizer, self.classifier)
+
+        # Domain classifier following DANN paper
+        self.domain_classifier = DomainClassifier(
+            input_dim=self.featurizer.n_outputs, num_domains=num_domains
+        )
+
+        device = next(self.network.parameters()).device
+        self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
+
+        # Parameters
+        self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
+        self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
+        self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
+
+        # DANN specific parameters
+        self.gamma = hparams.get("gamma", 10)  # for adaptation parameter
+        self.steps = 0
+        self.total_steps = hparams.get("total_steps", 20000)
+
+        # Optimizers
+        self.optimizer = torch.optim.Adam(
+            list(self.network.parameters())
+            + list(self.cyclemixLayer.projection.parameters())
+            + list(self.domain_classifier.parameters()),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams["weight_decay"],
+        )
+
+        self.glo_optimizer = torch.optim.Adam(
+            self.cyclemixLayer.glo.parameters(),
+            lr=hparams.get("glo_lr", 1e-4),
+            betas=(0.5, 0.999),
+        )
+
+    def compute_adaptation_factor(self):
+        """Compute p and then lambda according to DANN paper"""
+        p = float(self.steps) / self.total_steps
+        return 2.0 / (1.0 + np.exp(-self.gamma * p)) - 1
+
+    def compute_dann_loss(self, features, domain_labels, alpha):
+        """Compute domain adversarial loss following DANN paper"""
+        domain_preds = self.domain_classifier(features, alpha)
+        return F.cross_entropy(domain_preds, domain_labels)
+
+    def compute_glo_loss(self, original, generated, latent):
+        reconstruction_loss = F.mse_loss(generated, original)
+        latent_reg = torch.mean(torch.norm(latent, dim=1))
+        return (
+            self.reconstruction_lambda * reconstruction_loss
+            + self.latent_reg_lambda * latent_reg
+        )
+    
+    def compute_contrastive_loss(self, projections):
+        total_loss = 0
+        for proj_tuple in projections:
+            for i in range(len(proj_tuple)):
+                for j in range(i + 1, len(proj_tuple)):
+                    total_loss += self.cyclemixLayer.nt_xent(
+                        proj_tuple[i], proj_tuple[j]
+                    )
+        return total_loss
+
+    def update(self, minibatches, unlabeled=None):
+        self.steps += 1
+        alpha = self.compute_adaptation_factor()
+
+        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
+
+        # Separate original and augmented samples
+        orig_samples = minibatches_aug[: len(minibatches)]
+        aug_samples = minibatches_aug[len(minibatches) :]
+
+        # Concatenate all samples for classification
+        all_x = torch.cat([x for x, y in orig_samples])
+        all_y = torch.cat([y for x, y in orig_samples])
+
+        # Extract features
+        features = self.featurizer(all_x)
+
+        # Create domain labels
+        num_domains = len(minibatches)
+        samples_per_domain = all_x.size(0) // num_domains
+        domain_labels = torch.cat(
+            [
+                torch.full(
+                    (samples_per_domain,), i, dtype=torch.long, device=all_x.device
+                )
+                for i in range(num_domains)
+            ]
+        )
+
+        # Classification loss
+        class_loss = F.cross_entropy(self.classifier(features), all_y)
+
+        # Domain adversarial loss with proper adaptation factor
+        dann_loss = self.compute_dann_loss(features, domain_labels, alpha)
+
+        # GLO loss computation
+        glo_loss = 0
+        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
+            _, z = self.cyclemixLayer.glo(x_orig, 0)
+            glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
+
+        # Contrastive loss computation
+        contrastive_loss = self.compute_contrastive_loss(projections)
+
+        # Total loss with weighted DANN component
+        total_loss = (
+            class_loss
+            + glo_loss
+            + self.contrastive_lambda * contrastive_loss
+            + alpha * dann_loss  # Scale with adaptation factor
+        )
+
+        # Optimization steps
+        self.optimizer.zero_grad()
+        self.glo_optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        self.glo_optimizer.step()
+
+        return {
+            "loss": total_loss.item(),
+            "class_loss": class_loss.item(),
+            "glo_loss": glo_loss.item(),
+            "contrastive_loss": contrastive_loss.item(),
+            "dann_loss": dann_loss.item(),
+            "alpha": alpha,
+        }
+
+    def predict(self, x):
+        return self.classifier(self.featurizer(x))
 
 
 class ERM(Algorithm):
@@ -278,100 +421,6 @@ class CUTMIX(Algorithm):
 
     def predict(self, x):
         return self.network(x)
-
-
-class CYCLEMIX(Algorithm):
-    def __init__(self, input_shape, num_classes, num_domains, hparams):
-        super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.featurizer = networks.Featurizer(input_shape, self.hparams)
-        self.classifier = networks.Classifier(
-            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
-        )
-
-        self.network = nn.Sequential(self.featurizer, self.classifier)
-
-        device = next(self.network.parameters()).device
-        self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
-
-        # Parameters
-        self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
-        self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
-        self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
-
-        # Optimizers
-        self.optimizer = torch.optim.Adam(
-            list(self.network.parameters())
-            + list(self.cyclemixLayer.projection.parameters()),
-            lr=self.hparams["lr"],
-            weight_decay=self.hparams["weight_decay"],
-        )
-
-        self.glo_optimizer = torch.optim.Adam(
-            self.cyclemixLayer.glo.parameters(),
-            lr=hparams.get("glo_lr", 1e-4),
-            betas=(0.5, 0.999),
-        )
-
-    def compute_glo_loss(self, original, generated, latent):
-        reconstruction_loss = F.mse_loss(generated, original)
-        latent_reg = torch.mean(torch.norm(latent, dim=1))
-        return (
-            self.reconstruction_lambda * reconstruction_loss
-            + self.latent_reg_lambda * latent_reg
-        )
-
-    def compute_contrastive_loss(self, projections):
-        total_loss = 0
-        for proj_tuple in projections:
-            for i in range(len(proj_tuple)):
-                for j in range(i + 1, len(proj_tuple)):
-                    total_loss += self.cyclemixLayer.nt_xent(
-                        proj_tuple[i], proj_tuple[j]
-                    )
-        return total_loss
-
-    def update(self, minibatches, unlabeled=None):
-        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
-
-        # Separate original and augmented samples
-        orig_samples = minibatches_aug[: len(minibatches)]
-        aug_samples = minibatches_aug[len(minibatches) :]
-
-        # Concatenate all samples for classification
-        all_x = torch.cat([x for x, y in orig_samples])
-        all_y = torch.cat([y for x, y in orig_samples])
-
-        # Classification loss
-        class_loss = F.cross_entropy(self.predict(all_x), all_y)
-
-        # GLO loss computation
-        glo_loss = 0
-        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
-            _, z = self.cyclemixLayer.glo(x_orig, 0)
-            glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
-
-        # Contrastive loss computation
-        contrastive_loss = self.compute_contrastive_loss(projections)
-
-        # Total loss
-        total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
-
-        # Optimization steps
-        self.optimizer.zero_grad()
-        self.glo_optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
-        self.glo_optimizer.step()
-
-        return {
-            "loss": total_loss.item(),
-            "class_loss": class_loss.item(),
-            "glo_loss": glo_loss.item(),
-            "contrastive_loss": contrastive_loss.item(),
-        }
-
-    def predict(self, x):
-        return self.classifier(self.featurizer(x))
 
 
 class Fish(Algorithm):

@@ -126,7 +126,6 @@ class NTXentLoss(nn.Module):
         loss = self.criterion(logits, labels)
         return loss
 
-
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
         super(CycleMixLayer, self).__init__()
