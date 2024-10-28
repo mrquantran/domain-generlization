@@ -132,7 +132,7 @@ class CycleMixLayer(nn.Module):
         super(CycleMixLayer, self).__init__()
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
-        # Use the same feature dimension as the featurizer
+        # Dynamic feature dimension based on backbone
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
         # GLO components
@@ -144,7 +144,7 @@ class CycleMixLayer(nn.Module):
 
         # Projection head for contrastive learning
         self.projection = ProjectionHead(
-            input_dim=self.feature_dim,  # Using ResNet18 feature dimension
+            input_dim=self.feature_dim,
             hidden_dim=hparams.get("proj_hidden_dim", 2048),
             output_dim=hparams.get("proj_output_dim", 128),
         ).to(device)
@@ -152,90 +152,52 @@ class CycleMixLayer(nn.Module):
         # Contrastive loss
         self.nt_xent = NTXentLoss(temperature=hparams.get("temperature", 0.5))
 
+        # Image normalization
+        self.norm = transforms.Compose(
+            [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
+        )
+
+    def process_domain(self, batch, domain_idx, featurizer):
+        """Process single domain data"""
+        x, y = batch
+
+        # Generate domain-mixed samples
+        x_hat, z = self.glo(x, domain_idx)
+
+        # Extract and project features
+        feat = featurizer(x)
+        proj = self.projection(feat)
+        proj = F.normalize(proj, dim=1)
+
+        # Normalize generated samples
+        x_hat = self.norm(x_hat)
+
+        return (x, y), (x_hat, y), proj
+
     def forward(self, x: list, featurizer):
         """
         Args:
-            x: list of domain batches
-            featurizer: ResNet18 feature extractor from DomainBed
+            x: list of domain batches [(x_1, y_1), ..., (x_n, y_n)]
+            featurizer: Feature extractor from DomainBed
+        Returns:
+            original_and_generated: list of tuples [(x_i, y_i), (x_i_hat, y_i)]
+            projections: list of normalized projections [proj_1, ..., proj_n]
         """
-        if len(self.sources) == 3:
-            b1, b2, b3 = x
-            x_1, y_task_1 = b1
-            x_2, y_task_2 = b2
-            x_3, y_task_3 = b3
+        num_domains = len(x)
 
-            # Generate domain-mixed samples using GLO
-            x_1_hat, z1 = self.glo(x_1, 0)
-            x_2_hat, z2 = self.glo(x_2, 1)
-            x_3_hat, z3 = self.glo(x_3, 2)
+        # Process each domain
+        processed_domains = [
+            self.process_domain(batch, idx, featurizer) for idx, batch in enumerate(x)
+        ]
 
-            # Extract features using ResNet18 featurizer
-            feat_1 = featurizer(x_1)
-            feat_2 = featurizer(x_2)
-            feat_3 = featurizer(x_3)
+        # Unzip results
+        original_samples, generated_samples, projections = zip(*processed_domains)
 
-            # Project features for contrastive learning
-            proj_1 = self.projection(feat_1)
-            proj_2 = self.projection(feat_2)
-            proj_3 = self.projection(feat_3)
+        # Combine original and generated samples
+        all_samples = list(original_samples) + list(generated_samples)
 
-            # Normalize projections
-            proj_1 = F.normalize(proj_1, dim=1)
-            proj_2 = F.normalize(proj_2, dim=1)
-            proj_3 = F.normalize(proj_3, dim=1)
-
-            # Apply normalization for consistency
-            norm = transforms.Compose(
-                [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-            )
-
-            x_1_hat = norm(x_1_hat)
-            x_2_hat = norm(x_2_hat)
-            x_3_hat = norm(x_3_hat)
-
-            return [
-                (x_1, y_task_1),
-                (x_2, y_task_2),
-                (x_3, y_task_3),
-                (x_1_hat, y_task_1),
-                (x_2_hat, y_task_2),
-                (x_3_hat, y_task_3),
-            ], [(proj_1, proj_2, proj_3)]
-
-        else:
-            b1, b2 = x
-            x_1, y_task_1 = b1
-            x_2, y_task_2 = b2
-
-            # Generate domain-mixed samples using GLO
-            x_1_hat, z1 = self.glo(x_1, 0)
-            x_2_hat, z2 = self.glo(x_2, 1)
-
-            # Extract features using ResNet18 featurizer
-            feat_1 = featurizer(x_1)
-            feat_2 = featurizer(x_2)
-
-            # Project features for contrastive learning
-            proj_1 = self.projection(feat_1)
-            proj_2 = self.projection(feat_2)
-
-            # Normalize projections
-            proj_1 = F.normalize(proj_1, dim=1)
-            proj_2 = F.normalize(proj_2, dim=1)
-
-            norm = transforms.Compose(
-                [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-            )
-
-            x_1_hat = norm(x_1_hat)
-            x_2_hat = norm(x_2_hat)
-
-            return [
-                (x_1, y_task_1),
-                (x_2, y_task_2),
-                (x_1_hat, y_task_1),
-                (x_2_hat, y_task_2),
-            ], [(proj_1, proj_2)]
+        # Return in required format
+        return all_samples, [projections]
 
 
 def remove_batch_norm_from_resnet(model):
