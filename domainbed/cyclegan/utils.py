@@ -13,5 +13,19 @@ def get_sources(dataset: str, targets: list):
             domains.remove(domain_names[i])
         return domains
 
+    elif dataset == "DomainNet":
+        domains = ["clipart", "infograph", "painting", "quickdraw", "real", "sketch"]
+        domain_names = {0: "clipart", 1: "infograph", 2: "painting", 3: "quickdraw", 4: "real", 5: "sketch"}
+        for i in targets:
+            domains.remove(domain_names[i])
+        return domains
+
+    elif dataset == "TerraIncognita":
+        domains = ["L100", "L38", "L43", "L46"]
+        domain_names = {0: "L100", 1: "L38", 2: "L43", 3: "L46"}
+        for i in targets:
+            domains.remove(domain_names[i])
+        return domains
+
     else:
         raise NotImplementedError("Dataset not implemented yet for GANs")

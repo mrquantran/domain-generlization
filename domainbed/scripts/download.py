@@ -327,16 +327,40 @@ def download_spawrious(data_dir, remove=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download datasets")
+    parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--data_dir", type=str, required=True)
     args = parser.parse_args()
-
-    # download_mnist(args.data_dir)
-    # download_pacs(args.data_dir)
-    download_office_home(args.data_dir)
-    # download_domain_net(args.data_dir)
-    # download_vlcs(args.data_dir)
-    # download_terra_incognita(args.data_dir)
-    # download_spawrious(args.data_dir)
-    # download_sviro(args.data_dir)
-    # Camelyon17Dataset(root_dir=args.data_dir, download=True)
-    # FMoWDataset(root_dir=args.data_dir, download=True)
+    
+    # get dataset download
+    dataset = [
+        "MNIST",
+        "PACS",
+        "OfficeHome",
+        "DomainNet",
+        "VLCS",
+        "TerraIncognita",
+        "Spawrious",
+        "SVIRO",
+    ]
+    
+    if args.dataset not in dataset:
+        raise ValueError(f"Dataset {args.dataset} not found in {dataset}")
+    
+    if args.dataset == "MNIST":
+        download_mnist(args.data_dir)
+    elif args.dataset == "PACS":
+        download_pacs(args.data_dir)
+    elif args.dataset == "OfficeHome":
+        download_office_home(args.data_dir)
+    elif args.dataset == "DomainNet":
+        download_domain_net(args.data_dir)
+    elif args.dataset == "VLCS":
+        download_vlcs(args.data_dir)
+    elif args.dataset == "TerraIncognita":
+        download_terra_incognita(args.data_dir)
+    elif args.dataset == "Spawrious":
+        download_spawrious(args.data_dir)
+    elif args.dataset == "SVIRO":
+        download_sviro(args.data_dir)
+    else:
+        raise ValueError(f"Dataset {args.dataset} not found in {dataset}")
