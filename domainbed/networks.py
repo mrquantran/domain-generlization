@@ -58,6 +58,9 @@ class GLOModule(nn.Module):
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
+        self.current_latent_dim = (
+            latent_dim  # Thêm biến này để theo dõi kích thước hiện tại
+        )
 
         # Generator following GLO paper
         self.generator = GLOGenerator(latent_dim)
@@ -80,6 +83,20 @@ class GLOModule(nn.Module):
         # Generate images
         generated = self.generator(z)
         return generated, z
+
+    def prune_latent_space(self, prune_rate=0.1):
+        """Prune the latent space by removing a percentage of neurons."""
+        new_latent_dim = int(self.current_latent_dim * (1 - prune_rate))
+        self.current_latent_dim = max(
+            new_latent_dim, 1
+        )  # Ensure at least one dimension remains
+
+        # Update the generator and latent codes
+        self.generator = GLOGenerator(self.current_latent_dim)
+        self.domain_latents = nn.Parameter(
+            torch.randn(self.num_domains, self.batch_size, self.current_latent_dim)
+        )
+        nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
 
 class ProjectionHead(nn.Module):
