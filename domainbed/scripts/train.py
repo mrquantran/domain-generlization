@@ -292,6 +292,13 @@ if __name__ == "__main__":
                 misc.print_row(results_keys, colwidth=12)
                 last_results_keys = results_keys
             misc.print_row([results[key] for key in results_keys], colwidth=12)
+            
+            # Calculate the mean of all "env[number]_out_acc" keys
+            out_acc_keys = [key for key in results_keys if key.endswith("_out_acc")]
+            if out_acc_keys:
+                mean_out_acc = np.mean([results[key] for key in out_acc_keys])
+                results["mean_out_acc"] = mean_out_acc
+            misc.print_row(["mean_out_acc", mean_out_acc], colwidth=12)
 
             results.update({"hparams": hparams, "args": vars(args)})
 
