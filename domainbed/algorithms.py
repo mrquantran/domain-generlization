@@ -33,6 +33,9 @@ from domainbed.cyclegan.networks import define_G
 from domainbed.cyclegan.utils import get_sources
 from domainbed.lib.cyclemix_loss import cyclemix_contra_loss
 
+import sklearn
+from sklearn.cluster import KMeans
+from .fid_score import calculate_fid_given_data, compute_statistics_of_path, calculate_frechet_distance
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -279,7 +282,6 @@ class CUTMIX(Algorithm):
     def predict(self, x):
         return self.network(x)
 
-
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
@@ -330,6 +332,27 @@ class CYCLEMIX(Algorithm):
                     )
         return total_loss
 
+    def evaluate_criteria(self, original, generated, latent):
+        reconstruction_loss = F.mse_loss(generated, original).item()
+        # Placeholder for FID and silhouette score calculations
+        fid_score = self.calculate_fid(original, generated)
+        silhouette_score = self.calculate_silhouette_score(latent)
+        return reconstruction_loss, fid_score, silhouette_score
+
+    def calculate_fid(self, original, generated):
+        # Calculate FID using the method from FID_SCORE.PY
+        paths = [original, generated]
+        fid_value, _ = calculate_fid_given_data(paths, batch_size=24, device="cpu", dims=2048, num_workers=1)
+        return fid_value
+
+    def calculate_silhouette_score(self, latent):
+        # Calculate silhouette score using sklearn's silhouette_score
+        latent_np = latent.detach().cpu().numpy()
+        kmeans = KMeans(n_clusters=self.hparams["num_clusters"], random_state=42).fit(latent_np)
+        labels = kmeans.labels_
+        silhouette_avg = sklearn.metrics.silhouette_score(latent_np, labels)
+        return silhouette_avg
+
     def update(self, minibatches, unlabeled=None):
         minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
 
@@ -363,6 +386,19 @@ class CYCLEMIX(Algorithm):
         self.optimizer.step()
         self.glo_optimizer.step()
 
+        # Evaluate criteria and prune if necessary
+        reconstruction_loss, fid_score, silhouette_score = self.evaluate_criteria(
+            all_x, all_y, z
+        )
+        
+        threshold = 0.5
+        if (
+            reconstruction_loss > threshold
+            or fid_score > threshold
+            or silhouette_score < threshold
+        ):
+            self.cyclemixLayer.glo.prune_latent_space()
+
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
@@ -372,7 +408,6 @@ class CYCLEMIX(Algorithm):
 
     def predict(self, x):
         return self.classifier(self.featurizer(x))
-
 
 class Fish(Algorithm):
     """
