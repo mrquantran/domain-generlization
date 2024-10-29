@@ -29,13 +29,13 @@ class ALDModule(nn.Module):
     def __init__(
         self,
         initial_dim=100,
-        min_dim=20,
+        min_dim=50,
         max_dim=200,
         reduction_rate=0.1,
         expansion_rate=0.1,
         eval_frequency=100,
         patience=5,
-        metric_weights={"reconstruction": 0.4, "silhouette": 1.0, "fid": 1.0},
+        metric_weights={"reconstruction": 0.4, "silhouette": 1.0, "fid": 0.15},
     ):
         super(ALDModule, self).__init__()
         self.current_dim = initial_dim
@@ -107,7 +107,7 @@ class ALDModule(nn.Module):
 
     def compute_domain_discrimination(self, latent_vectors, domain_labels):
         """Compute domain discrimination score"""
-        
+
         # Convert to numpy for wasserstein distance calculation
         latent_np = latent_vectors.detach().cpu().numpy()
         unique_domains = np.unique(domain_labels)
@@ -132,7 +132,7 @@ class ALDModule(nn.Module):
 
     def should_adjust_dimension(self, metrics):
         """Determine if and how latent dimension should be adjusted"""
-        
+
         # Update moving averages
         self.update_ema_metrics(metrics)
 
@@ -140,13 +140,20 @@ class ALDModule(nn.Module):
         history_length = min(
             self.patience, len(self.metrics_history["reconstruction_loss"])
         )
+        # recent_scores = [
+        #     (
+        #         self.metric_weights["reconstruction"]
+        #         * self.metrics_history["reconstruction_loss"][-i]
+        #         + self.metric_weights["silhouette"]
+        #         * self.metrics_history["silhouette_score"][-i]
+        #         + self.metric_weights["fid"] * self.metrics_history["fid_score"][-i]
+        #     )
+        #     for i in range(1, history_length + 1)
+        # ]
         recent_scores = [
             (
-                # self.metric_weights["reconstruction"]
-                # * self.metrics_history["reconstruction_loss"][-i]
-                + self.metric_weights["silhouette"]
+                self.metric_weights["silhouette"]
                 * self.metrics_history["silhouette_score"][-i]
-                + self.metric_weights["fid"] * self.metrics_history["fid_score"][-i]
             )
             for i in range(1, history_length + 1)
         ]
@@ -168,13 +175,11 @@ class ALDModule(nn.Module):
         if action == "reduce":
             reduction = max(int(self.current_dim * self.reduction_rate), 1)
             self.current_dim = max(self.current_dim - reduction, self.min_dim)
-            print(f"Reducing dimension from {old_dim} to {self.current_dim}")
             return ("reduce", self.current_dim)
 
         elif action == "expand":
             expansion = max(int(self.current_dim * self.expansion_rate), 1)
             self.current_dim = min(self.current_dim + expansion, self.max_dim)
-            print(f"Expanding dimension from {old_dim} to {self.current_dim}")
             return ("expand", self.current_dim)
 
         return ("maintain", self.current_dim)
@@ -275,7 +280,7 @@ class GLOModule(nn.Module):
         self.device = device
         self.ald = ALDModule(
             initial_dim=latent_dim,
-            metric_weights={"reconstruction": 0.4, "silhouette": 0.3, "fid": 0.3},
+            metric_weights={"reconstruction": 0.4, "silhouette": 1.0, "fid": 0.15},
         ).to(self.device)
 
         # Add dimension validator
