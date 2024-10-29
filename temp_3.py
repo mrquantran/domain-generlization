@@ -1,127 +1,3 @@
-class CYCLEMIX(Algorithm):
-    def __init__(self, input_shape, num_classes, num_domains, hparams):
-        super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.featurizer = networks.Featurizer(input_shape, self.hparams)
-        self.classifier = networks.Classifier(
-            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
-        )
-
-        self.network = nn.Sequential(self.featurizer, self.classifier)
-
-        device = next(self.network.parameters()).device
-        self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
-
-        # Parameters
-        self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
-        self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
-        self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
-
-        # Optimizers
-        self.optimizer = torch.optim.Adam(
-            list(self.network.parameters())
-            + list(self.cyclemixLayer.projection.parameters()),
-            lr=self.hparams["lr"],
-            weight_decay=self.hparams["weight_decay"],
-        )
-
-        self.glo_optimizer = torch.optim.Adam(
-            self.cyclemixLayer.glo.parameters(),
-            lr=hparams.get("glo_lr", 1e-4),
-            betas=(0.5, 0.999),
-        )
-
-    def compute_glo_loss(self, original, generated, latent):
-        reconstruction_loss = F.mse_loss(generated, original)
-        latent_reg = torch.mean(torch.norm(latent, dim=1))
-        return (
-            self.reconstruction_lambda * reconstruction_loss
-            + self.latent_reg_lambda * latent_reg
-        )
-
-    def compute_contrastive_loss(self, projections):
-        total_loss = 0
-        for proj_tuple in projections:
-            for i in range(len(proj_tuple)):
-                for j in range(i + 1, len(proj_tuple)):
-                    total_loss += self.cyclemixLayer.nt_xent(
-                        proj_tuple[i], proj_tuple[j]
-                    )
-        return total_loss
-
-    def update(self, minibatches, unlabeled=None):
-        device = next(self.network.parameters()).device
-        minibatches = [(x.to(device), y.to(device)) for x, y in minibatches]
-        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
-
-        # Original and augmented samples
-        orig_samples = minibatches_aug[: len(minibatches)]
-        aug_samples = minibatches_aug[len(minibatches) :]
-
-        # Classification
-        all_x = torch.cat([x for x, y in orig_samples])
-        all_y = torch.cat([y for x, y in orig_samples])
-        class_loss = F.cross_entropy(self.predict(all_x), all_y)
-
-        # GLO loss computation
-        glo_loss = 0
-        reconstruction_losses = []
-        silhouette_scores = []
-        fid_scores = []
-
-        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
-            _, z = self.cyclemixLayer.glo(x_orig, 0)
-            current_glo_loss = self.compute_glo_loss(x_orig, x_aug, z)
-            glo_loss += current_glo_loss
-
-            # Compute metrics for ALD
-            reconstruction_losses.append(F.mse_loss(x_aug, x_orig).item())
-
-            # Compute Silhouette score on latent representations
-            with torch.no_grad():
-                z_np = z.cpu().numpy()
-                if len(z_np) > 1:  # Need at least 2 samples
-                    labels = np.random.randint(
-                        0, 2, len(z_np)
-                    )  # Generate random labels
-                    silhouette_scores.append(silhouette_score(z_np, labels))
-
-                # Compute FID score (simplified version)
-                fid_scores.append(torch.norm(x_aug - x_orig).item())
-
-        # Update latent dimension if needed
-        avg_reconstruction = np.mean(reconstruction_losses)
-        avg_silhouette = np.mean(silhouette_scores) if silhouette_scores else 0
-        avg_fid = np.mean(fid_scores)
-
-        self.cyclemixLayer.glo.update_dimension(
-            avg_reconstruction, avg_silhouette, avg_fid
-        )
-
-        # Contrastive loss
-        contrastive_loss = self.compute_contrastive_loss(projections)
-
-        # Total loss
-        total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
-
-        # Optimization
-        self.optimizer.zero_grad()
-        self.glo_optimizer.zero_grad()
-        total_loss.backward()
-        self.optimizer.step()
-        self.glo_optimizer.step()
-
-        return {
-            "loss": total_loss.item(),
-            "class_loss": class_loss.item(),
-            "glo_loss": glo_loss.item(),
-            "contrastive_loss": contrastive_loss.item(),
-            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
-        }
-
-    def predict(self, x):
-        return self.classifier(self.featurizer(x))
-
-
 class ALDModule(nn.Module):
     """Enhanced Automatic Latent Dimension module for domain generalization"""
 
@@ -654,20 +530,22 @@ class CycleMixLayer(nn.Module):
         )
 
     def process_domain(self, batch, domain_idx, featurizer):
-        """Process single domain data"""
         x, y = batch
-
-        # Đảm bảo featurizer và input cùng device
         device = next(featurizer.parameters()).device
         x = x.to(device)
         y = y.to(device)
 
+        # Create adapter if not exists
+        if not hasattr(self, "featurizer_adapter"):
+            self.featurizer_adapter = FeaturizerAdapter(
+                featurizer, self.glo.ald.current_dim, device
+            ).to(device)
+
         # Generate domain-mixed samples
-        self.glo = self.glo.to(device)
         x_hat, z = self.glo(x, domain_idx)
 
-        # Extract and project features
-        feat = featurizer(x)
+        # Extract and project features using adapter
+        feat = self.featurizer_adapter(x)
         proj = self.projection(feat)
         proj = F.normalize(proj, dim=1)
 
@@ -684,7 +562,7 @@ class CycleMixLayer(nn.Module):
             featurizer: Feature extractor from DomainBed
         Returns:
             original_and_generated: list of tuples [(x_i, y_i), (x_i_hat, y_i)]
-            projections: list of normalized projections [proj_1, ..., proj_n]
+            projections: list of normalized projections [proj_1, ..., proj_n]of normalized projections [proj_1, ..., proj_n]
         """
         num_domains = len(x)
 
@@ -701,3 +579,213 @@ class CycleMixLayer(nn.Module):
 
         # Return in required format
         return all_samples, [projections]
+
+
+class FeaturizerAdapter(nn.Module):
+    def __init__(self, featurizer, latent_dim, device="cuda"):
+        super(FeaturizerAdapter, self).__init__()
+        self.device = device
+        self.featurizer = featurizer
+        self.feature_dim = self._get_feature_dim()
+
+        # Two-stage adaptation for better dimension handling
+        intermediate_dim = min(self.feature_dim, 1024)  # Prevent excessive dimensions
+        self.adapter = nn.Sequential(
+            nn.Linear(self.feature_dim, intermediate_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(intermediate_dim),
+            nn.Linear(intermediate_dim, latent_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(latent_dim),
+        ).to(device)
+
+    def _get_feature_dim(self):
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224, device=self.device)
+            features = self.featurizer(dummy_input)
+            return features.shape[1]
+
+    def forward(self, x):
+        features = self.featurizer(x)
+        features = features.view(features.size(0), -1)  # Flatten if needed
+        adapted_features = self.adapter(features)
+        return adapted_features
+
+class ViTFeaturizer(torch.nn.Module):
+    """ViT feature extractor with consistent output dimension"""
+
+    def __init__(self, input_shape, hparams):
+        super(ViTFeaturizer, self).__init__()
+        # Load pretrained ViT
+        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224")
+
+        # Match output dimension with original ResNet
+        if hparams.get("resnet18", True):
+            self.n_outputs = 512
+        else:
+            self.n_outputs = 2048
+
+        # Add linear projection to match expected feature dimension
+        self.feature_projection = nn.Linear(768, self.n_outputs)
+
+        self.dropout = nn.Dropout(hparams.get("vit_dropout", 0.1))
+        self.hparams = hparams
+
+    def forward(self, x):
+        """
+        Input: (batch_size, channels, height, width)
+        Output: (batch_size, n_outputs) where n_outputs matches ResNet
+        """
+        # ViT forward pass
+        outputs = self.vit(x)
+        # Get CLS token features
+        features = outputs.last_hidden_state[:, 0]  # Shape: (batch_size, 768)
+        # Project to match ResNet dimension
+        features = self.feature_projection(features)  # Shape: (batch_size, n_outputs)
+        return self.dropout(features)
+
+    def train(self, mode=True):
+        super().train(mode)
+        # Keep batch norm in eval mode if it exists
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+
+def Featurizer(input_shape, hparams):
+    """Auto-select an appropriate featurizer for the given input shape."""
+    print(input_shape)
+    if len(input_shape) == 1:
+        return MLP(input_shape[0], hparams["mlp_width"], hparams)
+    elif input_shape[1:3] == (28, 28):
+        return MNIST_CNN(input_shape)
+    elif input_shape[1:3] == (32, 32):
+        return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.0)
+    elif input_shape[1:3] == (224, 224):
+        return ViTFeaturizer(input_shape, hparams)
+    else:
+        raise NotImplementedError
+
+
+class CYCLEMIX(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
+        )
+
+        self.network = nn.Sequential(self.featurizer, self.classifier)
+
+        device = next(self.network.parameters()).device
+        self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
+
+        # Parameters
+        self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
+        self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
+        self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
+
+        # Optimizers
+        self.optimizer = torch.optim.Adam(
+            list(self.network.parameters())
+            + list(self.cyclemixLayer.projection.parameters()),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams["weight_decay"],
+        )
+
+        self.glo_optimizer = torch.optim.Adam(
+            self.cyclemixLayer.glo.parameters(),
+            lr=hparams.get("glo_lr", 1e-4),
+            betas=(0.5, 0.999),
+        )
+
+    def compute_glo_loss(self, original, generated, latent):
+        reconstruction_loss = F.mse_loss(generated, original)
+        latent_reg = torch.mean(torch.norm(latent, dim=1))
+        return (
+            self.reconstruction_lambda * reconstruction_loss
+            + self.latent_reg_lambda * latent_reg
+        )
+
+    def compute_contrastive_loss(self, projections):
+        total_loss = 0
+        for proj_tuple in projections:
+            for i in range(len(proj_tuple)):
+                for j in range(i + 1, len(proj_tuple)):
+                    total_loss += self.cyclemixLayer.nt_xent(
+                        proj_tuple[i], proj_tuple[j]
+                    )
+        return total_loss
+
+    def update(self, minibatches, unlabeled=None):
+        device = next(self.network.parameters()).device
+        minibatches = [(x.to(device), y.to(device)) for x, y in minibatches]
+        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
+
+        # Original and augmented samples
+        orig_samples = minibatches_aug[: len(minibatches)]
+        aug_samples = minibatches_aug[len(minibatches) :]
+
+        # Classification
+        all_x = torch.cat([x for x, y in orig_samples])
+        all_y = torch.cat([y for x, y in orig_samples])
+        class_loss = F.cross_entropy(self.predict(all_x), all_y)
+
+        # GLO loss computation
+        glo_loss = 0
+        reconstruction_losses = []
+        silhouette_scores = []
+        fid_scores = []
+
+        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
+            _, z = self.cyclemixLayer.glo(x_orig, 0)
+            current_glo_loss = self.compute_glo_loss(x_orig, x_aug, z)
+            glo_loss += current_glo_loss
+
+            # Compute metrics for ALD
+            reconstruction_losses.append(F.mse_loss(x_aug, x_orig).item())
+
+            # Compute Silhouette score on latent representations
+            with torch.no_grad():
+                z_np = z.cpu().numpy()
+                if len(z_np) > 1:  # Need at least 2 samples
+                    labels = np.random.randint(
+                        0, 2, len(z_np)
+                    )  # Generate random labels
+                    silhouette_scores.append(silhouette_score(z_np, labels))
+
+                # Compute FID score (simplified version)
+                fid_scores.append(torch.norm(x_aug - x_orig).item())
+
+        # Update latent dimension if needed
+        avg_reconstruction = np.mean(reconstruction_losses)
+        avg_silhouette = np.mean(silhouette_scores) if silhouette_scores else 0
+        avg_fid = np.mean(fid_scores)
+
+        self.cyclemixLayer.glo.update_dimension(
+            avg_reconstruction, avg_silhouette, avg_fid
+        )
+
+        # Contrastive loss
+        contrastive_loss = self.compute_contrastive_loss(projections)
+
+        # Total loss
+        total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
+
+        # Optimization
+        self.optimizer.zero_grad()
+        self.glo_optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        self.glo_optimizer.step()
+
+        return {
+            "loss": total_loss.item(),
+            "class_loss": class_loss.item(),
+            "glo_loss": glo_loss.item(),
+            "contrastive_loss": contrastive_loss.item(),
+            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
+        }

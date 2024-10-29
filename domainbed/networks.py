@@ -456,14 +456,19 @@ class GLOModule(nn.Module):
 
 
 class ProjectionHead(nn.Module):
-    """Projection head for contrastive learning"""
+    """Enhanced projection head with dynamic dimension handling"""
 
     def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
         super(ProjectionHead, self).__init__()
+
+        # Adjust hidden dimension based on input
+        adjusted_hidden_dim = min(hidden_dim, input_dim * 2)
+
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, adjusted_hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.BatchNorm1d(adjusted_hidden_dim),
+            nn.Linear(adjusted_hidden_dim, output_dim),
         )
 
     def forward(self, x):
@@ -517,28 +522,28 @@ class CycleMixLayer(nn.Module):
         super(CycleMixLayer, self).__init__()
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
-        # Dynamic feature dimension based on backbone
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
+        self.latent_dim = hparams.get("latent_dim", 100)
+
         # Add dimension adapter
-        self.latent_adapter = DimensionAdapter(
-            hparams.get("latent_dim", 100), 
-            self.feature_dim
-        ).to(device)
+        self.latent_adapter = DimensionAdapter(self.latent_dim, self.feature_dim).to(
+            device
+        )
 
         # GLO components
         self.glo = GLOModule(
-            latent_dim=hparams.get("latent_dim", 100),
+            latent_dim=self.latent_dim,
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
-            device=self.device
+            device=self.device,
         ).to(device)
 
         # Projection head for contrastive learning
         self.projection = ProjectionHead(
-            input_dim=self.feature_dim,
+            input_dim=self.latent_dim,  # Use latent dimension
             hidden_dim=hparams.get("proj_hidden_dim", 2048),
-            output_dim=hparams.get("proj_output_dim", 128),
+            output_dim=hparams.get("proj_output_dim", 128)
         ).to(device)
 
         # Contrastive loss
@@ -550,20 +555,22 @@ class CycleMixLayer(nn.Module):
         )
 
     def process_domain(self, batch, domain_idx, featurizer):
-        """Process single domain data"""
         x, y = batch
-
-        # Đảm bảo featurizer và input cùng device
         device = next(featurizer.parameters()).device
         x = x.to(device)
         y = y.to(device)
 
+        # Create adapter if not exists
+        if not hasattr(self, "featurizer_adapter"):
+            self.featurizer_adapter = FeaturizerAdapter(
+                featurizer, self.glo.ald.current_dim, device
+            ).to(device)
+
         # Generate domain-mixed samples
-        self.glo = self.glo.to(device)
         x_hat, z = self.glo(x, domain_idx)
 
-        # Extract and project features
-        feat = featurizer(x)
+        # Extract and project features using adapter
+        feat = self.featurizer_adapter(x)
         proj = self.projection(feat)
         proj = F.normalize(proj, dim=1)
 
@@ -580,7 +587,7 @@ class CycleMixLayer(nn.Module):
             featurizer: Feature extractor from DomainBed
         Returns:
             original_and_generated: list of tuples [(x_i, y_i), (x_i_hat, y_i)]
-            projections: list of normalized projections [proj_1, ..., proj_n]
+            projections: list of normalized projections [proj_1, ..., proj_n]of normalized projections [proj_1, ..., proj_n]
         """
         num_domains = len(x)
 
@@ -597,6 +604,37 @@ class CycleMixLayer(nn.Module):
 
         # Return in required format
         return all_samples, [projections]
+
+
+class FeaturizerAdapter(nn.Module):
+    def __init__(self, featurizer, latent_dim, device="cuda"):
+        super(FeaturizerAdapter, self).__init__()
+        self.device = device
+        self.featurizer = featurizer
+        self.feature_dim = self._get_feature_dim()
+
+        # Two-stage adaptation for better dimension handling
+        intermediate_dim = min(self.feature_dim, 1024)  # Prevent excessive dimensions
+        self.adapter = nn.Sequential(
+            nn.Linear(self.feature_dim, intermediate_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(intermediate_dim),
+            nn.Linear(intermediate_dim, latent_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(latent_dim),
+        ).to(device)
+
+    def _get_feature_dim(self):
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224, device=self.device)
+            features = self.featurizer(dummy_input)
+            return features.shape[1]
+
+    def forward(self, x):
+        features = self.featurizer(x)
+        features = features.view(features.size(0), -1)  # Flatten if needed
+        adapted_features = self.adapter(features)
+        return adapted_features
 
 
 def remove_batch_norm_from_resnet(model):
