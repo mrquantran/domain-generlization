@@ -12,8 +12,8 @@ import numpy as np
 from collections import OrderedDict
 
 try:
-    from backpack import backpack, extend
-    from backpack.extensions import BatchGrad
+    from backpack import backpack, extend  # type: ignore
+    from backpack.extensions import BatchGrad # type: ignore
 except:
     backpack = None
 

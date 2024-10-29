@@ -35,7 +35,7 @@ class ALDModule(nn.Module):
         expansion_rate=0.1,
         eval_frequency=100,
         patience=5,
-        metric_weights={"reconstruction": 0.4, "silhouette": 0.3, "fid": 0.3},
+        metric_weights={"reconstruction": 0.4, "silhouette": 1, "fid": 0.75},
     ):
         super(ALDModule, self).__init__()
         self.current_dim = initial_dim
@@ -132,14 +132,6 @@ class ALDModule(nn.Module):
         # Update moving averages
         self.update_ema_metrics(metrics)
 
-        # Compute weighted metric score
-        weighted_score = (
-            self.metric_weights["reconstruction"]
-            * self.ema_metrics["reconstruction_loss"]
-            + self.metric_weights["silhouette"] * self.ema_metrics["silhouette_score"]
-            + self.metric_weights["fid"] * self.ema_metrics["fid_score"]
-        )
-
         # Check recent history
         history_length = min(
             self.patience, len(self.metrics_history["reconstruction_loss"])
@@ -221,85 +213,6 @@ def downsize_layer(old_layer, layer_class, new_size, importance_scores=None):
 
     return new_layer
 
-
-class DimensionManager:
-    """Manages dimension changes in the network"""
-    def __init__(self, network):
-        self.network = network
-
-    def update_network_dimensions(self, action, new_dim, old_dim):
-        device = next(self.network.parameters()).device
-
-        """Updates network layers based on dimension change"""
-        if action == "maintain":
-            return
-
-        # Get importance scores for neurons if reducing
-        importance_scores = None
-        if action == "reduce":
-            importance_scores = self.compute_neuron_importance()
-
-        # Update layers
-        for name, module in self.network.named_modules():
-            if isinstance(module, nn.Linear):
-                old_size = (module.in_features, module.out_features)
-                new_size = self.calculate_new_size(old_size, new_dim, old_dim)
-
-                if action == "expand":
-                    new_module = expand_layer(module, nn.Linear, new_size).to(device)
-                else:
-                    new_module = downsize_layer(
-                        module, nn.Linear, new_size, importance_scores
-                    ).to(device)
-
-                # Replace old module
-                parent = self.get_parent_module(name)
-                child_name = name.split(".")[-1]
-                setattr(parent, child_name, new_module)
-
-    def compute_neuron_importance(self):
-        """Compute importance scores for neurons"""
-        importance_scores = {}
-
-        for name, module in self.network.named_modules():
-            if isinstance(module, nn.Linear):
-                # Use combination of L1 norm and gradient information
-                weights = module.weight.data
-                if module.weight.grad is not None:
-                    grads = module.weight.grad.data
-                    importance = torch.norm(weights, p=1, dim=1) * torch.norm(
-                        grads, p=1, dim=1
-                    )
-                else:
-                    importance = torch.norm(weights, p=1, dim=1)
-                importance_scores[name] = importance
-
-        return importance_scores
-
-    def calculate_new_size(self, old_size, new_dim, old_dim):
-        """Calculate new layer sizes based on dimension change"""
-        in_scale = new_dim / old_dim
-        out_scale = new_dim / old_dim
-
-        new_in = max(int(old_size[0] * in_scale), 1)
-        new_out = max(int(old_size[1] * out_scale), 1)
-
-        return (new_in, new_out)
-
-    def get_parent_module(self, name):
-        """Get parent module for a given module name"""
-        if "." not in name:
-            return self.network
-
-        parent_name = ".".join(name.split(".")[:-1])
-        parent = self.network
-
-        for part in parent_name.split("."):
-            parent = getattr(parent, part)
-
-        return parent
-
-
 class GLOGenerator(nn.Module):
     """Generator network with proper dimension handling"""
 
@@ -352,8 +265,6 @@ class GLOGenerator(nn.Module):
         x = self.deconv(x)
         return x
 
-
-# Modify GLOModule to use ALDModule
 class GLOModule(nn.Module):
     def __init__(self, latent_dim=100, num_domains=3, batch_size=32, device="cuda"):
         super(GLOModule, self).__init__()
@@ -389,8 +300,6 @@ class GLOModule(nn.Module):
         )
         self._init_domain_latents()
 
-        self.dim_manager = DimensionManager(self)
-
     def _init_domain_latents(self):
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
@@ -414,7 +323,7 @@ class GLOModule(nn.Module):
 
         if action != "maintain":
             action, new_dim = self.ald.adjust_dimension(action)
-    
+
             if new_dim != old_dim:
                 # Update domain latents
                 new_domain_latents = torch.randn(
@@ -495,7 +404,6 @@ class GLOModule(nn.Module):
 
 class ProjectionHead(nn.Module):
     """Enhanced projection head with dynamic dimension handling"""
-
     def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
         super(ProjectionHead, self).__init__()
 
@@ -514,7 +422,6 @@ class ProjectionHead(nn.Module):
 
 class NTXentLoss(nn.Module):
     """NT-Xent loss for contrastive learning"""
-
     def __init__(self, temperature=0.5):
         super(NTXentLoss, self).__init__()
         self.temperature = temperature
@@ -541,18 +448,6 @@ class NTXentLoss(nn.Module):
         loss = self.criterion(logits, labels)
         return loss
 
-class DimensionAdapter(nn.Module):
-    """Adapter module to handle dimension mismatches"""
-
-    def __init__(self, in_dim, out_dim):
-        super(DimensionAdapter, self).__init__()
-        self.adapter = nn.Sequential(
-            nn.Linear(in_dim, out_dim), nn.ReLU(), nn.BatchNorm1d(out_dim)
-        )
-
-    def forward(self, x):
-        return self.adapter(x)
-
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
         super(CycleMixLayer, self).__init__()
@@ -561,11 +456,6 @@ class CycleMixLayer(nn.Module):
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
         self.latent_dim = hparams.get("latent_dim", 100)
-
-        # Add dimension adapter
-        self.latent_adapter = DimensionAdapter(self.latent_dim, self.feature_dim).to(
-            device
-        )
 
         # GLO components
         self.glo = GLOModule(
