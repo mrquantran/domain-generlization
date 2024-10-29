@@ -1,5 +1,4 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-
 from sklearn.metrics import silhouette_score
 import torch
 import torch.nn as nn
@@ -28,81 +27,6 @@ from domainbed.lib.misc import (
     proj,
     Nonparametric,
 )
-
-# CYCLEGAN Experiments
-from domainbed.cyclegan.networks import define_G
-from domainbed.cyclegan.utils import get_sources
-from domainbed.lib.cyclemix_loss import cyclemix_contra_loss
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from torch.nn import Parameter
-import math
-
-
-class ProjectionHead(nn.Module):
-    """Projection head for contrastive learning"""
-
-    def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
-        super(ProjectionHead, self).__init__()
-        self.projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x):
-        return self.projection(x)
-
-
-class NTXentLoss(nn.Module):
-    """NT-Xent loss for contrastive learning"""
-
-    def __init__(self, temperature=0.5):
-        super(NTXentLoss, self).__init__()
-        self.temperature = temperature
-        self.criterion = nn.CrossEntropyLoss(reduction="sum")
-        self.similarity_f = nn.CosineSimilarity(dim=2)
-
-    def forward(self, z_i, z_j):
-        """
-        Calculate NT-Xent loss for batch of paired samples
-        Args:
-            z_i, z_j: Batch of paired embeddings [N, D]
-        Returns:
-            Loss value
-        """
-        batch_size = z_i.shape[0]
-
-        # Concatenate embeddings for positive and negative pairs
-        z = torch.cat([z_i, z_j], dim=0)
-
-        # Calculate similarity matrix
-        sim = torch.matmul(z, z.T) / self.temperature
-
-        # Create mask for positive pairs
-        sim_i_j = torch.diag(sim, batch_size)
-        sim_j_i = torch.diag(sim, -batch_size)
-
-        positive_samples = torch.cat([sim_i_j, sim_j_i], dim=0).reshape(
-            2 * batch_size, 1
-        )
-
-        # Create mask for negative samples
-        mask = ~torch.eye(2 * batch_size, dtype=torch.bool, device=z_i.device)
-        negative_samples = sim[mask].reshape(2 * batch_size, -1)
-
-        # Concatenate positive and negative samples
-        logits = torch.cat((positive_samples, negative_samples), dim=1)
-        labels = torch.zeros(2 * batch_size, dtype=torch.long, device=z_i.device)
-
-        loss = self.criterion(logits, labels)
-        loss = loss / (2 * batch_size)
-
-        return loss
-
 
 ALGORITHMS = [
     "ERM",
@@ -361,7 +285,8 @@ class CYCLEMIX(Algorithm):
             with torch.no_grad():
                 z_np = z.cpu().numpy()
                 if len(z_np) > 1:  # Need at least 2 samples
-                    silhouette_scores.append(silhouette_score(z_np, [0]*len(z_np)))
+                    labels = np.random.randint(0, 2, len(z_np))  # Generate random labels
+                    silhouette_scores.append(silhouette_score(z_np, labels))
                 
                 # Compute FID score (simplified version)
                 fid_scores.append(torch.norm(x_aug - x_orig).item())
