@@ -1,28 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models
-from torchvision import transforms
-from transformers import ViTModel
-
-import numpy as np
-
-from domainbed.lib import wide_resnet
-import copy
-
-# CYCLEGAN Experiments
-from domainbed.cyclegan.utils import get_sources
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from scipy.stats import wasserstein_distance
-
-
 class ALDModule(nn.Module):
     """Enhanced Automatic Latent Dimension module for domain generalization"""
 
@@ -223,6 +198,7 @@ def downsize_layer(old_layer, layer_class, new_size, importance_scores=None):
 
 class DimensionManager:
     """Manages dimension changes in the network"""
+
     def __init__(self, network):
         self.network = network
 
@@ -363,7 +339,7 @@ class GLOModule(nn.Module):
         ).to(self.device)
 
         # Add dimension validator
-        self.input_validator = nn.Linear(self.ald.current_dim, self.ald.current_dim).to(self.device)
+        self.input_validator = nn.Linear(self.ald.current_dim, self.ald.current_dim)
 
         # Initialize with proper output shape
         self.generator = GLOGenerator(
@@ -382,7 +358,9 @@ class GLOModule(nn.Module):
         ).to(device)
 
         self.domain_latents = nn.Parameter(
-            torch.randn(num_domains, batch_size, self.ald.current_dim, device=self.device)
+            torch.randn(
+                num_domains, batch_size, self.ald.current_dim, device=self.device
+            )
         )
         self._init_domain_latents()
 
@@ -423,7 +401,7 @@ class GLOModule(nn.Module):
                 # Update domain latents
                 old_latents = self.domain_latents.data
                 self.domain_latents = nn.Parameter(
-                    torch.randn(old_latents.size(0), old_latents.size(1), new_dim), 
+                    torch.randn(old_latents.size(0), old_latents.size(1), new_dim),
                 )
                 self._init_domain_latents()
 
@@ -436,12 +414,9 @@ class GLOModule(nn.Module):
 
         # Validate input dimension
         z = self.domain_latents[domain_idx, :batch_size].to(device)
-
-        self.input_validator = self.input_validator.to(device)
         z = self.input_validator(z)
 
         # Adapt dimension for generator
-        self.dim_adapter = self.dim_adapter.to(device)
         z = self.dim_adapter(z)
         z = z.view(
             batch_size,
@@ -512,6 +487,7 @@ class DimensionAdapter(nn.Module):
     def forward(self, x):
         return self.adapter(x)
 
+
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
         super(CycleMixLayer, self).__init__()
@@ -522,8 +498,7 @@ class CycleMixLayer(nn.Module):
 
         # Add dimension adapter
         self.latent_adapter = DimensionAdapter(
-            hparams.get("latent_dim", 100), 
-            self.feature_dim
+            hparams.get("latent_dim", 100), self.feature_dim
         ).to(device)
 
         # GLO components
@@ -531,7 +506,7 @@ class CycleMixLayer(nn.Module):
             latent_dim=hparams.get("latent_dim", 100),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
-            device=self.device
+            device=self.device,
         ).to(device)
 
         # Projection head for contrastive learning
@@ -559,7 +534,6 @@ class CycleMixLayer(nn.Module):
         y = y.to(device)
 
         # Generate domain-mixed samples
-        self.glo = self.glo.to(device)
         x_hat, z = self.glo(x, domain_idx)
 
         # Extract and project features
@@ -599,274 +573,125 @@ class CycleMixLayer(nn.Module):
         return all_samples, [projections]
 
 
-def remove_batch_norm_from_resnet(model):
-    fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
-    model.eval()
+class CYCLEMIX(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        self.classifier = networks.Classifier(
+            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
+        )
 
-    model.conv1 = fuse(model.conv1, model.bn1)
-    model.bn1 = Identity()
+        self.network = nn.Sequential(self.featurizer, self.classifier)
 
-    for name, module in model.named_modules():
-        if name.startswith("layer") and len(name) == 6:
-            for b, bottleneck in enumerate(module):
-                for name2, module2 in bottleneck.named_modules():
-                    if name2.startswith("conv"):
-                        bn_name = "bn" + name2[-1]
-                        setattr(
-                            bottleneck,
-                            name2,
-                            fuse(module2, getattr(bottleneck, bn_name)),
-                        )
-                        setattr(bottleneck, bn_name, Identity())
-                if isinstance(bottleneck.downsample, torch.nn.Sequential):
-                    bottleneck.downsample[0] = fuse(
-                        bottleneck.downsample[0], bottleneck.downsample[1]
+        device = next(self.network.parameters()).device
+        self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
+
+        # Parameters
+        self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
+        self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
+        self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
+
+        # Optimizers
+        self.optimizer = torch.optim.Adam(
+            list(self.network.parameters())
+            + list(self.cyclemixLayer.projection.parameters()),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams["weight_decay"],
+        )
+
+        self.glo_optimizer = torch.optim.Adam(
+            self.cyclemixLayer.glo.parameters(),
+            lr=hparams.get("glo_lr", 1e-4),
+            betas=(0.5, 0.999),
+        )
+
+    def compute_glo_loss(self, original, generated, latent):
+        reconstruction_loss = F.mse_loss(generated, original)
+        latent_reg = torch.mean(torch.norm(latent, dim=1))
+        return (
+            self.reconstruction_lambda * reconstruction_loss
+            + self.latent_reg_lambda * latent_reg
+        )
+
+    def compute_contrastive_loss(self, projections):
+        total_loss = 0
+        for proj_tuple in projections:
+            for i in range(len(proj_tuple)):
+                for j in range(i + 1, len(proj_tuple)):
+                    total_loss += self.cyclemixLayer.nt_xent(
+                        proj_tuple[i], proj_tuple[j]
                     )
-                    bottleneck.downsample[1] = Identity()
-    model.train()
-    return model
+        return total_loss
 
+    def update(self, minibatches, unlabeled=None):
+        device = next(self.network.parameters()).device
+        minibatches = [(x.to(device), y.to(device)) for x, y in minibatches]
+        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
 
-class Identity(nn.Module):
-    """An identity layer"""
+        # Original and augmented samples
+        orig_samples = minibatches_aug[: len(minibatches)]
+        aug_samples = minibatches_aug[len(minibatches) :]
 
-    def __init__(self):
-        super(Identity, self).__init__()
+        # Classification
+        all_x = torch.cat([x for x, y in orig_samples])
+        all_y = torch.cat([y for x, y in orig_samples])
+        class_loss = F.cross_entropy(self.predict(all_x), all_y)
 
-    def forward(self, x):
-        return x
+        # GLO loss computation
+        glo_loss = 0
+        reconstruction_losses = []
+        silhouette_scores = []
+        fid_scores = []
 
+        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
+            _, z = self.cyclemixLayer.glo(x_orig, 0)
+            current_glo_loss = self.compute_glo_loss(x_orig, x_aug, z)
+            glo_loss += current_glo_loss
 
-class MLP(nn.Module):
-    """Just  an MLP"""
+            # Compute metrics for ALD
+            reconstruction_losses.append(F.mse_loss(x_aug, x_orig).item())
 
-    def __init__(self, n_inputs, n_outputs, hparams):
-        super(MLP, self).__init__()
-        self.input = nn.Linear(n_inputs, hparams["mlp_width"])
-        self.dropout = nn.Dropout(hparams["mlp_dropout"])
-        self.hiddens = nn.ModuleList(
-            [
-                nn.Linear(hparams["mlp_width"], hparams["mlp_width"])
-                for _ in range(hparams["mlp_depth"] - 2)
-            ]
-        )
-        self.output = nn.Linear(hparams["mlp_width"], n_outputs)
-        self.n_outputs = n_outputs
+            # Compute Silhouette score on latent representations
+            with torch.no_grad():
+                z_np = z.cpu().numpy()
+                if len(z_np) > 1:  # Need at least 2 samples
+                    labels = np.random.randint(
+                        0, 2, len(z_np)
+                    )  # Generate random labels
+                    silhouette_scores.append(silhouette_score(z_np, labels))
 
-    def forward(self, x):
-        x = self.input(x)
-        x = self.dropout(x)
-        x = F.relu(x)
-        for hidden in self.hiddens:
-            x = hidden(x)
-            x = self.dropout(x)
-            x = F.relu(x)
-        x = self.output(x)
-        return x
+                # Compute FID score (simplified version)
+                fid_scores.append(torch.norm(x_aug - x_orig).item())
 
+        # Update latent dimension if needed
+        avg_reconstruction = np.mean(reconstruction_losses)
+        avg_silhouette = np.mean(silhouette_scores) if silhouette_scores else 0
+        avg_fid = np.mean(fid_scores)
 
-class ResNet(torch.nn.Module):
-    """ResNet with the softmax chopped off and the batchnorm frozen"""
-
-    def __init__(self, input_shape, hparams):
-        super(ResNet, self).__init__()
-        if hparams["resnet18"]:
-            self.network = torchvision.models.resnet18(pretrained=True)
-            self.n_outputs = 512
-        else:
-            self.network = torchvision.models.resnet50(pretrained=True)
-            self.n_outputs = 2048
-
-        # self.network = remove_batch_norm_from_resnet(self.network)
-
-        # adapt number of channels
-        nc = input_shape[0]
-        if nc != 3:
-            tmp = self.network.conv1.weight.data.clone()
-
-            self.network.conv1 = nn.Conv2d(
-                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
-            )
-
-            for i in range(nc):
-                self.network.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
-
-        # save memory
-        del self.network.fc
-        self.network.fc = Identity()
-
-        self.freeze_bn()
-        self.hparams = hparams
-        self.dropout = nn.Dropout(hparams["resnet_dropout"])
-
-    def forward(self, x):
-        """Encode x into a feature vector of size n_outputs."""
-        return self.dropout(self.network(x))
-
-    def train(self, mode=True):
-        """
-        Override the default train() to freeze the BN parameters
-        """
-        super().train(mode)
-        self.freeze_bn()
-
-    def freeze_bn(self):
-        for m in self.network.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-
-class MNIST_CNN(nn.Module):
-    """
-    Hand-tuned architecture for MNIST.
-    Weirdness I've noticed so far with this architecture:
-    - adding a linear layer after the mean-pool in features hurts
-        RotatedMNIST-100 generalization severely.
-    """
-
-    n_outputs = 128
-
-    def __init__(self, input_shape):
-        super(MNIST_CNN, self).__init__()
-        self.conv1 = nn.Conv2d(input_shape[0], 64, 3, 1, padding=1)
-        self.conv2 = nn.Conv2d(64, 128, 3, stride=2, padding=1)
-        self.conv3 = nn.Conv2d(128, 128, 3, 1, padding=1)
-        self.conv4 = nn.Conv2d(128, 128, 3, 1, padding=1)
-
-        self.bn0 = nn.GroupNorm(8, 64)
-        self.bn1 = nn.GroupNorm(8, 128)
-        self.bn2 = nn.GroupNorm(8, 128)
-        self.bn3 = nn.GroupNorm(8, 128)
-
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.bn0(x)
-
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = self.bn1(x)
-
-        x = self.conv3(x)
-        x = F.relu(x)
-        x = self.bn2(x)
-
-        x = self.conv4(x)
-        x = F.relu(x)
-        x = self.bn3(x)
-
-        x = self.avgpool(x)
-        x = x.view(len(x), -1)
-        return x
-
-
-class ContextNet(nn.Module):
-    def __init__(self, input_shape):
-        super(ContextNet, self).__init__()
-
-        # Keep same dimensions
-        padding = (5 - 1) // 2
-        self.context_net = nn.Sequential(
-            nn.Conv2d(input_shape[0], 64, 5, padding=padding),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 5, padding=padding),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 1, 5, padding=padding),
+        self.cyclemixLayer.glo.update_dimension(
+            avg_reconstruction, avg_silhouette, avg_fid
         )
 
-    def forward(self, x):
-        return self.context_net(x)
+        # Contrastive loss
+        contrastive_loss = self.compute_contrastive_loss(projections)
 
+        # Total loss
+        total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
 
-class ViTFeaturizer(torch.nn.Module):
-    """ViT feature extractor with consistent output dimension"""
+        # Optimization
+        self.optimizer.zero_grad()
+        self.glo_optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        self.glo_optimizer.step()
 
-    def __init__(self, input_shape, hparams):
-        super(ViTFeaturizer, self).__init__()
-        # Load pretrained ViT
-        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224")
+        return {
+            "loss": total_loss.item(),
+            "class_loss": class_loss.item(),
+            "glo_loss": glo_loss.item(),
+            "contrastive_loss": contrastive_loss.item(),
+            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
+        }
 
-        # Match output dimension with original ResNet
-        if hparams.get("resnet18", True):
-            self.n_outputs = 512
-        else:
-            self.n_outputs = 2048
-
-        # Add linear projection to match expected feature dimension
-        self.feature_projection = nn.Linear(768, self.n_outputs)
-
-        self.dropout = nn.Dropout(hparams.get("vit_dropout", 0.1))
-        self.hparams = hparams
-
-    def forward(self, x):
-        """
-        Input: (batch_size, channels, height, width)
-        Output: (batch_size, n_outputs) where n_outputs matches ResNet
-        """
-        # ViT forward pass
-        outputs = self.vit(x)
-        # Get CLS token features
-        features = outputs.last_hidden_state[:, 0]  # Shape: (batch_size, 768)
-        # Project to match ResNet dimension
-        features = self.feature_projection(features)  # Shape: (batch_size, n_outputs)
-        return self.dropout(features)
-
-    def train(self, mode=True):
-        super().train(mode)
-        # Keep batch norm in eval mode if it exists
-        self.freeze_bn()
-
-    def freeze_bn(self):
-        for m in self.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-
-def Featurizer(input_shape, hparams):
-    """Auto-select an appropriate featurizer for the given input shape."""
-    print(input_shape)
-    if len(input_shape) == 1:
-        return MLP(input_shape[0], hparams["mlp_width"], hparams)
-    elif input_shape[1:3] == (28, 28):
-        return MNIST_CNN(input_shape)
-    elif input_shape[1:3] == (32, 32):
-        return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.0)
-    elif input_shape[1:3] == (224, 224):
-        return ViTFeaturizer(input_shape, hparams)
-    else:
-        raise NotImplementedError
-
-
-def Classifier(in_features, out_features, is_nonlinear=False):
-    if is_nonlinear:
-        return torch.nn.Sequential(
-            torch.nn.Linear(in_features, in_features // 2),
-            torch.nn.ReLU(),
-            torch.nn.Linear(in_features // 2, in_features // 4),
-            torch.nn.ReLU(),
-            torch.nn.Linear(in_features // 4, out_features),
-        )
-    else:
-        return torch.nn.Linear(in_features, out_features)
-
-
-class WholeFish(nn.Module):
-    def __init__(self, input_shape, num_classes, hparams, weights=None):
-        super(WholeFish, self).__init__()
-        featurizer = Featurizer(input_shape, hparams)
-        classifier = Classifier(
-            featurizer.n_outputs, num_classes, hparams["nonlinear_classifier"]
-        )
-        self.net = nn.Sequential(featurizer, classifier)
-        if weights is not None:
-            self.load_state_dict(copy.deepcopy(weights))
-
-    def reset_weights(self, weights):
-        self.load_state_dict(copy.deepcopy(weights))
-
-    def forward(self, x):
-        return self.net(x)
+    def predict(self, x):
+        return self.classifier(self.featurizer(x))
