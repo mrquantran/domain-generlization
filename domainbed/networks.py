@@ -29,13 +29,13 @@ class ALDModule(nn.Module):
     def __init__(
         self,
         initial_dim=100,
-        min_dim=10,
+        min_dim=20,
         max_dim=200,
         reduction_rate=0.1,
         expansion_rate=0.1,
         eval_frequency=100,
         patience=5,
-        metric_weights={"reconstruction": 0.4, "silhouette": 1, "fid": 0.75},
+        metric_weights={"reconstruction": 0.4, "silhouette": 1.0, "fid": 1.0},
     ):
         super(ALDModule, self).__init__()
         self.current_dim = initial_dim
@@ -46,6 +46,10 @@ class ALDModule(nn.Module):
         self.eval_frequency = eval_frequency
         self.patience = patience
         self.metric_weights = metric_weights
+
+        # Ensure min_dim and max_dim are within valid range
+        assert 1 <= self.min_dim <= self.max_dim, "min_dim must be >= 1 and <= max_dim"
+        assert self.max_dim >= self.min_dim, "max_dim must be >= min_dim"
 
         # Metrics history with exponential moving average
         self.ema_alpha = 0.1
@@ -138,8 +142,8 @@ class ALDModule(nn.Module):
         )
         recent_scores = [
             (
-                self.metric_weights["reconstruction"]
-                * self.metrics_history["reconstruction_loss"][-i]
+                # self.metric_weights["reconstruction"]
+                # * self.metrics_history["reconstruction_loss"][-i]
                 + self.metric_weights["silhouette"]
                 * self.metrics_history["silhouette_score"][-i]
                 + self.metric_weights["fid"] * self.metrics_history["fid_score"][-i]
