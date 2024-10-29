@@ -209,6 +209,7 @@ class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
 
+        self.current_epoch = 0
         self.featurizer = networks.Featurizer(input_shape, self.hparams)
         self.classifier = networks.Classifier(
             self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
@@ -255,52 +256,37 @@ class CYCLEMIX(Algorithm):
         return total_loss
 
     def update(self, minibatches, unlabeled=None):
+        if not hasattr(self, 'current_epoch'):
+            self.current_epoch = 0
+        self.current_epoch += 1
+
         device = next(self.network.parameters()).device
         minibatches = [(x.to(device), y.to(device)) for x, y in minibatches]
         minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
 
-        # Original and augmented samples
-        orig_samples = minibatches_aug[: len(minibatches)]
-        aug_samples = minibatches_aug[len(minibatches) :]
+        # Source and target samples
+        source_samples = minibatches_aug[: len(minibatches)]
+        target_samples = minibatches_aug[len(minibatches) :]
 
         # Classification
-        all_x = torch.cat([x for x, y in orig_samples])
-        all_y = torch.cat([y for x, y in orig_samples])
+        all_x = torch.cat([x for x, y in source_samples])
+        all_y = torch.cat([y for x, y in target_samples])
         class_loss = F.cross_entropy(self.predict(all_x), all_y)
 
         # GLO loss computation
         glo_loss = 0
-        reconstruction_losses = []
-        silhouette_scores = []
-        fid_scores = []
 
-        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
-            _, z = self.cyclemixLayer.glo(x_orig, 0)
-            current_glo_loss = self.compute_glo_loss(x_orig, x_aug, z)
+        for (x_source, _), (x_target, _) in zip(source_samples, target_samples):
+            _, z = self.cyclemixLayer.glo(x_source, 0)
+            current_glo_loss = self.compute_glo_loss(x_source, x_target, z)
             glo_loss += current_glo_loss
 
-            # Compute metrics for ALD
-            reconstruction_losses.append(F.mse_loss(x_aug, x_orig).item())
-
-            # Compute Silhouette score on latent representations
-            with torch.no_grad():
-                z_np = z.cpu().numpy()
-                if len(z_np) > 1:  # Need at least 2 samples
-                    labels = np.random.randint(0, 2, len(z_np))  # Generate random labels
-                    silhouette_scores.append(silhouette_score(z_np, labels))
-
-                # Compute FID score (simplified version)
-                fid_scores.append(torch.norm(x_aug - x_orig).item())
-
-        # Update latent dimension if needed
-        avg_reconstruction = np.mean(reconstruction_losses)
-        avg_silhouette = np.mean(silhouette_scores) if silhouette_scores else 0
-        avg_fid = np.mean(fid_scores)
-
         self.cyclemixLayer.glo.update_dimension(
-            avg_reconstruction, avg_silhouette, avg_fid
+            x_source=source_samples,
+            x_target=target_samples,
+            current_epoch=self.current_epoch,
         )
-
+        
         # Contrastive loss
         contrastive_loss = self.compute_contrastive_loss(projections)
 
@@ -319,7 +305,8 @@ class CYCLEMIX(Algorithm):
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
-            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim
+            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
+            "current_epoch": self.current_epoch,
         }
 
     def predict(self, x):
