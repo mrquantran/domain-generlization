@@ -23,200 +23,179 @@ from sklearn.metrics import silhouette_score
 from scipy.stats import wasserstein_distance
 
 
+import torch
+import torch.nn as nn
+import numpy as np
+from sklearn.metrics import silhouette_score
+import numpy.polynomial.polynomial as poly
+
+
 class ALDModule(nn.Module):
-    """Enhanced Automatic Latent Dimension module for domain generalization"""
+    """Adaptive Latent Dimensionality Module following the exact ALD-VAE algorithm specification"""
 
     def __init__(
         self,
-        initial_dim=100,
-        min_dim=50,
-        max_dim=200,
-        reduction_rate=0.1,
-        expansion_rate=0.1,
-        eval_frequency=100,
-        patience=5,
-        metric_weights={"reconstruction": 0.4, "silhouette": 1.0, "fid": 0.15},
+        initial_dim=100,  # nz in algorithm
+        latent_decrease=5,
+        patience=5,  # p in algorithm
+        window_size=5,  # w in algorithm
+        n_classes=10,  # k_classes in algorithm
+        min_dim=10,  # Minimum dimension allowed
+        slope_threshold=1e-4,  # Threshold for slope significance
     ):
         super(ALDModule, self).__init__()
         self.current_dim = initial_dim
-        self.min_dim = min_dim
-        self.max_dim = max_dim
-        self.reduction_rate = reduction_rate
-        self.expansion_rate = expansion_rate
-        self.eval_frequency = eval_frequency
+        self.latent_decrease = latent_decrease
         self.patience = patience
-        self.metric_weights = metric_weights
+        self.window_size = window_size
+        self.n_classes = n_classes
+        self.min_dim = min_dim
+        self.slope_threshold = slope_threshold
 
-        # Ensure min_dim and max_dim are within valid range
-        assert 1 <= self.min_dim <= self.max_dim, "min_dim must be >= 1 and <= max_dim"
-        assert self.max_dim >= self.min_dim, "max_dim must be >= min_dim"
+        # Tracking variables as per algorithm
+        self.s_scores = []  # Silhouette scores
+        self.recon_losses = []  # Reconstruction losses
+        self.fid_g = []  # FID scores for generated samples
+        self.fid_r = []  # FID scores for reconstructed samples
+        self.compressing = True  # compressing flag in algorithm
 
-        # Metrics history with exponential moving average
-        self.ema_alpha = 0.1
-        self.metrics_history = {
-            "reconstruction_loss": [],
-            "silhouette_score": [],
-            "fid_score": [],
-            "domain_disc_score": [],  # New metric for domain discrimination
-        }
-        self.ema_metrics = {
-            "reconstruction_loss": 0,
-            "silhouette_score": 0,
-            "fid_score": 0,
-            "domain_disc_score": 0,
-        }
-        self.steps_no_improve = 0
+        # Additional tracking for stability
+        self.consecutive_positive_slopes = 0
+        self.compression_history = []
 
-    def compute_clustering_metrics(self, latent_vectors, n_clusters=5):
-        """Compute clustering quality metrics for latent space"""
-        if len(latent_vectors) < n_clusters:
+    def polyfit_slope(self, values, deg=1):
+        """Calculate slope using polynomial fitting with enhanced stability"""
+        if len(values) < self.window_size:
             return 0.0
 
-        # Perform K-means clustering
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        cluster_labels = kmeans.fit_predict(latent_vectors)
+        y = np.array(values[-self.window_size :])
+        x = np.arange(len(y))
 
-        # Compute silhouette score
-        sil_score = silhouette_score(latent_vectors, cluster_labels)
-        return sil_score
+        # Normalize values for numerical stability
+        y_mean = np.mean(y)
+        y_std = np.std(y) if np.std(y) != 0 else 1
+        y_normalized = (y - y_mean) / y_std
 
-    def compute_fid_score(self, real_features, generated_features):
-        """Compute Fréchet Inception Distance between real and generated features"""
-        mu1, sigma1 = real_features.mean(dim=0), torch.cov(real_features.T)
-        mu2, sigma2 = generated_features.mean(dim=0), torch.cov(generated_features.T)
+        try:
+            coeffs = poly.polyfit(x, y_normalized, deg)
+            slope = coeffs[1] * y_std  # Denormalize slope
+            return slope
+        except np.linalg.LinAlgError:
+            return 0.0  # Return 0 if fitting fails
 
-        # Calculate FID
-        diff = mu1 - mu2
-        covmean = torch.sqrt(sigma1 @ sigma2)
+    def update_metrics(self, z_samples, val_data, model):
+        """Update all metrics with enhanced error handling and validation"""
+        try:
+            # Validate inputs
+            if not torch.is_tensor(z_samples) or not torch.is_tensor(val_data):
+                raise ValueError("Inputs must be torch tensors")
 
-        if torch.is_complex(covmean):
-            covmean = torch.real(covmean)
+            # Step 8: KMeans clustering with stability improvements
+            z_numpy = z_samples.detach().cpu().numpy()
+            kmeans = KMeans(n_clusters=min(self.n_classes, len(z_numpy)))
+            labels = kmeans.fit_predict(z_numpy)
 
-        fid = torch.sum(diff**2) + torch.trace(sigma1 + sigma2 - 2 * covmean)
-        return fid.item()
-
-    def update_ema_metrics(self, metrics):
-        """Update exponential moving average of metrics"""
-        for key, value in metrics.items():
-            if key in self.ema_metrics:
-                self.ema_metrics[key] = (
-                    self.ema_alpha * value
-                    + (1 - self.ema_alpha) * self.ema_metrics[key]
-                )
-                self.metrics_history[key].append(self.ema_metrics[key])
-
-    def compute_domain_discrimination(self, latent_vectors, domain_labels):
-        """Compute domain discrimination score"""
-
-        # Convert to numpy for wasserstein distance calculation
-        latent_np = latent_vectors.detach().cpu().numpy()
-        unique_domains = np.unique(domain_labels)
-
-        # Calculate average Wasserstein distance between domain pairs
-        distances = []
-        for i in range(len(unique_domains)):
-            for j in range(i + 1, len(unique_domains)):
-                dom1_vectors = latent_np[domain_labels == unique_domains[i]]
-                dom2_vectors = latent_np[domain_labels == unique_domains[j]]
-
-                # Calculate distance for each dimension
-                dim_distances = []
-                for dim in range(dom1_vectors.shape[1]):
-                    dist = wasserstein_distance(
-                        dom1_vectors[:, dim], dom2_vectors[:, dim]
-                    )
-                    dim_distances.append(dist)
-                distances.append(np.mean(dim_distances))
-
-        return np.mean(distances) if distances else 0.0
-
-    def should_adjust_dimension(self, metrics):
-        """Determine if and how latent dimension should be adjusted"""
-
-        # Update moving averages
-        self.update_ema_metrics(metrics)
-
-        # Check recent history
-        history_length = min(
-            self.patience, len(self.metrics_history["reconstruction_loss"])
-        )
-        recent_scores = [
-            (
-                self.metrics_history["silhouette_score"][-i]
-            )
-            for i in range(1, history_length + 1)
-        ]
-
-        # Determine trend 
-        trend = np.mean(np.diff(recent_scores)) if len (recent_scores) > 1 else 0
-
-        # Decision logic
-        if trend > 0:
-            if metrics["fid_score"] > self.ema_metrics["fid_score"] and metrics["reconstruction_loss"] > self.ema_metrics["reconstruction_loss"]:
-                return "maintain"
-            elif self.current_dim > self.min_dim:
-                return "reduce"
-        elif metrics["fid_score"] < self.ema_metrics["fid_score"] and metrics["reconstruction_loss"] < self.ema_metrics["reconstruction_loss"] and metrics["silhouette_score"] > self.ema_metrics["silhouette_score"]:
-            if self.steps_no_improve >= self.patience:
-                self.steps_no_improve = 0
-                return "reduce"
+            # Step 9: Calculate silhouette score with validation
+            if len(np.unique(labels)) > 1:
+                s_score = silhouette_score(z_numpy, labels)
             else:
-                self.steps_no_improve += 1
-        return "maintain"
+                s_score = -1.0  # Invalid clustering case
+            self.s_scores.append(float(s_score))
 
-    def adjust_dimension(self, action):
-        """Adjust latent dimension based on action"""
-        old_dim = self.current_dim
+            # Step 10: Calculate reconstruction loss
+            recon_loss = float(model.calculate_nll(val_data))
+            self.recon_losses.append(recon_loss)
 
-        if action == "reduce":
-            reduction = max(int(self.current_dim * self.reduction_rate), 1)
-            self.current_dim = max(self.current_dim - reduction, self.min_dim)
-            return ("reduce", self.current_dim)
+            # Step 11: Calculate FID scores with validation
+            fid_g_score, fid_r_score = model.calculate_fid(val_data)
+            self.fid_g.append(float(fid_g_score))
+            self.fid_r.append(float(fid_r_score))
 
-        elif action == "expand":
-            expansion = max(int(self.current_dim * self.expansion_rate), 1)
-            self.current_dim = min(self.current_dim + expansion, self.max_dim)
-            return ("expand", self.current_dim)
+        except Exception as e:
+            print(f"Error in update_metrics: {str(e)}")
+            return False
+        return True
 
-        return ("maintain", self.current_dim)
+    def should_adjust_dimension(self, epoch) -> bool:
+        """Implement steps 15-26 of the algorithm with enhanced stability checks"""
+        if epoch % self.patience != 0 or not self.compressing:
+            return self.compressing
 
+        if self.current_dim <= self.min_dim:
+            self.compressing = False
+            return False
 
-def expand_layer(old_layer, layer_class, new_size):
-    """Expands a layer by adding new neurons"""
-    weights = old_layer.weight.data
-    biases = old_layer.bias.data
-    new_layer = layer_class(new_size[0], new_size[1])
+        # Calculate slopes with significance threshold
+        slopes = {
+            "recon": self.polyfit_slope(self.recon_losses),
+            "silhouette": self.polyfit_slope(self.s_scores),
+            "fid_r": self.polyfit_slope(self.fid_r),
+            "fid_g": self.polyfit_slope(self.fid_g),
+        }
 
-    # Initialize new weights with small random values
-    new_layer.weight.data.normal_(0, 0.02)
-    new_layer.bias.data.zero_()
+        # Apply slope threshold
+        significant_slopes = {k: v > self.slope_threshold for k, v in slopes.items()}
 
-    # Copy old weights and biases
-    new_layer.weight.data[: weights.shape[0], : weights.shape[1]] = weights
-    new_layer.bias.data[: biases.shape[0]] = biases
+        # Step 20-22: Enhanced stopping criteria
+        if all(significant_slopes.values()):
+            self.consecutive_positive_slopes += 1
+            if self.consecutive_positive_slopes >= 2:  # Consistent positive slopes
+                self.compressing = False
+        else:
+            self.consecutive_positive_slopes = 0
 
-    return new_layer
+        # Step 23-24: Adaptive latent decrease
+        if significant_slopes["silhouette"] and self.latent_decrease > 1:
+            self.latent_decrease = max(1, self.latent_decrease - 1)  # Gradual decrease
 
+        # Record compression decision
+        self.compression_history.append(
+            {
+                "epoch": epoch,
+                "slopes": slopes,
+                "compressing": self.compressing,
+                "current_dim": self.current_dim,
+            }
+        )
 
-def downsize_layer(old_layer, layer_class, new_size, importance_scores=None):
-    """Downsizes a layer by removing least important neurons"""
-    weights = old_layer.weight.data
-    biases = old_layer.bias.data
+        return self.compressing
 
-    if importance_scores is None:
-        # Use L1 norm as importance if not provided
-        importance_scores = torch.norm(weights, p=1, dim=1)
+    def adjust_dimension(self):
+        """Implement steps 27-30 with dimension bounds checking"""
+        if not self.compressing:
+            return False, self.current_dim
 
-    # Get indices of most important neurons
-    _, indices = torch.sort(importance_scores, descending=True)
-    keep_indices = indices[: new_size[1]]
+        new_dim = max(self.min_dim, self.current_dim - self.latent_decrease)
+        if new_dim == self.current_dim:
+            self.compressing = False
+            return False, self.current_dim
 
-    # Create new layer
-    new_layer = layer_class(new_size[0], new_size[1])
-    new_layer.weight.data = weights[keep_indices, : new_size[0]]
-    new_layer.bias.data = biases[keep_indices]
+        self.current_dim = new_dim
+        return True, new_dim
 
-    return new_layer
+    def get_current_metrics(self):
+        """Enhanced metrics reporting with validation"""
+        metrics = {
+            "current_dimension": self.current_dim,
+            "compressing": self.compressing,
+            "latent_decrease": self.latent_decrease,
+        }
+
+        if self.s_scores:
+            metrics.update(
+                {
+                    "silhouette": float(self.s_scores[-1]),
+                    "reconstruction": float(self.recon_losses[-1]),
+                    "fid_g": float(self.fid_g[-1]),
+                    "fid_r": float(self.fid_r[-1]),
+                }
+            )
+
+        if len(self.compression_history) > 0:
+            metrics["last_compression"] = self.compression_history[-1]
+
+        return metrics
+
 
 class GLOGenerator(nn.Module):
     """Generator network with proper dimension handling"""
@@ -271,12 +250,11 @@ class GLOGenerator(nn.Module):
         return x
 
 class GLOModule(nn.Module):
-    def __init__(self, latent_dim=100, num_domains=3, batch_size=32, device="cuda"):
+    def __init__(self, latent_dim=256, num_domains=3, batch_size=32, device="cuda"):
         super(GLOModule, self).__init__()
         self.device = device
         self.ald = ALDModule(
-            initial_dim=latent_dim,
-            metric_weights={"reconstruction": 0.4, "silhouette": 1.0, "fid": 0.15},
+            initial_dim=latent_dim
         ).to(self.device)
 
         # Add dimension validator
@@ -326,9 +304,9 @@ class GLOModule(nn.Module):
         }
         action = self.ald.should_adjust_dimension(metrics)
 
-        if action != "maintain":
-            action, new_dim = self.ald.adjust_dimension(action)
-
+        if action:
+            action, new_dim = self.ald.adjust_dimension()
+            print(f"Dimension adjusted: {old_dim} -> {new_dim}")
             if new_dim != old_dim:
                 # Update domain latents
                 new_domain_latents = torch.randn(
