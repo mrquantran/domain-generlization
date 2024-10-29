@@ -350,13 +350,15 @@ class GLOModule(nn.Module):
         ).to(self.device)
 
         # Add dimension adapter layer
-        fc_output_size = (
+        self.fc_output_size = (
             self.generator.init_h * self.generator.init_w * self.generator.init_channels
         )
-        self.dim_adapter = nn.Sequential(
-            nn.Linear(self.ald.current_dim, fc_output_size),
-            nn.ReLU(),
-            nn.BatchNorm1d(fc_output_size),
+        self.dim_adapter = nn.ModuleDict(
+            {
+                "fc": nn.Linear(self.ald.current_dim, self.fc_output_size),
+                "relu": nn.ReLU(),
+                "bn": nn.BatchNorm1d(self.fc_output_size),
+            }
         ).to(device)
 
         self.domain_latents = nn.Parameter(
@@ -396,33 +398,38 @@ class GLOModule(nn.Module):
 
             # Update generator if dimension changes
             if new_dim != old_dim:
-                self.generator = GLOGenerator(
-                    latent_dim=new_dim, output_shape=(3, 224, 224)
-                ).to(self.device)
-
-                # Update domain latents
-                old_latents = self.domain_latents.data
-                self.domain_latents = nn.Parameter(
-                    torch.randn(old_latents.size(0), old_latents.size(1), new_dim),
+                self.fc_output_size = (
+                    self.generator.init_h
+                    * self.generator.init_w
+                    * self.generator.init_channels
                 )
-                self._init_domain_latents()
+                self.dim_adapter = nn.ModuleDict(
+                    {
+                        "fc": nn.Linear(new_dim, self.fc_output_size),
+                        "relu": nn.ReLU(),
+                        "bn": nn.BatchNorm1d(self.fc_output_size),
+                    }
+                ).to(self.device)
+                self.reset_batch_norm()
 
-                # Update dimension manager
-                self.dim_manager.update_network_dimensions(action, new_dim, old_dim)
+    def reset_batch_norm(self):
+        """Reset BatchNorm statistics when dimension changes"""
+        if hasattr(self.dim_adapter, "bn"):
+            self.dim_adapter.bn.reset_parameters()
+            self.dim_adapter.bn.to(self.device)
 
     def forward(self, x, domain_idx):
         device = x.device
         batch_size = x.size(0)
 
-        # Validate input dimension
         z = self.domain_latents[domain_idx, :batch_size].to(device)
+        z = self.input_validator(z).to(device)
 
-        self.input_validator = self.input_validator.to(device)
-        z = self.input_validator(z)
+        # Xử lý dimension adapter từng bước
+        z = self.dim_adapter["fc"](z)
+        z = self.dim_adapter["relu"](z)
+        z = self.dim_adapter["bn"](z)
 
-        # Adapt dimension for generator
-        self.dim_adapter = self.dim_adapter.to(device)
-        z = self.dim_adapter(z)
         z = z.view(
             batch_size,
             self.generator.init_channels,
@@ -430,20 +437,24 @@ class GLOModule(nn.Module):
             self.generator.init_w,
         )
 
-        # Generate output
         generated = self.generator.deconv(z)
         return generated, z.view(batch_size, -1)
 
 
 class ProjectionHead(nn.Module):
-    """Projection head for contrastive learning"""
+    """Enhanced projection head with dynamic dimension handling"""
 
     def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
         super(ProjectionHead, self).__init__()
+
+        # Adjust hidden dimension based on input
+        adjusted_hidden_dim = min(hidden_dim, input_dim * 2)
+
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, adjusted_hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.BatchNorm1d(adjusted_hidden_dim),
+            nn.Linear(adjusted_hidden_dim, output_dim),
         )
 
     def forward(self, x):
@@ -498,17 +509,18 @@ class CycleMixLayer(nn.Module):
         super(CycleMixLayer, self).__init__()
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
-        # Dynamic feature dimension based on backbone
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
+        self.latent_dim = hparams.get("latent_dim", 100)
+
         # Add dimension adapter
-        self.latent_adapter = DimensionAdapter(
-            hparams.get("latent_dim", 100), self.feature_dim
-        ).to(device)
+        self.latent_adapter = DimensionAdapter(self.latent_dim, self.feature_dim).to(
+            device
+        )
 
         # GLO components
         self.glo = GLOModule(
-            latent_dim=hparams.get("latent_dim", 100),
+            latent_dim=self.latent_dim,
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
             device=self.device,
@@ -516,7 +528,7 @@ class CycleMixLayer(nn.Module):
 
         # Projection head for contrastive learning
         self.projection = ProjectionHead(
-            input_dim=self.feature_dim,
+            input_dim=self.latent_dim,  # Use latent dimension
             hidden_dim=hparams.get("proj_hidden_dim", 2048),
             output_dim=hparams.get("proj_output_dim", 128),
         ).to(device)
@@ -611,76 +623,16 @@ class FeaturizerAdapter(nn.Module):
         adapted_features = self.adapter(features)
         return adapted_features
 
-class ViTFeaturizer(torch.nn.Module):
-    """ViT feature extractor with consistent output dimension"""
-
-    def __init__(self, input_shape, hparams):
-        super(ViTFeaturizer, self).__init__()
-        # Load pretrained ViT
-        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224")
-
-        # Match output dimension with original ResNet
-        if hparams.get("resnet18", True):
-            self.n_outputs = 512
-        else:
-            self.n_outputs = 2048
-
-        # Add linear projection to match expected feature dimension
-        self.feature_projection = nn.Linear(768, self.n_outputs)
-
-        self.dropout = nn.Dropout(hparams.get("vit_dropout", 0.1))
-        self.hparams = hparams
-
-    def forward(self, x):
-        """
-        Input: (batch_size, channels, height, width)
-        Output: (batch_size, n_outputs) where n_outputs matches ResNet
-        """
-        # ViT forward pass
-        outputs = self.vit(x)
-        # Get CLS token features
-        features = outputs.last_hidden_state[:, 0]  # Shape: (batch_size, 768)
-        # Project to match ResNet dimension
-        features = self.feature_projection(features)  # Shape: (batch_size, n_outputs)
-        return self.dropout(features)
-
-    def train(self, mode=True):
-        super().train(mode)
-        # Keep batch norm in eval mode if it exists
-        self.freeze_bn()
-
-    def freeze_bn(self):
-        for m in self.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-
-def Featurizer(input_shape, hparams):
-    """Auto-select an appropriate featurizer for the given input shape."""
-    print(input_shape)
-    if len(input_shape) == 1:
-        return MLP(input_shape[0], hparams["mlp_width"], hparams)
-    elif input_shape[1:3] == (28, 28):
-        return MNIST_CNN(input_shape)
-    elif input_shape[1:3] == (32, 32):
-        return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.0)
-    elif input_shape[1:3] == (224, 224):
-        return ViTFeaturizer(input_shape, hparams)
-    else:
-        raise NotImplementedError
-
-
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
+
         self.featurizer = networks.Featurizer(input_shape, self.hparams)
         self.classifier = networks.Classifier(
             self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
         )
-
-        self.network = nn.Sequential(self.featurizer, self.classifier)
-
-        device = next(self.network.parameters()).device
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.network = nn.Sequential(self.featurizer, self.classifier).to(device)
         self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
 
         # Parameters
@@ -752,9 +704,7 @@ class CYCLEMIX(Algorithm):
             with torch.no_grad():
                 z_np = z.cpu().numpy()
                 if len(z_np) > 1:  # Need at least 2 samples
-                    labels = np.random.randint(
-                        0, 2, len(z_np)
-                    )  # Generate random labels
+                    labels = np.random.randint(0, 2, len(z_np))  # Generate random labels
                     silhouette_scores.append(silhouette_score(z_np, labels))
 
                 # Compute FID score (simplified version)
@@ -787,5 +737,8 @@ class CYCLEMIX(Algorithm):
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
-            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
+            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim
         }
+
+    def predict(self, x):
+        return self.classifier(self.featurizer(x))

@@ -63,16 +63,6 @@ class ALDModule(nn.Module):
         }
         self.steps_no_improve = 0
 
-    def update_ema_metrics(self, metrics):
-        """Update exponential moving average of metrics"""
-        for key, value in metrics.items():
-            if key in self.ema_metrics:
-                self.ema_metrics[key] = (
-                    self.ema_alpha * value
-                    + (1 - self.ema_alpha) * self.ema_metrics[key]
-                )
-                self.metrics_history[key].append(self.ema_metrics[key])
-
     def compute_clustering_metrics(self, latent_vectors, n_clusters=5):
         """Compute clustering quality metrics for latent space"""
         if len(latent_vectors) < n_clusters:
@@ -88,7 +78,6 @@ class ALDModule(nn.Module):
 
     def compute_fid_score(self, real_features, generated_features):
         """Compute Fréchet Inception Distance between real and generated features"""
-        # Calculate mean and covariance for real and generated features
         mu1, sigma1 = real_features.mean(dim=0), torch.cov(real_features.T)
         mu2, sigma2 = generated_features.mean(dim=0), torch.cov(generated_features.T)
 
@@ -102,8 +91,19 @@ class ALDModule(nn.Module):
         fid = torch.sum(diff**2) + torch.trace(sigma1 + sigma2 - 2 * covmean)
         return fid.item()
 
+    def update_ema_metrics(self, metrics):
+        """Update exponential moving average of metrics"""
+        for key, value in metrics.items():
+            if key in self.ema_metrics:
+                self.ema_metrics[key] = (
+                    self.ema_alpha * value
+                    + (1 - self.ema_alpha) * self.ema_metrics[key]
+                )
+                self.metrics_history[key].append(self.ema_metrics[key])
+
     def compute_domain_discrimination(self, latent_vectors, domain_labels):
         """Compute domain discrimination score"""
+        
         # Convert to numpy for wasserstein distance calculation
         latent_np = latent_vectors.detach().cpu().numpy()
         unique_domains = np.unique(domain_labels)
@@ -128,6 +128,7 @@ class ALDModule(nn.Module):
 
     def should_adjust_dimension(self, metrics):
         """Determine if and how latent dimension should be adjusted"""
+        
         # Update moving averages
         self.update_ema_metrics(metrics)
 
@@ -372,13 +373,15 @@ class GLOModule(nn.Module):
         ).to(self.device)
 
         # Add dimension adapter layer
-        fc_output_size = (
+        self.fc_output_size = (
             self.generator.init_h * self.generator.init_w * self.generator.init_channels
         )
-        self.dim_adapter = nn.Sequential(
-            nn.Linear(self.ald.current_dim, fc_output_size),
-            nn.ReLU(),
-            nn.BatchNorm1d(fc_output_size),
+        self.dim_adapter = nn.ModuleDict(
+            {
+                "fc": nn.Linear(self.ald.current_dim, self.fc_output_size),
+                "relu": nn.ReLU(),
+                "bn": nn.BatchNorm1d(self.fc_output_size),
+            }
         ).to(device)
 
         self.domain_latents = nn.Parameter(
@@ -394,9 +397,7 @@ class GLOModule(nn.Module):
     def update_dimension(
         self, reconstruction_loss, silhouette_score, fid_score, domain_labels=None
     ):
-        # Validate dimensions before update
         old_dim = self.ald.current_dim
-
         metrics = {
             "reconstruction_loss": reconstruction_loss,
             "silhouette_score": silhouette_score,
@@ -409,40 +410,79 @@ class GLOModule(nn.Module):
                 else 0.0
             ),
         }
-
         action = self.ald.should_adjust_dimension(metrics)
+
         if action != "maintain":
             action, new_dim = self.ald.adjust_dimension(action)
-
-            # Update generator if dimension changes
+    
             if new_dim != old_dim:
-                self.generator = GLOGenerator(
-                    latent_dim=new_dim, output_shape=(3, 224, 224)
+                # Update domain latents
+                new_domain_latents = torch.randn(
+                    self.domain_latents.size(0),
+                    self.domain_latents.size(1),
+                    new_dim,
+                    device=self.device,
+                    dtype=self.domain_latents.dtype
+                )
+
+                # Copy old values for stable transition
+                min_dim = min(old_dim, new_dim)
+                new_domain_latents[:, :, :min_dim] = self.domain_latents[:, :, :min_dim]
+                self.domain_latents = nn.Parameter(new_domain_latents)
+
+                # Update input validator
+                self.input_validator = nn.Linear(new_dim, new_dim).to(self.device)
+
+                # Update dimension adapter
+                self.fc_output_size = (
+                    self.generator.init_h
+                    * self.generator.init_w
+                    * self.generator.init_channels
+                )
+                self.dim_adapter = nn.ModuleDict(
+                    {
+                        "fc": nn.Linear(new_dim, self.fc_output_size),
+                        "relu": nn.ReLU(),
+                        "bn": nn.BatchNorm1d(self.fc_output_size),
+                    }
                 ).to(self.device)
 
-                # Update domain latents
-                old_latents = self.domain_latents.data
-                self.domain_latents = nn.Parameter(
-                    torch.randn(old_latents.size(0), old_latents.size(1), new_dim), 
-                )
-                self._init_domain_latents()
+                self.reset_batch_norm()
+                self.validate_dimensions()
 
-                # Update dimension manager
-                self.dim_manager.update_network_dimensions(action, new_dim, old_dim)
+    def reset_batch_norm(self):
+        """Reset BatchNorm statistics when dimension changes"""
+        if hasattr(self.dim_adapter, "bn"):
+            self.dim_adapter.bn.reset_parameters()
+            self.dim_adapter.bn.to(self.device)
+
+    def validate_dimensions(self):
+        current_dim = self.ald.current_dim
+
+        assert self.domain_latents.size(-1) == current_dim
+        assert self.input_validator.in_features == current_dim
+        assert self.dim_adapter['fc'].in_features == current_dim
 
     def forward(self, x, domain_idx):
         device = x.device
         batch_size = x.size(0)
 
-        # Validate input dimension
+        # Get latent vectors with correct dimension
         z = self.domain_latents[domain_idx, :batch_size].to(device)
+        current_dim = self.ald.current_dim
 
-        self.input_validator = self.input_validator.to(device)
+        if z.size(-1) != current_dim:
+            # Handle dimension mismatch
+            new_z = torch.zeros(batch_size, current_dim, device=device)
+            min_dim = min(z.size(-1), current_dim)
+            new_z[:, :min_dim] = z[:, :min_dim]
+            z = new_z
+
         z = self.input_validator(z)
+        z = self.dim_adapter["fc"](z)
+        z = self.dim_adapter["relu"](z)
+        z = self.dim_adapter["bn"](z)
 
-        # Adapt dimension for generator
-        self.dim_adapter = self.dim_adapter.to(device)
-        z = self.dim_adapter(z)
         z = z.view(
             batch_size,
             self.generator.init_channels,
@@ -450,10 +490,8 @@ class GLOModule(nn.Module):
             self.generator.init_w,
         )
 
-        # Generate output
         generated = self.generator.deconv(z)
         return generated, z.view(batch_size, -1)
-
 
 class ProjectionHead(nn.Module):
     """Enhanced projection head with dynamic dimension handling"""
@@ -473,7 +511,6 @@ class ProjectionHead(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
 
 class NTXentLoss(nn.Module):
     """NT-Xent loss for contrastive learning"""
@@ -503,7 +540,6 @@ class NTXentLoss(nn.Module):
 
         loss = self.criterion(logits, labels)
         return loss
-
 
 class DimensionAdapter(nn.Module):
     """Adapter module to handle dimension mismatches"""
@@ -543,7 +579,7 @@ class CycleMixLayer(nn.Module):
         self.projection = ProjectionHead(
             input_dim=self.latent_dim,  # Use latent dimension
             hidden_dim=hparams.get("proj_hidden_dim", 2048),
-            output_dim=hparams.get("proj_output_dim", 128)
+            output_dim=hparams.get("proj_output_dim", 128),
         ).to(device)
 
         # Contrastive loss
