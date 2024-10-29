@@ -298,14 +298,23 @@ class DimensionManager:
 
         return parent
 
+
 class GLOGenerator(nn.Module):
-    """Generator network following GLO paper architecture"""
+    """Generator network with proper dimension handling"""
 
-    def __init__(self, latent_dim=100, output_dim=3):
+    def __init__(self, latent_dim=100, output_shape=(3, 224, 224)):
         super(GLOGenerator, self).__init__()
+        self.latent_dim = latent_dim
+        self.output_shape = output_shape
 
-        # Following GLO paper architecture
-        self.fc = nn.Linear(latent_dim, 14 * 14 * 256)
+        # Calculate proper dimensions
+        c, h, w = output_shape
+        self.init_h = h // 16
+        self.init_w = w // 16
+        self.init_channels = 256
+
+        # Proper FC layer initialization
+        self.fc = nn.Linear(latent_dim, self.init_h * self.init_w * self.init_channels)
 
         self.deconv = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
@@ -317,15 +326,29 @@ class GLOGenerator(nn.Module):
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
-            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1),
+            nn.ConvTranspose2d(32, c, 4, stride=2, padding=1),
             nn.Tanh(),
         )
 
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.ConvTranspose2d)):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.normal_(m.weight, 1.0, 0.02)
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, z):
-        self.fc = self.fc.to(z.device)
-        self.deconv = self.deconv.to(z.device)
+        device = z.device
+        batch_size = z.size(0)
+
+        # Ensure proper shape handling
         x = self.fc(z)
-        x = x.view(-1, 256, 14, 14)
+        x = x.view(batch_size, self.init_channels, self.init_h, self.init_w)
         x = self.deconv(x)
         return x
 
@@ -340,29 +363,29 @@ class GLOModule(nn.Module):
             metric_weights={"reconstruction": 0.4, "silhouette": 0.3, "fid": 0.3},
         ).to(self.device)
 
-        self.dim_manager = DimensionManager(self)
-        self.latent_dim = latent_dim
-        self.num_domains = num_domains
-        self.batch_size = batch_size
+        # Initialize with proper output shape
+        self.generator = GLOGenerator(
+            latent_dim=self.ald.current_dim,
+            output_shape=(3, 224, 224),  # Standard ViT input size
+        ).to(self.device)
 
-        # Thêm device parameter
-        self.device = (
-            next(self.parameters()).device
-            if len(list(self.parameters())) > 0
-            else "cuda"
-        )
-
-        self.generator = GLOGenerator(self.ald.current_dim).to(self.device)
+        # Update domain latents initialization
         self.domain_latents = nn.Parameter(
-            torch.randn(
-                num_domains, batch_size, self.ald.current_dim, device=self.device
-            )
+            torch.randn(num_domains, batch_size, self.ald.current_dim)
         )
+        self._init_domain_latents()
+
+        self.dim_manager = DimensionManager(self)
+
+    def _init_domain_latents(self):
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
     def update_dimension(
         self, reconstruction_loss, silhouette_score, fid_score, domain_labels=None
     ):
+        # Validate dimensions before update
+        old_dim = self.ald.current_dim
+
         metrics = {
             "reconstruction_loss": reconstruction_loss,
             "silhouette_score": silhouette_score,
@@ -378,15 +401,31 @@ class GLOModule(nn.Module):
 
         action = self.ald.should_adjust_dimension(metrics)
         if action != "maintain":
-            old_dim = self.ald.current_dim
             action, new_dim = self.ald.adjust_dimension(action)
-            self.dim_manager.update_network_dimensions(action, new_dim, old_dim)
+
+            # Update generator if dimension changes
+            if new_dim != old_dim:
+                self.generator = GLOGenerator(
+                    latent_dim=new_dim, output_shape=(3, 224, 224)
+                ).to(self.device)
+
+                # Update domain latents
+                old_latents = self.domain_latents.data
+                self.domain_latents = nn.Parameter(
+                    torch.randn(old_latents.size(0), old_latents.size(1), new_dim)
+                )
+                self._init_domain_latents()
+
+                # Update dimension manager
+                self.dim_manager.update_network_dimensions(action, new_dim, old_dim)
 
     def forward(self, x, domain_idx):
+        device = x.device
         batch_size = x.size(0)
-        z = self.domain_latents[domain_idx, :batch_size].to(x.device)
-        
-        self.generator = self.generator.to(x.device)
+
+        self.generator = self.generator.to(device)
+        z = self.domain_latents[domain_idx, :batch_size].to(device)
+
         generated = self.generator(z)
         return generated, z
 
@@ -436,6 +475,18 @@ class NTXentLoss(nn.Module):
         return loss
 
 
+class DimensionAdapter(nn.Module):
+    """Adapter module to handle dimension mismatches"""
+
+    def __init__(self, in_dim, out_dim):
+        super(DimensionAdapter, self).__init__()
+        self.adapter = nn.Sequential(
+            nn.Linear(in_dim, out_dim), nn.ReLU(), nn.BatchNorm1d(out_dim)
+        )
+
+    def forward(self, x):
+        return self.adapter(x)
+
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
         super(CycleMixLayer, self).__init__()
@@ -444,12 +495,18 @@ class CycleMixLayer(nn.Module):
         # Dynamic feature dimension based on backbone
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
+        # Add dimension adapter
+        self.latent_adapter = DimensionAdapter(
+            hparams.get("latent_dim", 100), 
+            self.feature_dim
+        ).to(device)
+
         # GLO components
         self.glo = GLOModule(
             latent_dim=hparams.get("latent_dim", 100),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
-            device=self.device,
+            device=self.device
         ).to(device)
 
         # Projection head for contrastive learning
@@ -470,12 +527,17 @@ class CycleMixLayer(nn.Module):
     def process_domain(self, batch, domain_idx, featurizer):
         """Process single domain data"""
         x, y = batch
-        
-        x = x.to(self.device)
-        y = y.to(self.device)
+
+        # Đảm bảo featurizer và input cùng device
+        device = next(featurizer.parameters()).device
+        x = x.to(device)
+        y = y.to(device)
 
         # Generate domain-mixed samples
         x_hat, z = self.glo(x, domain_idx)
+
+        # Đảm bảo x_hat cùng device với featurizer
+        x_hat = x_hat.to(device)
 
         # Extract and project features
         feat = featurizer(x)
@@ -483,6 +545,7 @@ class CycleMixLayer(nn.Module):
         proj = F.normalize(proj, dim=1)
 
         # Normalize generated samples
+        x_hat = x_hat.to(device)
         x_hat = self.norm(x_hat)
 
         return (x, y), (x_hat, y), proj
