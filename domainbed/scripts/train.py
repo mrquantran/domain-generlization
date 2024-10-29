@@ -299,6 +299,8 @@ if __name__ == "__main__":
                 mean_out_acc = np.mean([results[key] for key in out_acc_keys])
                 results["mean_out_acc"] = mean_out_acc
                 
+            misc.print_row([results[key] for key in out_acc_keys], colwidth=12)
+                
             loss = results["loss"]
             misc.print_row(["mean_out_acc", mean_out_acc, 'loss', loss], colwidth=12)
             

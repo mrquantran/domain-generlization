@@ -140,32 +140,28 @@ class ALDModule(nn.Module):
         history_length = min(
             self.patience, len(self.metrics_history["reconstruction_loss"])
         )
-        # recent_scores = [
-        #     (
-        #         self.metric_weights["reconstruction"]
-        #         * self.metrics_history["reconstruction_loss"][-i]
-        #         + self.metric_weights["silhouette"]
-        #         * self.metrics_history["silhouette_score"][-i]
-        #         + self.metric_weights["fid"] * self.metrics_history["fid_score"][-i]
-        #     )
-        #     for i in range(1, history_length + 1)
-        # ]
         recent_scores = [
             (
-                self.metric_weights["silhouette"]
-                * self.metrics_history["silhouette_score"][-i]
+                self.metrics_history["silhouette_score"][-i]
             )
             for i in range(1, history_length + 1)
         ]
 
-        # Determine trend
-        trend = np.mean(np.diff(recent_scores)) if len(recent_scores) > 1 else 0
+        # Determine trend 
+        trend = np.mean(np.diff(recent_scores)) if len (recent_scores) > 1 else 0
 
         # Decision logic
-        if trend > 0 and self.current_dim > self.min_dim:
-            return "reduce"
-        elif trend < 0 and self.current_dim < self.max_dim:
-            return "expand"
+        if trend > 0:
+            if metrics["fid_score"] > self.ema_metrics["fid_score"] and metrics["reconstruction_loss"] > self.ema_metrics["reconstruction_loss"]:
+                return "maintain"
+            elif self.current_dim > self.min_dim:
+                return "reduce"
+        elif metrics["fid_score"] < self.ema_metrics["fid_score"] and metrics["reconstruction_loss"] < self.ema_metrics["reconstruction_loss"] and metrics["silhouette_score"] > self.ema_metrics["silhouette_score"]:
+            if self.steps_no_improve >= self.patience:
+                self.steps_no_improve = 0
+                return "reduce"
+            else:
+                self.steps_no_improve += 1
         return "maintain"
 
     def adjust_dimension(self, action):
