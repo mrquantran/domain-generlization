@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+from sklearn.metrics import silhouette_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -332,42 +333,67 @@ class CYCLEMIX(Algorithm):
 
     def update(self, minibatches, unlabeled=None):
         minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
-
-        # Separate original and augmented samples
+        
+        # Original and augmented samples
         orig_samples = minibatches_aug[: len(minibatches)]
         aug_samples = minibatches_aug[len(minibatches) :]
-
-        # Concatenate all samples for classification
+        
+        # Classification
         all_x = torch.cat([x for x, y in orig_samples])
         all_y = torch.cat([y for x, y in orig_samples])
-
-        # Classification loss
         class_loss = F.cross_entropy(self.predict(all_x), all_y)
-
+        
         # GLO loss computation
         glo_loss = 0
+        reconstruction_losses = []
+        silhouette_scores = []
+        fid_scores = []
+        
         for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
             _, z = self.cyclemixLayer.glo(x_orig, 0)
-            glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
-
-        # Contrastive loss computation
+            current_glo_loss = self.compute_glo_loss(x_orig, x_aug, z)
+            glo_loss += current_glo_loss
+            
+            # Compute metrics for ALD
+            reconstruction_losses.append(F.mse_loss(x_aug, x_orig).item())
+            
+            # Compute Silhouette score on latent representations
+            with torch.no_grad():
+                z_np = z.cpu().numpy()
+                if len(z_np) > 1:  # Need at least 2 samples
+                    silhouette_scores.append(silhouette_score(z_np, [0]*len(z_np)))
+                
+                # Compute FID score (simplified version)
+                fid_scores.append(torch.norm(x_aug - x_orig).item())
+        
+        # Update latent dimension if needed
+        avg_reconstruction = np.mean(reconstruction_losses)
+        avg_silhouette = np.mean(silhouette_scores) if silhouette_scores else 0
+        avg_fid = np.mean(fid_scores)
+        
+        self.cyclemixLayer.glo.update_dimension(
+            avg_reconstruction, avg_silhouette, avg_fid
+        )
+        
+        # Contrastive loss
         contrastive_loss = self.compute_contrastive_loss(projections)
-
+        
         # Total loss
         total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
-
-        # Optimization steps
+        
+        # Optimization
         self.optimizer.zero_grad()
         self.glo_optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
         self.glo_optimizer.step()
-
+        
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
+            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim
         }
 
     def predict(self, x):

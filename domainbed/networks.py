@@ -14,7 +14,6 @@ from domainbed.lib import wide_resnet
 import copy
 
 # CYCLEGAN Experiments
-from domainbed.cyclegan.networks import define_G
 from domainbed.cyclegan.utils import get_sources
 
 import torch
@@ -22,6 +21,68 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ALDModule(nn.Module):
+    """Automatic Latent Dimension module for VAE"""
+
+    def __init__(
+        self,
+        initial_dim=100,
+        min_dim=10,
+        reduction_rate=0.1,
+        eval_frequency=100,
+        patience=5,
+    ):
+        super(ALDModule, self).__init__()
+        self.current_dim = initial_dim
+        self.min_dim = min_dim
+        self.reduction_rate = reduction_rate
+        self.eval_frequency = eval_frequency
+        self.patience = patience
+
+        self.metrics_history = {
+            "reconstruction_loss": [],
+            "silhouette_score": [],
+            "fid_score": [],
+        }
+        self.steps_no_improve = 0
+
+    def compute_slope(self, metric_history, window=5):
+        """Compute slope of recent metrics"""
+        if len(metric_history) < window:
+            return 0
+        recent = metric_history[-window:]
+        x = np.arange(len(recent))
+        slope = np.polyfit(x, recent, 1)[0]
+        return slope
+
+    def should_reduce_dimension(self, reconstruction_loss, silhouette_score, fid_score):
+        """Determine if latent dimension should be reduced"""
+        # Update metrics history
+        self.metrics_history["reconstruction_loss"].append(reconstruction_loss)
+        self.metrics_history["silhouette_score"].append(silhouette_score)
+        self.metrics_history["fid_score"].append(fid_score)
+
+        # Compute slopes
+        r_slope = self.compute_slope(self.metrics_history["reconstruction_loss"])
+        s_slope = self.compute_slope(self.metrics_history["silhouette_score"])
+        f_slope = self.compute_slope(self.metrics_history["fid_score"])
+
+        # Check stopping conditions based on slopes
+        if r_slope > 0 and s_slope > 0 and f_slope > 0:
+            self.steps_no_improve += 1
+        else:
+            self.steps_no_improve = 0
+
+        # Return True if we should reduce dimension
+        return (
+            self.steps_no_improve >= self.patience and self.current_dim > self.min_dim
+        )
+
+    def reduce_dimension(self):
+        """Reduce latent dimension"""
+        reduction = max(int(self.current_dim * self.reduction_rate), 1)
+        self.current_dim = max(self.current_dim - reduction, self.min_dim)
+        return self.current_dim
 class GLOGenerator(nn.Module):
     """Generator network following GLO paper architecture"""
 
@@ -52,32 +113,53 @@ class GLOGenerator(nn.Module):
         return x
 
 
+# Modify GLOModule to use ALDModule
 class GLOModule(nn.Module):
     def __init__(self, latent_dim=100, num_domains=3, batch_size=32):
         super(GLOModule, self).__init__()
+        self.ald = ALDModule(initial_dim=latent_dim)
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
 
-        # Generator following GLO paper
-        self.generator = GLOGenerator(latent_dim)
-
-        # Learnable latent codes for each domain - key difference from original GLO
-        # We maintain separate latent codes for each domain
+        self.generator = GLOGenerator(self.ald.current_dim)
         self.domain_latents = nn.Parameter(
-            torch.randn(num_domains, batch_size, latent_dim)
+            torch.randn(num_domains, batch_size, self.ald.current_dim)
         )
-
-        # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
+
+    def update_dimension(self, reconstruction_loss, silhouette_score, fid_score):
+        """Update latent dimension if needed"""
+        if self.ald.should_reduce_dimension(
+            reconstruction_loss, silhouette_score, fid_score
+        ):
+            new_dim = self.ald.reduce_dimension()
+            # Update generator and latent codes
+            old_generator = self.generator
+            self.generator = GLOGenerator(new_dim)
+
+            # Transfer weights where possible
+            with torch.no_grad():
+                for new_param, old_param in zip(
+                    self.generator.parameters(), old_generator.parameters()
+                ):
+                    if new_param.data.shape == old_param.data.shape:
+                        new_param.data.copy_(old_param.data)
+
+            # Update domain latents
+            old_latents = self.domain_latents
+            self.domain_latents = nn.Parameter(
+                torch.randn(self.num_domains, self.batch_size, new_dim)
+            )
+            # Copy over values for dimensions that still exist
+            with torch.no_grad():
+                self.domain_latents.data[:, :, : min(new_dim, old_latents.size(2))] = (
+                    old_latents.data[:, :, : min(new_dim, old_latents.size(2))]
+                )
 
     def forward(self, x, domain_idx):
         batch_size = x.size(0)
-
-        # Get corresponding latent codes for the domain
         z = self.domain_latents[domain_idx, :batch_size]
-
-        # Generate images
         generated = self.generator(z)
         return generated, z
 
