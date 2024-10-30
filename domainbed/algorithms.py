@@ -208,7 +208,7 @@ class CUTMIX(Algorithm):
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
-
+        self.num_classes = num_classes
         self.current_epoch = 0
         self.featurizer = networks.Featurizer(input_shape, self.hparams)
         self.classifier = networks.Classifier(

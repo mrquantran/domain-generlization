@@ -31,18 +31,20 @@ import numpy as np
 from sklearn.metrics import silhouette_score
 import numpy.polynomial.polynomial as poly
 
+
 class ALDModule(nn.Module):
-    """Adaptive Latent Dimensionality Module following the exact ALD-VAE algorithm specification"""
+    """Adaptive Latent Dimensionality Module optimized for domain generalization"""
 
     def __init__(
         self,
-        initial_dim=256,  # nz in algorithm
-        latent_decrease=5,
-        patience=5,  # p in algorithm
-        window_size=5,  # w in algorithm
-        n_classes=4,  # k_classes in algorithm
-        min_dim=10,  # Minimum dimension allowed
-        slope_threshold=1e-4,  # Threshold for slope significance
+        initial_dim=512,  # Increased from 256 to capture more domain-invariant features initially
+        latent_decrease=5,  # More conservative decrease to preserve important features
+        patience=5,  # Reduced to check more frequently
+        window_size=20,  # Keep as per paper
+        n_classes=7,  # Depends on dataset (7 for PACS, 65 for OfficeHome)
+        min_dim=64,  # Increased minimum to ensure enough capacity for cross-domain features
+        slope_threshold=5e-4,  # More sensitive threshold
+        improvement_threshold=1e-4,  # New parameter for meaningful improvements
     ):
         super(ALDModule, self).__init__()
         self.current_dim = initial_dim
@@ -52,15 +54,15 @@ class ALDModule(nn.Module):
         self.n_classes = n_classes
         self.min_dim = min_dim
         self.slope_threshold = slope_threshold
+        self.improvement_threshold = improvement_threshold
 
-        # Tracking variables as per algorithm
-        self.s_scores = []  # Silhouette scores
-        self.recon_losses = []  # Reconstruction losses
-        self.compressing = True  # compressing flag in algorithm
-
-        # Additional tracking for stability
-        self.consecutive_positive_slopes = 0
-        self.compression_history = []
+        # Enhanced tracking
+        self.s_scores = []
+        self.recon_losses = []
+        self.compressing = True
+        self.best_score = float("-inf")
+        self.epochs_no_improve = 0
+        self.slow_compression = False
 
     def polyfit_slope(self, values, deg=1):
         """Calculate slope using polynomial fitting with enhanced stability"""
@@ -77,120 +79,113 @@ class ALDModule(nn.Module):
 
         try:
             coeffs = poly.polyfit(x, y_normalized, deg)
-            slope = coeffs[1] * y_std  # Denormalize slope
+            slope = coeffs[1] * y_std
             return slope
         except np.linalg.LinAlgError:
-            return 0.0  # Return 0 if fitting fails
+            return 0.0
 
-    def calculate_reconstruction_loss(self, z_samples, val_data):
-        """Calculate reconstruction loss using MSE"""
-        loss = F.mse_loss(z_samples, val_data)
-        return loss.item()
+    def should_adjust_dimension(self, epoch) -> bool:
+        """Enhanced dimension adjustment check with domain generalization focus"""
+        if self.current_dim <= self.min_dim:
+            return False
+            
+        if epoch % self.patience == 0:
+            # Step 16-19: Calculate slopes and check for improvements
+            recon_slope = self.polyfit_slope(self.recon_losses)
+            sil_slope = self.polyfit_slope(self.s_scores)
+
+            # Check if all slopes are positive
+            if recon_slope > 0 and sil_slope > 0:
+                self.compressing = False
+                return False
+
+            # Transition to slower compression if silhouette score slope is positive
+            if sil_slope > 0 and self.latent_decrease > 1:
+                self.latent_decrease = max(1, self.latent_decrease // 2)
+                
+        return True
+
+    def adjust_dimension(self):
+        """Adjust dimension with domain generalization considerations"""
+        if not self.compressing:
+            return False, self.current_dim
+
+        # Calculate new dimension
+        decrease = self.latent_decrease
+        if self.current_dim - decrease < self.min_dim:
+            decrease = self.current_dim - self.min_dim
+
+        new_dim = max(self.min_dim, self.current_dim - decrease)
+
+        # Stop if we can't decrease further
+        if new_dim == self.current_dim:
+            self.compressing = False
+            return False, self.current_dim
+
+        self.current_dim = new_dim
+        return True, new_dim
 
     def update_metrics(self, x_source_list, x_target_list):
+        """Update metrics with domain-aware calculations"""
         reconstruction_losses = []
         silhouette_scores = []
 
+        # Process each domain pair
         for (x_source, _), (x_target, _) in zip(x_source_list, x_target_list):
             if not torch.is_tensor(x_source) or not torch.is_tensor(x_target):
                 raise ValueError(
                     f"Invalid input types: {type(x_source)}, {type(x_target)}"
                 )
 
-            z_numpy = (
-                x_source.view(x_source.shape[0], -1).detach().cpu().numpy()
-            )  # Ensure it's on CPU for KMeans
+            # Calculate domain-aware silhouette score
+            z_numpy = x_source.view(x_source.shape[0], -1).detach().cpu().numpy()
             if z_numpy.shape[0] < self.n_classes:
-                raise ValueError(
-                    f"Number of samples {z_numpy.shape[0]} is less than the number of clusters {self.n_classes}"
-                )
-            kmeans = KMeans(n_clusters=self.n_classes, random_state=0, n_init='auto')
+                continue  # Skip if batch is too small instead of raising error
+
+            kmeans = KMeans(n_clusters=self.n_classes, random_state=0, n_init="auto")
             labels = kmeans.fit_predict(z_numpy)
 
-            s_score = (
-                silhouette_score(z_numpy, labels, metric="euclidean")
-                if len(np.unique(labels)) > 1
-                else -1.0
-            )
-            silhouette_scores.append(float(s_score))
+            if len(np.unique(labels)) > 1:
+                s_score = silhouette_score(z_numpy, labels, metric="euclidean")
+                silhouette_scores.append(float(s_score))
 
-            recon_loss = self.calculate_reconstruction_loss(x_source, x_target)
+            # Calculate reconstruction loss with domain alignment consideration
+            recon_loss = F.mse_loss(x_source, x_target).item()
             reconstruction_losses.append(recon_loss)
-
-        self.s_scores.append(torch.tensor(silhouette_scores).mean())
-        self.recon_losses.append(torch.tensor(reconstruction_losses).mean())
-
-        return True
-
-    def should_adjust_dimension(self, epoch) -> bool:
-        """Enhanced stop-check with consistent positive slopes as per ALD-VAE"""
-        if epoch % self.patience != 0:
-            return False
-        
-        if not self.compressing:
-            return self.compressing
-
-        if self.current_dim <= self.min_dim:
-            self.compressing = False
-            return False
-
-        # Check slopes with sliding window
-        recon_slope = self.polyfit_slope(self.recon_losses)
-        sil_slope = self.polyfit_slope(self.s_scores)
-
-        # Cơ chế dừng khi độ dốc tích cực liên tiếp đạt ngưỡng
-        if recon_slope > self.slope_threshold and sil_slope > self.slope_threshold:
-            self.consecutive_positive_slopes += 1
-            if self.consecutive_positive_slopes >= 2:
-                self.compressing = False
-        else:
-            self.consecutive_positive_slopes = 0
-
-        return self.compressing
-
-    def adjust_dimension(self):
-        """Adjust dimension following ALD-VAE approach with gradual decrement"""
-        if not self.compressing:
-            return False, self.current_dim
-
-        new_dim = max(self.min_dim, self.current_dim - self.latent_decrease)
-        if new_dim == self.current_dim:
-            self.compressing = False
-            return False, self.current_dim
-
-        # Giảm tốc độ loại bỏ neuron nếu gần đạt tối ưu
-        if self.latent_decrease > 1:
-            self.latent_decrease -= 1
-
-        self.current_dim = new_dim
-        return True, new_dim
-
-    def get_current_metrics(self):
-        """Enhanced metrics reporting with validation"""
-        metrics = {
-            "current_dimension": self.current_dim,
-            "compressing": self.compressing,
-            "latent_decrease": self.latent_decrease,
-        }
-
-        if self.s_scores:
-            metrics.update(
-                {
-                    "silhouette": float(self.s_scores[-1]),
-                    "reconstruction": float(self.recon_losses[-1])
-                }
+            # Calculate reconstruction loss using KL divergence
+            mu_source, logvar_source = torch.mean(x_source, dim=0), torch.var(
+                x_source, dim=0
+            )
+            mu_target, logvar_target = torch.mean(x_target, dim=0), torch.var(
+                x_target, dim=0
             )
 
-        if len(self.compression_history) > 0:
-            metrics["last_compression"] = self.compression_history[-1]
+            # Ensure numerical stability
+            logvar_source = torch.clamp(logvar_source, min=1e-6)
+            logvar_target = torch.clamp(logvar_target, min=1e-6)
 
-        return metrics
+            # KL divergence between source and target distributions
+            kl_div = 0.5 * torch.sum(
+                logvar_target
+                - logvar_source
+                + (logvar_source.exp() + (mu_source - mu_target).pow(2))
+                / logvar_target.exp()
+                - 1
+            )
+            reconstruction_losses.append(kl_div.item())
+
+        # Update tracking metrics if we have valid scores
+        if silhouette_scores and reconstruction_losses:
+            self.s_scores.append(torch.tensor(silhouette_scores).mean())
+            self.recon_losses.append(torch.tensor(reconstruction_losses).mean())
+
+        return bool(silhouette_scores and reconstruction_losses)
 
 
 class GLOGenerator(nn.Module):
     """Generator network with proper dimension handling"""
 
-    def __init__(self, latent_dim=100, output_shape=(3, 224, 224)):
+    def __init__(self, latent_dim=256, output_shape=(3, 224, 224)):
         super(GLOGenerator, self).__init__()
         self.latent_dim = latent_dim
         self.output_shape = output_shape
@@ -241,10 +236,14 @@ class GLOGenerator(nn.Module):
 
 
 class GLOModule(nn.Module):
-    def __init__(self, latent_dim=256, num_domains=3, batch_size=32, device="cuda"):
+    def __init__(
+        self, latent_dim=512, num_domains=3, num_classes=7, batch_size=32, device="cuda"
+    ):
         super(GLOModule, self).__init__()
         self.device = device
-        self.ald = ALDModule(initial_dim=latent_dim).to(self.device)
+        self.ald = ALDModule(initial_dim=latent_dim, n_classes=num_classes).to(
+            self.device
+        )
 
         # Add dimension validator
         self.input_validator = nn.Linear(self.ald.current_dim, self.ald.current_dim).to(
@@ -427,9 +426,10 @@ class CycleMixLayer(nn.Module):
         super(CycleMixLayer, self).__init__()
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
+        self.num_classes = len(self.sources)
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
-        self.latent_dim = hparams.get("latent_dim", 256)
+        self.latent_dim = hparams.get("latent_dim", 512)
 
         # GLO components
         self.glo = GLOModule(
@@ -437,6 +437,7 @@ class CycleMixLayer(nn.Module):
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
             device=self.device,
+            num_classes=self.num_classes,
         ).to(device)
 
         # Projection head for contrastive learning

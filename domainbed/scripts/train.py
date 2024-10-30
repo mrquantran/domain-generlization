@@ -323,19 +323,19 @@ if __name__ == "__main__":
                 save_checkpoint(f"model_step{step}.pkl")
 
             # Early stopping mechanism
-            # if 'best_mean_out_acc' not in globals():
-            #     best_mean_out_acc = float('-inf')
-            #     patience_counter = 0
+            if 'best_mean_out_acc' not in globals():
+                best_mean_out_acc = float('-inf')
+                patience_counter = 0
 
-            # if mean_out_acc > best_mean_out_acc:
-            #     best_mean_out_acc = mean_out_acc
-            #     patience_counter = 0
-            # else:
-            #     patience_counter += 1
+            if mean_out_acc > best_mean_out_acc:
+                best_mean_out_acc = mean_out_acc
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
-            # if patience_counter >= 10:
-            #     misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
-            #     break
+            if patience_counter >= 10:
+                misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
+                break
 
     save_checkpoint("model.pkl")
 
