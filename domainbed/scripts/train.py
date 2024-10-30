@@ -304,7 +304,7 @@ if __name__ == "__main__":
                 mean_out_acc = np.mean([results[key] for key in out_acc_keys])
                 results["mean_out_acc"] = mean_out_acc
 
-            misc.print_row([results[key] for key in out_acc_keys], colwidth=12)
+            misc.print_row(["out_acc"] + [results[key] for key in out_acc_keys], colwidth=12)
 
             loss = results["loss"]
             misc.print_row(["mean_out_acc", mean_out_acc, 'loss', loss], colwidth=12)
@@ -322,13 +322,13 @@ if __name__ == "__main__":
             if args.save_model_every_checkpoint:
                 save_checkpoint(f"model_step{step}.pkl")
 
-            # Early stopping mechanism
-            if 'best_mean_out_acc' not in globals():
-                best_mean_out_acc = float('-inf')
+            # Early stopping mechanism based on loss
+            if 'best_loss' not in globals():
+                best_loss = float('inf')
                 patience_counter = 0
 
-            if mean_out_acc > best_mean_out_acc:
-                best_mean_out_acc = mean_out_acc
+            if loss < best_loss:
+                best_loss = loss
                 patience_counter = 0
             else:
                 patience_counter += 1

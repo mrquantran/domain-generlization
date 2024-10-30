@@ -38,7 +38,7 @@ class ALDModule(nn.Module):
     def __init__(
         self,
         initial_dim=512,  # Increased from 256 to capture more domain-invariant features initially
-        latent_decrease=5,  # More conservative decrease to preserve important features
+        latent_decrease=4,  # More conservative decrease to preserve important features
         patience=5,  # Reduced to check more frequently
         window_size=20,  # Keep as per paper
         n_classes=7,  # Depends on dataset (7 for PACS, 65 for OfficeHome)
@@ -103,7 +103,9 @@ class ALDModule(nn.Module):
             if sil_slope > 0 and self.latent_decrease > 1:
                 self.latent_decrease = max(1, self.latent_decrease // 2)
                 
-        return True
+            return True
+                
+        return False
 
     def adjust_dimension(self):
         """Adjust dimension with domain generalization considerations"""
@@ -274,58 +276,180 @@ class GLOModule(nn.Module):
             )
         )
         self._init_domain_latents()
+        self.prev_domain_latents = torch.zeros_like(self.domain_latents)
 
     def _init_domain_latents(self):
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
-    def update_dimension(
-        self,
-        x_source=None,
-        x_target=None,
-        current_epoch=0,
-    ):
+    def get_most_important_neurons(self, domain_latents, k=5):
+        """Identify important neurons using multiple metrics"""
+        # 1. Magnitude of activations
+        magnitude_scores = torch.abs(domain_latents).mean(dim=(0, 1))
+
+        # 2. Variance across domains
+        variance_scores = torch.var(domain_latents, dim=(0, 1))
+
+        # 3. Domain distinctiveness
+        domain_means = torch.mean(
+            domain_latents, dim=1
+        )  # Tính trung bình trên từng miền
+        domain_separation_scores = torch.zeros(
+            domain_means.shape[1],
+            device=self.device,
+        )  # Khởi tạo điểm phân tách miền
+
+        for i in range(domain_means.shape[1]):  # Lặp qua từng neuron
+            corr_matrix = torch.corrcoef(domain_means[:, i])
+            domain_separation_scores[i] = (
+                1.0 - corr_matrix.mean()
+            )  # Độ tương quan trung bình nghịch đảo
+
+        # Calculate contribution to domain separation
+        for i in range(domain_means.size(1)):
+            neuron_dists = torch.pdist(domain_means[:, i : i + 1])
+            domain_separation_scores[i] = torch.mean(neuron_dists)
+
+        # 4. Temporal stability - Chỉ so sánh khi dimensions giống nhau
+        if hasattr(self, "prev_domain_latents") and self.prev_domain_latents.size(
+            -1
+        ) == domain_latents.size(-1):
+            temporal_scores = 1.0 - torch.abs(
+                torch.mean(domain_latents, dim=(0, 1))
+                - torch.mean(self.prev_domain_latents, dim=(0, 1))
+            )
+        else:
+            temporal_scores = torch.ones_like(magnitude_scores)
+
+        # Normalize scores
+        magnitude_scores = F.normalize(magnitude_scores, dim=0)
+        variance_scores = F.normalize(variance_scores, dim=0)
+        domain_separation_scores = F.normalize(domain_separation_scores, dim=0)
+        temporal_scores = F.normalize(temporal_scores, dim=0)
+
+        # Combine scores with weights
+        importance_scores = (
+            0.2 * magnitude_scores
+            + 0.35 * variance_scores
+            + 0.35 * domain_separation_scores
+            + 0.1 * temporal_scores
+        )
+
+        # Store current latents for next iteration with matching shape
+        self.prev_domain_latents = domain_latents.detach().clone()
+
+        important_indices = torch.topk(
+            importance_scores, k=min(k, len(importance_scores)), largest=True
+        )[1]        
+        return importance_scores, important_indices
+
+    def _find_optimal_neighbors(self, domain_latents, idx, importance_scores, k=3):
+        """Find optimal neighbors based on correlation"""
+        target_neuron = domain_latents[:, :, idx].flatten()
+        correlations = torch.zeros(domain_latents.size(2), device=self.device)
+
+        for i in range(domain_latents.size(2)):
+            if i != idx:
+                current_neuron = domain_latents[:, :, i].flatten()
+                correlations[i] = torch.corrcoef(
+                    torch.stack([target_neuron, current_neuron])
+                )[0, 1]
+
+        # Combine correlation with importance
+        neighbor_scores = correlations * (
+            1 - torch.abs(importance_scores - importance_scores[idx])
+        )
+        neighbor_scores[idx] = float("-inf")
+
+        return torch.topk(neighbor_scores, k=k, largest=True)[1]
+
+    def _verify_domain_separation(self, prune_mask):
+        """Verify domain separation after pruning"""
+        remaining_latents = self.domain_latents[:, :, prune_mask]
+        domain_means = torch.mean(remaining_latents, dim=1)
+
+        # Check minimum separation
+        domain_dists = torch.pdist(domain_means)
+
+        return torch.min(domain_dists) > 0.1
+
+
+    def update_dimension(self, x_source=None, x_target=None, current_epoch=0):
         old_dim = self.ald.current_dim
         self.ald.update_metrics(x_source_list=x_source, x_target_list=x_target)
-
         action = self.ald.should_adjust_dimension(current_epoch)
 
         if action:
             action, new_dim = self.ald.adjust_dimension()
-            print(f"Dimension adjusted: {old_dim} -> {new_dim}")
+
             if new_dim != old_dim:
-                # Update domain latents
-                new_domain_latents = torch.randn(
-                    self.domain_latents.size(0),
-                    self.domain_latents.size(1),
-                    new_dim,
-                    device=self.device,
-                    dtype=self.domain_latents.dtype,
-                )
+                if new_dim <= 0:
+                    print("Warning: Invalid new dimension. Skipping update.")
+                    return
 
-                # Copy old values for stable transition
-                min_dim = min(old_dim, new_dim)
-                new_domain_latents[:, :, :min_dim] = self.domain_latents[:, :, :min_dim]
-                self.domain_latents = nn.Parameter(new_domain_latents)
+                try:
+                    if new_dim < old_dim:
+                        # Get important neurons for pruning
+                        importance_scores, important_indices = (
+                            self.get_most_important_neurons(
+                                self.domain_latents, k=new_dim
+                            )
+                        )
+                        # Prune to keep only important neurons
+                        new_domain_latents = self.domain_latents[
+                            :, :, important_indices
+                        ]
+                    else:
+                        # Handling dimension increase
+                        new_domain_latents = torch.randn(
+                            self.domain_latents.size(0),
+                            self.domain_latents.size(1),
+                            new_dim,
+                            device=self.device,
+                            dtype=self.domain_latents.dtype,
+                        )
+                        # Copy existing values
+                        new_domain_latents[:, :, :old_dim] = self.domain_latents
 
-                # Update input validator
-                self.input_validator = nn.Linear(new_dim, new_dim).to(self.device)
+                    # Verify shape before assignment
+                    expected_shape = (
+                        self.domain_latents.size(0),
+                        self.domain_latents.size(1),
+                        new_dim,
+                    )
+                    if new_domain_latents.shape != expected_shape:
+                        raise ValueError(
+                            f"Shape mismatch: Expected {expected_shape}, "
+                            f"got {new_domain_latents.shape}"
+                        )
 
-                # Update dimension adapter
-                self.fc_output_size = (
-                    self.generator.init_h
-                    * self.generator.init_w
-                    * self.generator.init_channels
-                )
-                self.dim_adapter = nn.ModuleDict(
-                    {
-                        "fc": nn.Linear(new_dim, self.fc_output_size),
-                        "relu": nn.ReLU(),
-                        "bn": nn.BatchNorm1d(self.fc_output_size),
-                    }
-                ).to(self.device)
+                    # Update domain_latents
+                    self.domain_latents = nn.Parameter(new_domain_latents)
 
-                self.reset_batch_norm()
-                self.validate_dimensions()
+                    # Update other layers
+                    self.input_validator = nn.Linear(new_dim, new_dim).to(self.device)
+                    self.fc_output_size = (
+                        self.generator.init_h
+                        * self.generator.init_w
+                        * self.generator.init_channels
+                    )
+                    self.dim_adapter = nn.ModuleDict(
+                        {
+                            "fc": nn.Linear(new_dim, self.fc_output_size),
+                            "relu": nn.ReLU(),
+                            "bn": nn.BatchNorm1d(self.fc_output_size),
+                        }
+                    ).to(self.device)
+
+                    # Update ALD's current_dim
+                    self.ald.current_dim = new_dim
+
+                    self.reset_batch_norm()
+                    self.validate_dimensions()
+
+                except Exception as e:
+                    print(f"Error during dimension update: {str(e)}")
+                    self.ald.current_dim = old_dim
+                    raise
 
     def reset_batch_norm(self):
         """Reset BatchNorm statistics when dimension changes"""
@@ -334,11 +458,32 @@ class GLOModule(nn.Module):
             self.dim_adapter.bn.to(self.device)
 
     def validate_dimensions(self):
-        current_dim = self.ald.current_dim
+        """Validate dimensions of all components"""
+        try:
+            current_dim = self.ald.current_dim
 
-        assert self.domain_latents.size(-1) == current_dim
-        assert self.input_validator.in_features == current_dim
-        assert self.dim_adapter["fc"].in_features == current_dim
+            # Add detailed validation messages
+            if self.domain_latents.size(-1) != current_dim:
+                raise AssertionError(
+                    f"Domain latents dimension mismatch. "
+                    f"Expected: {current_dim}, Got: {self.domain_latents.size(-1)}"
+                )
+
+            if self.input_validator.in_features != current_dim:
+                raise AssertionError(
+                    f"Input validator dimension mismatch. "
+                    f"Expected: {current_dim}, Got: {self.input_validator.in_features}"
+                )
+
+            if self.dim_adapter["fc"].in_features != current_dim:
+                raise AssertionError(
+                    f"Dimension adapter dimension mismatch. "
+                    f"Expected: {current_dim}, Got: {self.dim_adapter['fc'].in_features}"
+                )
+
+        except Exception as e:
+            print(f"Dimension validation failed: {str(e)}")
+            raise
 
     def forward(self, x, domain_idx):
         device = x.device
@@ -359,7 +504,69 @@ class GLOModule(nn.Module):
         z = self.dim_adapter["fc"](z)
         z = self.dim_adapter["relu"](z)
         z = self.dim_adapter["bn"](z)
+        z = z.view(
+            batch_size,
+            self.generator.init_channels,
+            self.generator.init_h,
+            self.generator.init_w,
+        )
 
+        generated = self.generator.deconv(z)
+        return generated, z.view(batch_size, -1)
+
+    def reset_batch_norm(self):
+        """Reset BatchNorm statistics when dimension changes"""
+        if hasattr(self.dim_adapter, "bn"):
+            self.dim_adapter.bn.reset_parameters()
+            self.dim_adapter.bn.to(self.device)
+
+    def validate_dimensions(self):
+        """Validate dimensions of all components"""
+        try:
+            current_dim = self.ald.current_dim
+
+            # Add detailed validation messages
+            if self.domain_latents.size(-1) != current_dim:
+                raise AssertionError(
+                    f"Domain latents dimension mismatch. "
+                    f"Expected: {current_dim}, Got: {self.domain_latents.size(-1)}"
+                )
+
+            if self.input_validator.in_features != current_dim:
+                raise AssertionError(
+                    f"Input validator dimension mismatch. "
+                    f"Expected: {current_dim}, Got: {self.input_validator.in_features}"
+                )
+
+            if self.dim_adapter['fc'].in_features != current_dim:
+                raise AssertionError(
+                    f"Dimension adapter dimension mismatch. "
+                    f"Expected: {current_dim}, Got: {self.dim_adapter['fc'].in_features}"
+                )
+
+        except Exception as e:
+            print(f"Dimension validation failed: {str(e)}")
+            raise
+
+    def forward(self, x, domain_idx):
+        device = x.device
+        batch_size = x.size(0)
+
+        # Get latent vectors with correct dimension
+        z = self.domain_latents[domain_idx, :batch_size].to(device)
+        current_dim = self.ald.current_dim
+
+        if z.size(-1) != current_dim:
+            # Handle dimension mismatch
+            new_z = torch.zeros(batch_size, current_dim, device=device)
+            min_dim = min(z.size(-1), current_dim)
+            new_z[:, :min_dim] = z[:, :min_dim]
+            z = new_z
+
+        z = self.input_validator(z)
+        z = self.dim_adapter["fc"](z)
+        z = self.dim_adapter["relu"](z)
+        z = self.dim_adapter["bn"](z)
         z = z.view(
             batch_size,
             self.generator.init_channels,
