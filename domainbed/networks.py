@@ -310,10 +310,10 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams["resnet18"]:
-            self.network = torchvision.models.resnet18(pretrained=True)
+            self.network = torchvision.models.resnet18(pretrained=False)
             self.n_outputs = 512
         else:
-            self.network = torchvision.models.resnet50(pretrained=True)
+            self.network = torchvision.models.resnet50(pretrained=False)
             self.n_outputs = 2048
 
         # self.network = remove_batch_norm_from_resnet(self.network)
@@ -475,7 +475,7 @@ def Featurizer(input_shape, hparams):
     elif input_shape[1:3] == (32, 32):
         return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.0)
     elif input_shape[1:3] == (224, 224):
-        return ViTFeaturizer(input_shape, hparams)
+        return ResNet(input_shape, hparams)
     else:
         raise NotImplementedError
 
