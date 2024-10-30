@@ -878,12 +878,12 @@ class ResNet(torch.nn.Module):
 
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
-        if hparams["resnet18"]:
-            self.network = torchvision.models.resnet18(pretrained=False)
-            self.n_outputs = 512
-        else:
-            self.network = torchvision.models.resnet50(pretrained=False)
-            self.n_outputs = 2048
+        # if hparams["resnet18"]:
+        #     self.network = torchvision.models.resnet18(pretrained=False)
+        #     self.n_outputs = 512
+        # else:
+        self.network = torchvision.models.resnet50(pretrained=False)
+        self.n_outputs = 2048
 
         # self.network = remove_batch_norm_from_resnet(self.network)
 
@@ -903,7 +903,7 @@ class ResNet(torch.nn.Module):
         del self.network.fc
         self.network.fc = Identity()
 
-        self.freeze_bn()
+        # self.freeze_bn()
         self.hparams = hparams
         self.dropout = nn.Dropout(hparams["resnet_dropout"])
 
@@ -916,7 +916,7 @@ class ResNet(torch.nn.Module):
         Override the default train() to freeze the BN parameters
         """
         super().train(mode)
-        self.freeze_bn()
+        # self.freeze_bn()
 
     def freeze_bn(self):
         for m in self.network.modules():
