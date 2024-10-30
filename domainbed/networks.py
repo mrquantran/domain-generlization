@@ -659,6 +659,8 @@ class CycleMixLayer(nn.Module):
             [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
         )
 
+        self.featurizer_adapter = None
+
     def process_domain(self, batch, domain_idx, featurizer):
         x, y = batch
         device = next(featurizer.parameters()).device
@@ -718,13 +720,8 @@ class FeaturizerAdapter(nn.Module):
         self.featurizer = featurizer
         self.feature_dim = self._get_feature_dim()
 
-        # Two-stage adaptation for better dimension handling
-        intermediate_dim = min(self.feature_dim, 1024)  # Prevent excessive dimensions
         self.adapter = nn.Sequential(
-            nn.Linear(self.feature_dim, intermediate_dim),
-            nn.ReLU(),
-            nn.BatchNorm1d(intermediate_dim),
-            nn.Linear(intermediate_dim, latent_dim),
+            nn.Linear(self.feature_dim, latent_dim),
             nn.ReLU(),
             nn.BatchNorm1d(latent_dim),
         ).to(device)
