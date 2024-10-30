@@ -31,6 +31,7 @@ def _hparams(algorithm, dataset, random_seed):
     _hparam('resnet18', True, lambda r: False)
     _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))
     _hparam('class_balanced', False, lambda r: False)
+    _hparam("featurizer", "resnet", lambda r: "resnet")
     # TODO: nonlinear classifiers disabled
     _hparam('nonlinear_classifier', False,
             lambda r: bool(r.choice([False, False])))
@@ -126,7 +127,7 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('is_normalized', False, lambda r: False)
         _hparam('is_project', False, lambda r: False)
         _hparam('is_flipped', True, lambda r: True)
-        
+
     elif algorithm == "Transfer":
         _hparam('t_lambda', 1.0, lambda r: 10**r.uniform(-2, 1))
         _hparam('delta', 2.0, lambda r: r.uniform(0.1, 3.0))
@@ -140,7 +141,6 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('eqrm_quantile', 0.75, lambda r: r.uniform(0.5, 0.99))
         _hparam('eqrm_burnin_iters', 2500, lambda r: 10 ** r.uniform(2.5, 3.5))
         _hparam('eqrm_lr', 1e-6, lambda r: 10 ** r.uniform(-7, -5))
-
 
     # Dataset-and-algorithm-specific hparam definitions. Each block of code
     # below corresponds to exactly one hparam. Avoid nested conditionals.

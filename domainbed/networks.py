@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torchvision.models
 from torchvision import transforms
 from torchvision import models
-from transformers import ViTModel
+from transformers import ViTModel, ViTConfig
 
 import numpy as np
 
@@ -14,7 +14,6 @@ from domainbed.lib import wide_resnet
 import copy
 
 # CYCLEGAN Experiments
-from domainbed.cyclegan.networks import define_G
 from domainbed.cyclegan.utils import get_sources
 
 import torch
@@ -133,7 +132,7 @@ class CycleMixLayer(nn.Module):
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
         # Dynamic feature dimension based on backbone
-        self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
+        self.feature_dim = 2048
 
         # GLO components
         self.glo = GLOModule(
@@ -271,12 +270,12 @@ class ResNet(torch.nn.Module):
 
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
-        if hparams["resnet18"]:
-            self.network = torchvision.models.resnet18(pretrained=True)
-            self.n_outputs = 512
-        else:
-            self.network = torchvision.models.resnet50(pretrained=True)
-            self.n_outputs = 2048
+        # if hparams["resnet18"]:
+        #     self.network = torchvision.models.resnet18(pretrained=False)
+        #     self.n_outputs = 512
+        # else:
+        self.network = torchvision.models.resnet50(pretrained=False)
+        self.n_outputs = 2048
 
         # self.network = remove_batch_norm_from_resnet(self.network)
 
@@ -296,7 +295,7 @@ class ResNet(torch.nn.Module):
         del self.network.fc
         self.network.fc = Identity()
 
-        self.freeze_bn()
+        # self.freeze_bn()
         self.hparams = hparams
         self.dropout = nn.Dropout(hparams["resnet_dropout"])
 
@@ -309,7 +308,7 @@ class ResNet(torch.nn.Module):
         Override the default train() to freeze the BN parameters
         """
         super().train(mode)
-        self.freeze_bn()
+        # self.freeze_bn()
 
     def freeze_bn(self):
         for m in self.network.modules():
@@ -388,18 +387,27 @@ class ViTFeaturizer(torch.nn.Module):
 
     def __init__(self, input_shape, hparams):
         super(ViTFeaturizer, self).__init__()
-        # Load pretrained ViT
-        self.vit = ViTModel.from_pretrained("google/vit-base-patch16-224")
 
-        # Match output dimension with original ResNet
-        if hparams.get("resnet18", True):
-            self.n_outputs = 512
-        else:
-            self.n_outputs = 2048
+        # Define a new, randomly initialized ViT configuration
+        vit_config = ViTConfig(
+            hidden_size=768,  # Dimension for ViT-base
+            num_hidden_layers=12,  # Number of transformer layers in ViT-base
+            num_attention_heads=12,  # Attention heads in ViT-base
+            intermediate_size=3072,  # Feed-forward layer dimension in ViT-base
+            image_size=224,  # Image resolution as expected by ViT
+            patch_size=16,  # Patch size for ViT-base-patch16
+        )
 
-        # Add linear projection to match expected feature dimension
+        # Initialize ViT model with random weights
+        self.vit = ViTModel(vit_config)
+
+        # Set output dimensions to match original ResNet-based code
+        self.n_outputs = 512 if hparams.get("resnet18", True) else 2048
+
+        # Linear projection to match the expected output dimensions
         self.feature_projection = nn.Linear(768, self.n_outputs)
 
+        # Dropout layer for regularization
         self.dropout = nn.Dropout(hparams.get("vit_dropout", 0.1))
         self.hparams = hparams
 
@@ -410,15 +418,18 @@ class ViTFeaturizer(torch.nn.Module):
         """
         # ViT forward pass
         outputs = self.vit(x)
-        # Get CLS token features
+
+        # Extract CLS token features
         features = outputs.last_hidden_state[:, 0]  # Shape: (batch_size, 768)
-        # Project to match ResNet dimension
+
+        # Project to the desired output dimension
         features = self.feature_projection(features)  # Shape: (batch_size, n_outputs)
+
         return self.dropout(features)
 
     def train(self, mode=True):
         super().train(mode)
-        # Keep batch norm in eval mode if it exists
+        # Optionally, keep batch normalization in eval mode if using batch norm layers
         self.freeze_bn()
 
     def freeze_bn(self):
@@ -437,7 +448,12 @@ def Featurizer(input_shape, hparams):
     elif input_shape[1:3] == (32, 32):
         return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.0)
     elif input_shape[1:3] == (224, 224):
-        return ViTFeaturizer(input_shape, hparams)
+        if hparams["featurizer"] == "resnet":
+            return ResNet(input_shape, hparams)
+        # elif hparams["featurizer"] == "vit":
+        #     return ViTFeaturizer(input_shape, hparams)
+        else:
+            raise ValueError(f"Invalid featurizer: {hparams['featurizer']}")
     else:
         raise NotImplementedError
 
