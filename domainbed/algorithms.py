@@ -1,5 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-
+from sklearn.metrics import silhouette_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,8 +12,8 @@ import numpy as np
 from collections import OrderedDict
 
 try:
-    from backpack import backpack, extend
-    from backpack.extensions import BatchGrad
+    from backpack import backpack, extend  # type: ignore
+    from backpack.extensions import BatchGrad # type: ignore
 except:
     backpack = None
 
@@ -27,81 +27,6 @@ from domainbed.lib.misc import (
     proj,
     Nonparametric,
 )
-
-# CYCLEGAN Experiments
-from domainbed.cyclegan.networks import define_G
-from domainbed.cyclegan.utils import get_sources
-from domainbed.lib.cyclemix_loss import cyclemix_contra_loss
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from torch.nn import Parameter
-import math
-
-
-class ProjectionHead(nn.Module):
-    """Projection head for contrastive learning"""
-
-    def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
-        super(ProjectionHead, self).__init__()
-        self.projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x):
-        return self.projection(x)
-
-
-class NTXentLoss(nn.Module):
-    """NT-Xent loss for contrastive learning"""
-
-    def __init__(self, temperature=0.5):
-        super(NTXentLoss, self).__init__()
-        self.temperature = temperature
-        self.criterion = nn.CrossEntropyLoss(reduction="sum")
-        self.similarity_f = nn.CosineSimilarity(dim=2)
-
-    def forward(self, z_i, z_j):
-        """
-        Calculate NT-Xent loss for batch of paired samples
-        Args:
-            z_i, z_j: Batch of paired embeddings [N, D]
-        Returns:
-            Loss value
-        """
-        batch_size = z_i.shape[0]
-
-        # Concatenate embeddings for positive and negative pairs
-        z = torch.cat([z_i, z_j], dim=0)
-
-        # Calculate similarity matrix
-        sim = torch.matmul(z, z.T) / self.temperature
-
-        # Create mask for positive pairs
-        sim_i_j = torch.diag(sim, batch_size)
-        sim_j_i = torch.diag(sim, -batch_size)
-
-        positive_samples = torch.cat([sim_i_j, sim_j_i], dim=0).reshape(
-            2 * batch_size, 1
-        )
-
-        # Create mask for negative samples
-        mask = ~torch.eye(2 * batch_size, dtype=torch.bool, device=z_i.device)
-        negative_samples = sim[mask].reshape(2 * batch_size, -1)
-
-        # Concatenate positive and negative samples
-        logits = torch.cat((positive_samples, negative_samples), dim=1)
-        labels = torch.zeros(2 * batch_size, dtype=torch.long, device=z_i.device)
-
-        loss = self.criterion(logits, labels)
-        loss = loss / (2 * batch_size)
-
-        return loss
-
 
 ALGORITHMS = [
     "ERM",
@@ -283,14 +208,14 @@ class CUTMIX(Algorithm):
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
+        self.num_classes = num_classes
+        self.current_epoch = 0
         self.featurizer = networks.Featurizer(input_shape, self.hparams)
         self.classifier = networks.Classifier(
             self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
         )
-
-        self.network = nn.Sequential(self.featurizer, self.classifier)
-
-        device = next(self.network.parameters()).device
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.network = nn.Sequential(self.featurizer, self.classifier).to(device)
         self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
 
         # Parameters
@@ -331,32 +256,44 @@ class CYCLEMIX(Algorithm):
         return total_loss
 
     def update(self, minibatches, unlabeled=None):
+        if not hasattr(self, 'current_epoch'):
+            self.current_epoch = 0
+        self.current_epoch += 1
+
+        device = next(self.network.parameters()).device
+        minibatches = [(x.to(device), y.to(device)) for x, y in minibatches]
         minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
 
-        # Separate original and augmented samples
-        orig_samples = minibatches_aug[: len(minibatches)]
-        aug_samples = minibatches_aug[len(minibatches) :]
+        # Source and target samples
+        source_samples = minibatches_aug[: len(minibatches)]
+        target_samples = minibatches_aug[len(minibatches) :]
 
-        # Concatenate all samples for classification
-        all_x = torch.cat([x for x, y in orig_samples])
-        all_y = torch.cat([y for x, y in orig_samples])
-
-        # Classification loss
+        # Classification
+        all_x = torch.cat([x for x, y in source_samples])
+        all_y = torch.cat([y for x, y in target_samples])
         class_loss = F.cross_entropy(self.predict(all_x), all_y)
 
         # GLO loss computation
         glo_loss = 0
-        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
-            _, z = self.cyclemixLayer.glo(x_orig, 0)
-            glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
 
-        # Contrastive loss computation
+        for (x_source, _), (x_target, _) in zip(source_samples, target_samples):
+            _, z = self.cyclemixLayer.glo(x_source, 0)
+            current_glo_loss = self.compute_glo_loss(x_source, x_target, z)
+            glo_loss += current_glo_loss
+
+        self.cyclemixLayer.glo.update_dimension(
+            x_source=source_samples,
+            x_target=target_samples,
+            current_epoch=self.current_epoch,
+        )
+        
+        # Contrastive loss
         contrastive_loss = self.compute_contrastive_loss(projections)
 
         # Total loss
         total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
 
-        # Optimization steps
+        # Optimization
         self.optimizer.zero_grad()
         self.glo_optimizer.zero_grad()
         total_loss.backward()
@@ -368,6 +305,8 @@ class CYCLEMIX(Algorithm):
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
+            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
+            "current_epoch": self.current_epoch,
         }
 
     def predict(self, x):

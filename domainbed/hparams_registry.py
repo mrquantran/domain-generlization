@@ -26,7 +26,6 @@ def _hparams(algorithm, dataset, random_seed):
         hparams[name] = (default_val, random_val_fn(random_state))
 
     # Unconditional hparam definitions.
-
     _hparam('data_augmentation', True, lambda r: True)
     _hparam('resnet18', True, lambda r: False)
     _hparam('resnet_dropout', 0., lambda r: r.choice([0., 0.1, 0.5]))

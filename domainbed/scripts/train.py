@@ -250,6 +250,7 @@ if __name__ == "__main__":
     last_results_keys = None
     for step in tqdm(range(start_step, n_steps), desc="Training Progress"):
         step_start_time = time.time()
+        current_epoch = step / steps_per_epoch
         minibatches_device = [
             (x.to(device), y.to(device)) for x, y in next(train_minibatches_iterator)
         ]
@@ -261,9 +262,13 @@ if __name__ == "__main__":
             step_vals = algorithm.update(minibatches_device, uda_device)
         else:
             if (step / steps_per_epoch) < 15:
-                step_vals = algorithm.update(minibatches_device, uda_device)
+                step_vals = algorithm.update(
+                    minibatches_device, uda_device
+                )
             else:
-                step_vals = algorithm.update(minibatches_device, uda_device)
+                step_vals = algorithm.update(
+                    minibatches_device, uda_device
+                )
         checkpoint_vals["step_time"].append(time.time() - step_start_time)
 
         for key, val in step_vals.items():
@@ -293,6 +298,17 @@ if __name__ == "__main__":
                 last_results_keys = results_keys
             misc.print_row([results[key] for key in results_keys], colwidth=12)
 
+            # Calculate the mean of all "env[number]_out_acc" keys
+            out_acc_keys = [key for key in results_keys if key.endswith("_out_acc")]
+            if out_acc_keys:
+                mean_out_acc = np.mean([results[key] for key in out_acc_keys])
+                results["mean_out_acc"] = mean_out_acc
+
+            misc.print_row(["out_acc"] + [results[key] for key in out_acc_keys], colwidth=12)
+
+            loss = results["loss"]
+            misc.print_row(["mean_out_acc", mean_out_acc, 'loss', loss], colwidth=12)
+
             results.update({"hparams": hparams, "args": vars(args)})
 
             epochs_path = os.path.join(args.output_dir, "results.jsonl")
@@ -305,6 +321,21 @@ if __name__ == "__main__":
 
             if args.save_model_every_checkpoint:
                 save_checkpoint(f"model_step{step}.pkl")
+
+            # Early stopping mechanism based on loss
+            if 'best_loss' not in globals():
+                best_loss = float('inf')
+                patience_counter = 0
+
+            if loss < best_loss:
+                best_loss = loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= 10:
+                misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
+                break
 
     save_checkpoint("model.pkl")
 
