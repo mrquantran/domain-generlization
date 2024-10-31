@@ -299,7 +299,7 @@ class CYCLEMIX(Algorithm):
         contrastive_loss = self.compute_contrastive_loss(projections)
 
         # Total loss
-        total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
+        total_loss = class_loss + glo_loss
 
         # Optimization steps
         self.optimizer.zero_grad()
