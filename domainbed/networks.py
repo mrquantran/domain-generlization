@@ -817,10 +817,12 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams["resnet18"]:
-            self.network = torchvision.models.resnet18(pretrained=True)
+            print('Using ResNet18')
+            self.network = torchvision.models.resnet18(pretrained=False)
             self.n_outputs = 512
         else:
-            self.network = torchvision.models.resnet50(pretrained=True)
+            print('Using ResNet50')
+            self.network = torchvision.models.resnet50(pretrained=False)
             self.n_outputs = 2048
 
         # self.network = remove_batch_norm_from_resnet(self.network)
@@ -972,6 +974,82 @@ class ViTFeaturizer(torch.nn.Module):
                 m.eval()
 
 
+from torch.utils.model_zoo import load_url
+
+
+class ResNetMoCo(torch.nn.Module):
+    """ResNet with MoCo-v2 pretraining, with frozen BatchNorm"""
+
+    def __init__(self, input_shape, hparams):
+        super(ResNetMoCo, self).__init__()
+
+        # MoCo v2 checkpoint URL
+        moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+
+        if hparams["resnet18"]:
+            print("Using ResNet18")
+            self.network = torchvision.models.resnet18(pretrained=False)
+            self.n_outputs = 512
+        else:
+            print("Using ResNet50 with MoCo-v2 weights")
+            # Khởi tạo model ResNet50 base
+            self.network = torchvision.models.resnet50(pretrained=False)
+            self.n_outputs = 2048
+
+            try:
+                # Tải MoCo v2 checkpoint
+                checkpoint = load_url(moco_v2_path, progress=True)
+
+                # Xử lý state dict từ MoCo v2
+                state_dict = checkpoint["state_dict"]
+                new_state_dict = {}
+                for k in list(state_dict.keys()):
+                    # Loại bỏ prefix 'module.encoder_q.'
+                    if k.startswith("module.encoder_q."):
+                        new_state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
+
+                # Tải weights vào model
+                msg = self.network.load_state_dict(new_state_dict, strict=False)
+                print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
+
+            except Exception as e:
+                print(f"Error loading MoCo v2 weights: {str(e)}")
+                print("Falling back to random initialization")
+
+        # Xử lý số kênh đầu vào
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.network.conv1.weight.data.clone()
+            self.network.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+            )
+            for i in range(nc):
+                self.network.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # Loại bỏ fully connected layer
+        del self.network.fc
+        self.network.fc = Identity()
+
+        # Thêm batch norm freeze và dropout
+        self.freeze_bn()
+        self.hparams = hparams
+        self.dropout = nn.Dropout(hparams["resnet_dropout"])
+
+    def forward(self, x):
+        """Encode x into a feature vector of size n_outputs."""
+        return self.dropout(self.network(x))
+
+    def train(self, mode=True):
+        """Override the default train() to freeze the BN parameters"""
+        super().train(mode)
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        for m in self.network.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+
 def Featurizer(input_shape, hparams):
     """Auto-select an appropriate featurizer for the given input shape."""
     print(input_shape)
@@ -982,7 +1060,7 @@ def Featurizer(input_shape, hparams):
     elif input_shape[1:3] == (32, 32):
         return wide_resnet.Wide_ResNet(input_shape, 16, 2, 0.0)
     elif input_shape[1:3] == (224, 224):
-        return ViTFeaturizer(input_shape, hparams)
+        return ResNetMoCo(input_shape, hparams)
     else:
         raise NotImplementedError
 
