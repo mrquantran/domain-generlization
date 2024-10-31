@@ -246,17 +246,6 @@ class CYCLEMIX(Algorithm):
             betas=(0.5, 0.999),
         )
 
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=self.max_lr,
-            total_steps=total_steps,
-            pct_start=0.3,  # Warm-up phase is 30% of training
-            div_factor=25,  # Initial lr = max_lr/25
-            final_div_factor=1e4,  # Min lr = initial_lr/10000
-            three_phase=False,  # Use two-phase policy
-            verbose=False,
-        )
-
     def compute_glo_loss(self, original, generated, latent):
         reconstruction_loss = F.mse_loss(generated, original)
         latent_reg = torch.mean(torch.norm(latent, dim=1))
@@ -315,7 +304,6 @@ class CYCLEMIX(Algorithm):
         total_loss.backward()
         self.optimizer.step()
         self.glo_optimizer.step()
-        self.scheduler.step()
 
         return {
             "loss": total_loss.item(),
