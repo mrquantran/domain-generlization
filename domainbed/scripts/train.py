@@ -311,7 +311,11 @@ if __name__ == "__main__":
             misc.print_row(["out_acc"] + [results[key] for key in out_acc_keys], colwidth=12)
 
             loss = results["loss"]
-            misc.print_row(["mean_out_acc", mean_out_acc, 'loss', loss], colwidth=12)
+            class_loss = results["class_loss"]
+            contrastive_loss = results["contrastive_loss"]
+            glo_loss = results["glo_loss"]
+            misc.print_row(["loss", loss, "class_loss", class_loss, "contrastive_loss", contrastive_loss, "glo_loss", glo_loss], colwidth=12)
+            misc.print_row(["mean_out_acc", mean_out_acc], colwidth=12)
 
             results.update({"hparams": hparams, "args": vars(args)})
 

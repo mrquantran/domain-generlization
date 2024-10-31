@@ -188,7 +188,7 @@ class ALDModule(nn.Module):
 class GLOGenerator(nn.Module):
     """Generator network following GLO paper architecture"""
 
-    def __init__(self, latent_dim=100, output_dim=3):
+    def __init__(self, latent_dim=512, output_dim=3):
         super(GLOGenerator, self).__init__()
 
         # Following GLO paper architecture
@@ -215,7 +215,7 @@ class GLOGenerator(nn.Module):
         return x
 
 class GLOModule(nn.Module):
-    def __init__(self, latent_dim=100, num_domains=3, batch_size=32):
+    def __init__(self, latent_dim=512, num_domains=3, batch_size=32):
         super(GLOModule, self).__init__()
         self.latent_dim = latent_dim
         self.num_domains = num_domains
@@ -299,7 +299,7 @@ class CycleMixLayer(nn.Module):
 
         # GLO components
         self.glo = GLOModule(
-            latent_dim=hparams.get("latent_dim", 100),
+            latent_dim=hparams.get("latent_dim", 512),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
         ).to(device)
