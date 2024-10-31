@@ -256,6 +256,12 @@ class CYCLEMIX(Algorithm):
             three_phase=False,  # Use two-phase policy
             verbose=False,
         )
+        
+        self.ssl_rotation_optimizer = torch.optim.Adam(
+            self.cyclemixLayer.ssl_rotation_predictor.parameters(),
+            lr=hparams.get('ssl_rotation_lr', 1e-3),
+            weight_decay=1e-5
+        )
 
     def compute_glo_loss(self, original, generated, latent):
         reconstruction_loss = F.mse_loss(generated, original)
@@ -275,18 +281,18 @@ class CYCLEMIX(Algorithm):
                     )
         return total_loss
 
-    def update(self, minibatches, unlabeled=None):
-        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
+    def update(self, minibatches, unlabeled=None, epoch=0):
+        minibatches_aug, projections, ssl_losses = self.cyclemixLayer(
+            minibatches, self.featurizer, epoch
+        )
 
-        # Separate original and augmented samples
+        # Existing loss computations
         orig_samples = minibatches_aug[: len(minibatches)]
         aug_samples = minibatches_aug[len(minibatches) :]
 
-        # Concatenate all samples for classification
+        # Classification loss
         all_x = torch.cat([x for x, y in orig_samples])
         all_y = torch.cat([y for x, y in orig_samples])
-
-        # Classification loss
         class_loss = F.cross_entropy(self.predict(all_x), all_y)
 
         # GLO loss computation
@@ -298,21 +304,34 @@ class CYCLEMIX(Algorithm):
         # Contrastive loss computation
         contrastive_loss = self.compute_contrastive_loss(projections)
 
-        # Total loss
-        total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
+        # SSL Rotation Loss
+        ssl_loss = sum(ssl_losses)
+
+        # Total loss with adaptive SSL weight
+        total_loss = (
+            class_loss
+            + glo_loss
+            + self.contrastive_lambda * contrastive_loss
+            + ssl_loss
+        )
 
         # Optimization steps
         self.optimizer.zero_grad()
         self.glo_optimizer.zero_grad()
+        self.ssl_rotation_optimizer.zero_grad()
         total_loss.backward()
+        self.ssl_rotation_optimizer.step()
         self.optimizer.step()
         self.glo_optimizer.step()
+        self.scheduler.step()
 
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
+            "ssl_loss": ssl_loss.item(),
+            "learning_rate": self.scheduler.get_last_lr()[0],
         }
 
     def predict(self, x):

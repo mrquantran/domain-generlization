@@ -1,5 +1,4 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,171 +17,34 @@ from domainbed.cyclegan.utils import get_sources
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from scipy.stats import wasserstein_distance
-from numpy import cov, trace, iscomplexobj
-from scipy.linalg import sqrtm
 
 
-import torch
-import torch.nn as nn
-import numpy as np
-from sklearn.metrics import silhouette_score
-import numpy.polynomial.polynomial as poly
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        self.block = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(),
+            nn.Linear(channels, channels),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
 
 
-class ALDModule(nn.Module):
-    """Adaptive Latent Dimensionality Module optimized for domain generalization"""
+class SSLRotationPredictor(nn.Module):
+    def __init__(self, num_rotations=4):
+        super(SSLRotationPredictor, self).__init__()
+        # Use a pretrained ResNet18 model
+        self.rotation_predictor = torchvision.models.resnet18(pretrained=True)
 
-    def __init__(
-        self,
-        initial_dim=512,  # Increased from 256 to capture more domain-invariant features initially
-        latent_decrease=4,  # More conservative decrease to preserve important features
-        patience=5,  # Reduced to check more frequently
-        window_size=20,  # Keep as per paper
-        n_classes=7,  # Depends on dataset (7 for PACS, 65 for OfficeHome)
-        min_dim=64,  # Increased minimum to ensure enough capacity for cross-domain features
-        slope_threshold=5e-4,  # More sensitive threshold
-        improvement_threshold=1e-4,  # New parameter for meaningful improvements
-    ):
-        super(ALDModule, self).__init__()
-        self.current_dim = initial_dim
-        self.latent_decrease = latent_decrease
-        self.patience = patience
-        self.window_size = window_size
-        self.n_classes = n_classes
-        self.min_dim = min_dim
-        self.slope_threshold = slope_threshold
-        self.improvement_threshold = improvement_threshold
+        # Replace the final fully connected layer
+        num_ftrs = self.rotation_predictor.fc.in_features
+        self.rotation_predictor.fc = nn.Linear(num_ftrs, num_rotations)
 
-        # Enhanced tracking
-        self.s_scores = []
-        self.recon_losses = []
-        self.compressing = True
-        self.best_score = float("-inf")
-        self.epochs_no_improve = 0
-        self.slow_compression = False
-
-    def polyfit_slope(self, values, deg=1):
-        """Calculate slope using polynomial fitting with enhanced stability"""
-        if len(values) < self.window_size:
-            return 0.0
-
-        y = np.array(values[-self.window_size :])
-        x = np.arange(len(y))
-
-        # Normalize values for numerical stability
-        y_mean = np.mean(y)
-        y_std = np.std(y) if np.std(y) != 0 else 1
-        y_normalized = (y - y_mean) / y_std
-
-        try:
-            coeffs = poly.polyfit(x, y_normalized, deg)
-            slope = coeffs[1] * y_std
-            return slope
-        except np.linalg.LinAlgError:
-            return 0.0
-
-    def should_adjust_dimension(self, epoch) -> bool:
-        """Enhanced dimension adjustment check with domain generalization focus"""
-        if self.current_dim <= self.min_dim:
-            return False
-
-        if epoch % self.patience == 0:
-            # Step 16-19: Calculate slopes and check for improvements
-            recon_slope = self.polyfit_slope(self.recon_losses)
-            sil_slope = self.polyfit_slope(self.s_scores)
-
-            # Check if all slopes are positive
-            if recon_slope > 0 and sil_slope > 0:
-                self.compressing = False
-                return False
-
-            # Transition to slower compression if silhouette score slope is positive
-            if sil_slope > 0 and self.latent_decrease > 1:
-                self.latent_decrease = max(1, self.latent_decrease // 2)
-
-            return True
-
-        return False
-
-    def adjust_dimension(self):
-        """Adjust dimension with domain generalization considerations"""
-        if not self.compressing:
-            return False, self.current_dim
-
-        # Calculate new dimension
-        decrease = self.latent_decrease
-        if self.current_dim - decrease < self.min_dim:
-            decrease = self.current_dim - self.min_dim
-
-        new_dim = max(self.min_dim, self.current_dim - decrease)
-
-        # Stop if we can't decrease further
-        if new_dim == self.current_dim:
-            self.compressing = False
-            return False, self.current_dim
-
-        self.current_dim = new_dim
-        return True, new_dim
-
-    def update_metrics(self, x_source_list, x_target_list):
-        """Update metrics with domain-aware calculations"""
-        reconstruction_losses = []
-        silhouette_scores = []
-
-        # Process each domain pair
-        for (x_source, _), (x_target, _) in zip(x_source_list, x_target_list):
-            if not torch.is_tensor(x_source) or not torch.is_tensor(x_target):
-                raise ValueError(
-                    f"Invalid input types: {type(x_source)}, {type(x_target)}"
-                )
-
-            # Calculate domain-aware silhouette score
-            z_numpy = x_source.view(x_source.shape[0], -1).detach().cpu().numpy()
-            if z_numpy.shape[0] < self.n_classes:
-                continue  # Skip if batch is too small instead of raising error
-
-            kmeans = KMeans(n_clusters=self.n_classes, random_state=0, n_init="auto")
-            labels = kmeans.fit_predict(z_numpy)
-
-            if len(np.unique(labels)) > 1:
-                s_score = silhouette_score(z_numpy, labels, metric="euclidean")
-                silhouette_scores.append(float(s_score))
-
-            # Calculate reconstruction loss with domain alignment consideration
-            recon_loss = F.mse_loss(x_source, x_target).item()
-            reconstruction_losses.append(recon_loss)
-
-            # Calculate reconstruction loss using KL divergence
-            mu_source, logvar_source = torch.mean(x_source, dim=0), torch.var(
-                x_source, dim=0
-            )
-            mu_target, logvar_target = torch.mean(x_target, dim=0), torch.var(
-                x_target, dim=0
-            )
-
-            # Ensure numerical stability
-            logvar_source = torch.clamp(logvar_source, min=1e-6)
-            logvar_target = torch.clamp(logvar_target, min=1e-6)
-
-            # KL divergence between source and target distributions
-            kl_div = 0.5 * torch.sum(
-                logvar_target
-                - logvar_source
-                + (logvar_source.exp() + (mu_source - mu_target).pow(2))
-                / logvar_target.exp()
-                - 1
-            )
-            reconstruction_losses.append(kl_div.item())
-
-        # Update tracking metrics if we have valid scores
-        if silhouette_scores and reconstruction_losses:
-            self.s_scores.append(torch.tensor(silhouette_scores).mean())
-            self.recon_losses.append(torch.tensor(reconstruction_losses).mean())
-
-        return bool(silhouette_scores and reconstruction_losses)
+    def forward(self, x):
+        return self.rotation_predictor(x)
 
 
 class GLOGenerator(nn.Module):
@@ -213,6 +75,7 @@ class GLOGenerator(nn.Module):
         x = x.view(-1, 256, 14, 14)
         x = self.deconv(x)
         return x
+
 
 class GLOModule(nn.Module):
     def __init__(self, latent_dim=100, num_domains=3, batch_size=32):
@@ -245,18 +108,22 @@ class GLOModule(nn.Module):
 
 
 class ProjectionHead(nn.Module):
-    """Projection head for contrastive learning"""
-
     def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
         super(ProjectionHead, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.PReLU(),  # Thay thế ReLU
+            ResidualBlock(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.PReLU(),
+            nn.Linear(hidden_dim // 2, output_dim),
+            nn.LayerNorm(output_dim),
         )
 
     def forward(self, x):
-        return self.net(x)
+        return F.normalize(self.net(x), p=2, dim=1)
 
 
 class NTXentLoss(nn.Module):
@@ -294,72 +161,171 @@ class CycleMixLayer(nn.Module):
         super(CycleMixLayer, self).__init__()
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
-        # Dynamic feature dimension based on backbone
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
-        # GLO components
+        # GLO components (unchanged)
         self.glo = GLOModule(
-            latent_dim=hparams.get("latent_dim", 100),
+            latent_dim=self.feature_dim,
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
         ).to(device)
 
-        # Projection head for contrastive learning
+        # Cải tiến SSL Rotation Predictor
+        self.ssl_rotation_predictor = SSLRotationPredictor(
+            num_rotations=4  # Mở rộng góc xoay
+        ).to(device)
+
+        # Projection head với cấu trúc phức tạp hơn
         self.projection = ProjectionHead(
             input_dim=self.feature_dim,
             hidden_dim=hparams.get("proj_hidden_dim", 2048),
-            output_dim=hparams.get("proj_output_dim", 128),
+            output_dim=hparams.get("proj_output_dim", 256),
         ).to(device)
 
         # Contrastive loss
         self.nt_xent = NTXentLoss(temperature=hparams.get("temperature", 0.5))
 
-        # Image normalization
-        self.norm = transforms.Compose(
-            [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-        )
+        # SSL hyperparameters với adaptive lambda
+        self.ssl_lambda = hparams.get("ssl_lambda", 0.1)
+        self.rotation_choices = [0, 90, 180, 270]
 
-    def process_domain(self, batch, domain_idx, featurizer):
-        """Process single domain data"""
+        # Thêm mechanism để điều chỉnh SSL lambda động
+        self.ssl_lambda_scheduler = self._create_ssl_lambda_scheduler()
+
+    def _create_ssl_lambda_scheduler(self):
+        def scheduler(epoch):
+            # Phức tạp và linh hoạt hơn
+            warmup_epochs = 30
+            decay_start = 50
+            min_lambda = 0.001
+
+            # Cosine annealing with warm restart
+            if epoch < warmup_epochs:
+                return min(1.0, (epoch + 1) / warmup_epochs)
+
+            T_0 = 50  # Restart period
+            T_mult = 2  # Exponential restart
+
+            def cosine_restart(epoch):
+                return min_lambda + 0.5 * (1 - min_lambda) * (
+                    1 + np.cos(np.pi * ((epoch - warmup_epochs) % T_0) / T_0)
+                )
+
+            return cosine_restart(epoch)
+
+        return scheduler
+
+    def rotate_image(self, x, rotation):
+        """
+        Advanced image rotation with robust handling
+
+        Args:
+            x (torch.Tensor): Input image tensor
+            rotation (int): Rotation angle
+
+        Returns:
+            torch.Tensor: Rotated image tensor
+        """
+        import kornia
+        import torch
+
+        # Ensure tensor compatibility
+        x = x.float() if not isinstance(x, torch.Tensor) else x
+
+        # Handle different tensor dimensions
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+
+        # Robust rotation using kornia
+        try:
+            angle = torch.tensor([rotation], dtype=torch.float32).to(x.device)
+            center = torch.tensor(
+                [x.shape[3] / 2, x.shape[2] / 2], dtype=torch.float32
+            ).to(x.device)
+
+            rotated_x = kornia.geometry.rotate(
+                x,
+                angle,
+                center=center,
+                mode="bilinear",
+                padding_mode="reflection",  # More stable padding
+            )
+
+            return rotated_x
+        except Exception as e:
+            print(f"Rotation error: {e}")
+            return x
+
+    def process_domain_with_ssl(self, batch, domain_idx, featurizer, epoch):
         x, y = batch
+        batch_size = x.size(0)
 
-        # Generate domain-mixed samples
+        # Sinh augmented samples
+        augmentations = []
+        rotation_targets = []
+
+        for i in range(batch_size):
+            # Chọn ngẫu nhiên góc xoay cho từng ảnh
+            rotation = np.random.choice(self.rotation_choices)
+            rotation_idx = self.rotation_choices.index(rotation)
+
+            # Áp dụng rotation và lưu target
+            x_aug = self.rotate_image(x[i].unsqueeze(0), rotation)
+            augmentations.append(x_aug)
+            rotation_targets.append(rotation_idx)
+
+        # Chuyển augmentations và targets thành tensor
+        augmentations = torch.cat(augmentations, dim=0)
+        rotation_targets = torch.tensor(rotation_targets).to(self.device)
+
+        # Sinh samples với GLO
         x_hat, z = self.glo(x, domain_idx)
 
-        # Extract and project features
+        # Kiểm tra và điều chỉnh kích thước batch
+        # Kết hợp augmented samples và GLO samples
+        combined_samples = torch.cat([x, augmentations, x_hat])
+        combined_targets = torch.cat(
+            [y, rotation_targets, y]  # Sử dụng lại labels ban đầu cho GLO samples
+        )
+
+        # Feature extraction cho combined samples
+        z_combined = featurizer(combined_samples)
+
+        # Predict rotations cho augmented samples
+        rotation_pred = self.ssl_rotation_predictor(
+            z_combined[batch_size : 2 * batch_size]
+        )
+
+        # Điều chỉnh SSL rotation loss
+        ssl_rotation_loss = F.cross_entropy(rotation_pred, rotation_targets)
+
+        # Điều chỉnh kích thước lambda
+        current_ssl_lambda = self.ssl_lambda_scheduler(epoch)
+
+        # Feature extraction và projection cho original samples
         feat = featurizer(x)
         proj = self.projection(feat)
         proj = F.normalize(proj, dim=1)
 
-        # Normalize generated samples
-        x_hat = self.norm(x_hat)
+        return (x, y), (x_hat, y), proj, ssl_rotation_loss * current_ssl_lambda
 
-        return (x, y), (x_hat, y), proj
-
-    def forward(self, x: list, featurizer):
-        """
-        Args:
-            x: list of domain batches [(x_1, y_1), ..., (x_n, y_n)]
-            featurizer: Feature extractor from DomainBed
-        Returns:
-            original_and_generated: list of tuples [(x_i, y_i), (x_i_hat, y_i)]
-            projections: list of normalized projections [proj_1, ..., proj_n]
-        """
-        num_domains = len(x)
-
-        # Process each domain
+    def forward(self, x: list, featurizer, epoch):
+        # Giữ nguyên logic của forward method
         processed_domains = [
-            self.process_domain(batch, idx, featurizer) for idx, batch in enumerate(x)
+            self.process_domain_with_ssl(batch, idx, featurizer, epoch)
+            for idx, batch in enumerate(x)
         ]
 
         # Unzip results
-        original_samples, generated_samples, projections = zip(*processed_domains)
+        original_samples = [p[0] for p in processed_domains]
+        generated_samples = [p[1] for p in processed_domains]
+        projections = [p[2] for p in processed_domains]
+        ssl_losses = [p[3] for p in processed_domains]
 
-        # Combine original and generated samples
         all_samples = list(original_samples) + list(generated_samples)
 
-        # Return in required format
-        return all_samples, [projections]
+        return all_samples, [projections], ssl_losses
+
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
@@ -433,11 +399,11 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams["resnet18"]:
-            print('Using ResNet18')
+            print("Using ResNet18")
             self.network = torchvision.models.resnet18(pretrained=False)
             self.n_outputs = 512
         else:
-            print('Using ResNet50')
+            print("Using ResNet50")
             self.network = torchvision.models.resnet50(pretrained=False)
             self.n_outputs = 2048
 
