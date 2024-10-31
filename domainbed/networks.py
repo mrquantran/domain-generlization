@@ -32,159 +32,6 @@ from sklearn.metrics import silhouette_score
 import numpy.polynomial.polynomial as poly
 
 
-class ALDModule(nn.Module):
-    """Adaptive Latent Dimensionality Module optimized for domain generalization"""
-
-    def __init__(
-        self,
-        initial_dim=512,  # Increased from 256 to capture more domain-invariant features initially
-        latent_decrease=4,  # More conservative decrease to preserve important features
-        patience=5,  # Reduced to check more frequently
-        window_size=20,  # Keep as per paper
-        n_classes=7,  # Depends on dataset (7 for PACS, 65 for OfficeHome)
-        min_dim=64,  # Increased minimum to ensure enough capacity for cross-domain features
-        slope_threshold=5e-4,  # More sensitive threshold
-        improvement_threshold=1e-4,  # New parameter for meaningful improvements
-    ):
-        super(ALDModule, self).__init__()
-        self.current_dim = initial_dim
-        self.latent_decrease = latent_decrease
-        self.patience = patience
-        self.window_size = window_size
-        self.n_classes = n_classes
-        self.min_dim = min_dim
-        self.slope_threshold = slope_threshold
-        self.improvement_threshold = improvement_threshold
-
-        # Enhanced tracking
-        self.s_scores = []
-        self.recon_losses = []
-        self.compressing = True
-        self.best_score = float("-inf")
-        self.epochs_no_improve = 0
-        self.slow_compression = False
-
-    def polyfit_slope(self, values, deg=1):
-        """Calculate slope using polynomial fitting with enhanced stability"""
-        if len(values) < self.window_size:
-            return 0.0
-
-        y = np.array(values[-self.window_size :])
-        x = np.arange(len(y))
-
-        # Normalize values for numerical stability
-        y_mean = np.mean(y)
-        y_std = np.std(y) if np.std(y) != 0 else 1
-        y_normalized = (y - y_mean) / y_std
-
-        try:
-            coeffs = poly.polyfit(x, y_normalized, deg)
-            slope = coeffs[1] * y_std
-            return slope
-        except np.linalg.LinAlgError:
-            return 0.0
-
-    def should_adjust_dimension(self, epoch) -> bool:
-        """Enhanced dimension adjustment check with domain generalization focus"""
-        if self.current_dim <= self.min_dim:
-            return False
-
-        if epoch % self.patience == 0:
-            # Step 16-19: Calculate slopes and check for improvements
-            recon_slope = self.polyfit_slope(self.recon_losses)
-            sil_slope = self.polyfit_slope(self.s_scores)
-
-            # Check if all slopes are positive
-            if recon_slope > 0 and sil_slope > 0:
-                self.compressing = False
-                return False
-
-            # Transition to slower compression if silhouette score slope is positive
-            if sil_slope > 0 and self.latent_decrease > 1:
-                self.latent_decrease = max(1, self.latent_decrease // 2)
-
-            return True
-
-        return False
-
-    def adjust_dimension(self):
-        """Adjust dimension with domain generalization considerations"""
-        if not self.compressing:
-            return False, self.current_dim
-
-        # Calculate new dimension
-        decrease = self.latent_decrease
-        if self.current_dim - decrease < self.min_dim:
-            decrease = self.current_dim - self.min_dim
-
-        new_dim = max(self.min_dim, self.current_dim - decrease)
-
-        # Stop if we can't decrease further
-        if new_dim == self.current_dim:
-            self.compressing = False
-            return False, self.current_dim
-
-        self.current_dim = new_dim
-        return True, new_dim
-
-    def update_metrics(self, x_source_list, x_target_list):
-        """Update metrics with domain-aware calculations"""
-        reconstruction_losses = []
-        silhouette_scores = []
-
-        # Process each domain pair
-        for (x_source, _), (x_target, _) in zip(x_source_list, x_target_list):
-            if not torch.is_tensor(x_source) or not torch.is_tensor(x_target):
-                raise ValueError(
-                    f"Invalid input types: {type(x_source)}, {type(x_target)}"
-                )
-
-            # Calculate domain-aware silhouette score
-            z_numpy = x_source.view(x_source.shape[0], -1).detach().cpu().numpy()
-            if z_numpy.shape[0] < self.n_classes:
-                continue  # Skip if batch is too small instead of raising error
-
-            kmeans = KMeans(n_clusters=self.n_classes, random_state=0, n_init="auto")
-            labels = kmeans.fit_predict(z_numpy)
-
-            if len(np.unique(labels)) > 1:
-                s_score = silhouette_score(z_numpy, labels, metric="euclidean")
-                silhouette_scores.append(float(s_score))
-
-            # Calculate reconstruction loss with domain alignment consideration
-            recon_loss = F.mse_loss(x_source, x_target).item()
-            reconstruction_losses.append(recon_loss)
-
-            # Calculate reconstruction loss using KL divergence
-            mu_source, logvar_source = torch.mean(x_source, dim=0), torch.var(
-                x_source, dim=0
-            )
-            mu_target, logvar_target = torch.mean(x_target, dim=0), torch.var(
-                x_target, dim=0
-            )
-
-            # Ensure numerical stability
-            logvar_source = torch.clamp(logvar_source, min=1e-6)
-            logvar_target = torch.clamp(logvar_target, min=1e-6)
-
-            # KL divergence between source and target distributions
-            kl_div = 0.5 * torch.sum(
-                logvar_target
-                - logvar_source
-                + (logvar_source.exp() + (mu_source - mu_target).pow(2))
-                / logvar_target.exp()
-                - 1
-            )
-            reconstruction_losses.append(kl_div.item())
-
-        # Update tracking metrics if we have valid scores
-        if silhouette_scores and reconstruction_losses:
-            self.s_scores.append(torch.tensor(silhouette_scores).mean())
-            self.recon_losses.append(torch.tensor(reconstruction_losses).mean())
-
-        return bool(silhouette_scores and reconstruction_losses)
-
-
 class GLOGenerator(nn.Module):
     """Generator network following GLO paper architecture"""
 
@@ -214,34 +61,107 @@ class GLOGenerator(nn.Module):
         x = self.deconv(x)
         return x
 
+
+class LatentAugmentation(nn.Module):
+    def __init__(self, latent_dim, augmentation_config):
+        super(LatentAugmentation, self).__init__()
+
+        # Cấu hình tĩnh để tránh overhead
+        self.noise_level = augmentation_config.get("noise_level", 0.1)
+        self.interpolation_prob = augmentation_config.get("interpolation_prob", 0.3)
+        self.dropout_rate = augmentation_config.get("dropout_rate", 0.1)
+
+        # Pre-compute dropout mask
+        self.register_buffer(
+            "dropout_mask",
+            torch.bernoulli(
+                torch.full((1, latent_dim), self.dropout_rate, dtype=torch.float)
+            ).bool(),
+        )
+
+    def forward(self, z):
+        """
+        Áp dụng augmentation trên latent vectors
+
+        Args:
+            z (torch.Tensor): Latent vectors gốc
+
+        Returns:
+            torch.Tensor: Latent vectors sau khi augmentation
+        """
+        # Sử dụng inplace operations để giảm bộ nhớ
+        if self.training:
+            # Noise injection - sử dụng inplace operations
+            if torch.rand(1).item() < 0.5:
+                z.add_(torch.randn_like(z).mul_(self.noise_level))
+
+            # Interpolation - vectorized và hiệu quả hơn
+            if torch.rand(1).item() < self.interpolation_prob:
+                # Sử dụng torch.roll để tránh sinh index mới
+                z_shuffled = torch.roll(z, shifts=1, dims=0)
+                alpha = torch.rand(z.size(0), 1, device=z.device)
+                z_interpolated = z * alpha + z_shuffled * (1 - alpha)
+
+                # Mask interpolation
+                mask = (
+                    torch.rand(z.size(0), 1, device=z.device) < self.interpolation_prob
+                )
+                z = torch.where(mask, z_interpolated, z)
+
+            # Dropout - sử dụng pre-computed mask
+            z.mul_(~self.dropout_mask)
+
+        return z
+
+
 class GLOModule(nn.Module):
-    def __init__(self, latent_dim=100, num_domains=3, batch_size=32):
+    def __init__(
+        self, latent_dim=100, num_domains=3, batch_size=32, augmentation_config=None
+    ):
         super(GLOModule, self).__init__()
+
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
 
-        # Generator following GLO paper
+        # Generator
         self.generator = GLOGenerator(latent_dim)
 
-        # Learnable latent codes for each domain - key difference from original GLO
-        # We maintain separate latent codes for each domain
-        self.domain_latents = nn.Parameter(
-            torch.randn(num_domains, batch_size, latent_dim)
+        # Optimized Latent Augmentation
+        self.latent_augmentation = LatentAugmentation(
+            latent_dim,
+            augmentation_config
+            or {"noise_level": 0.1, "interpolation_prob": 0.3, "dropout_rate": 0.1},
         )
 
-        # Initialize with normal distribution as per GLO paper
-        nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
+        # Domain latents với khởi tạo hiệu quả hơn
+        self.domain_latents = nn.Parameter(
+            torch.randn(num_domains, batch_size, latent_dim) * 0.02
+        )
 
     def forward(self, x, domain_idx):
+        """
+        Forward pass for the GLOModule.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            domain_idx (int): Index of the domain.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Generated images and augmented latent vectors.
+        """
         batch_size = x.size(0)
 
-        # Get corresponding latent codes for the domain
-        z = self.domain_latents[domain_idx, :batch_size]
+        # Lấy domain latent
+        z = self.domain_latents[domain_idx, :batch_size].clone()
 
-        # Generate images
-        generated = self.generator(z)
-        return generated, z
+        # Áp dụng augmentation
+        z_augmented = self.latent_augmentation(z)
+
+        # Sinh ảnh
+        generated = self.generator(z_augmented)
+
+        return generated, z_augmented
 
 
 class ProjectionHead(nn.Module):
@@ -297,11 +217,19 @@ class CycleMixLayer(nn.Module):
         # Dynamic feature dimension based on backbone
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
 
+        # Cấu hình augmentation
+        augmentation_config = {
+            "noise_level": hparams.get("noise_level", 0.1),
+            "interpolation_prob": hparams.get("interpolation_prob", 0.3),
+            "dropout_rate": hparams.get("dropout_rate", 0.1),
+        }
+
         # GLO components
         self.glo = GLOModule(
             latent_dim=hparams.get("latent_dim", 100),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
+            augmentation_config=augmentation_config,
         ).to(device)
 
         # Projection head for contrastive learning
@@ -360,6 +288,7 @@ class CycleMixLayer(nn.Module):
 
         # Return in required format
         return all_samples, [projections]
+
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval

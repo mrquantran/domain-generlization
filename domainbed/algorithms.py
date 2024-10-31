@@ -13,11 +13,13 @@ from collections import OrderedDict
 
 try:
     from backpack import backpack, extend  # type: ignore
-    from backpack.extensions import BatchGrad # type: ignore
+    from backpack.extensions import BatchGrad  # type: ignore
 except:
     backpack = None
 
 from domainbed import networks
+import os
+from torchvision.utils import save_image
 from domainbed.lib.misc import (
     random_pairs_of_minibatches,
     split_meta_train_test,
@@ -216,6 +218,7 @@ class CYCLEMIX(Algorithm):
         )
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.network = nn.Sequential(self.featurizer, self.classifier).to(device)
+
         self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
 
         # Parameters
@@ -230,8 +233,8 @@ class CYCLEMIX(Algorithm):
         num_epochs = hparams["num_epochs"]
         total_steps = int(steps_per_epoch * num_epochs)
         print(f"Total steps: {total_steps}")
-        print(f'steps_per_epoch: {steps_per_epoch}')
-        print(f'num_epochs: {num_epochs}')
+        print(f"steps_per_epoch: {steps_per_epoch}")
+        print(f"num_epochs: {num_epochs}")
 
         self.optimizer = torch.optim.Adam(
             list(self.network.parameters())
@@ -258,12 +261,38 @@ class CYCLEMIX(Algorithm):
         )
 
     def compute_glo_loss(self, original, generated, latent):
+        """
+        Tích hợp latent regularization loss
+        """
         reconstruction_loss = F.mse_loss(generated, original)
-        latent_reg = torch.mean(torch.norm(latent, dim=1))
+
+        # Latent regularization: Đảm bảo latent vector không quá xa so với phân phối gốc
+        latent_reg = torch.mean(torch.norm(latent, p=2, dim=1))
+
+        # Thêm regularization cho khoảng cách giữa các domain latents
+        domain_distance_reg = self.compute_domain_latent_reg()
+
         return (
             self.reconstruction_lambda * reconstruction_loss
             + self.latent_reg_lambda * latent_reg
+            + 0.01 * domain_distance_reg  # Trọng số nhỏ cho domain distance
         )
+
+    def compute_domain_latent_reg(self):
+        """
+        Tính toán regularization để các domain latents không quá gần nhau
+        """
+        domain_latents = self.cyclemixLayer.glo.domain_latents
+        domain_distance = 0
+
+        for i in range(domain_latents.size(0)):
+            for j in range(i + 1, domain_latents.size(0)):
+                dist = torch.norm(
+                    domain_latents[i].mean(dim=0) - domain_latents[j].mean(dim=0)
+                )
+                domain_distance += dist
+
+        return domain_distance
 
     def compute_contrastive_loss(self, projections):
         total_loss = 0
@@ -314,6 +343,20 @@ class CYCLEMIX(Algorithm):
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
         }
+
+    def save_augmented_samples(self, minibatches, save_path):
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+
+        minibatches_aug, _ = self.cyclemixLayer(minibatches, self.featurizer)
+
+        # Separate original and augmented samples
+        orig_samples = minibatches_aug[: len(minibatches)]
+        aug_samples = minibatches_aug[len(minibatches):]
+
+        for i, ((x_orig, _), (x_aug, _)) in enumerate(zip(orig_samples, aug_samples)):
+            save_image(x_orig, os.path.join(save_path, f"orig_{i}.png"))
+            save_image(x_aug, os.path.join(save_path, f"aug_{i}.png"))
 
     def predict(self, x):
         return self.classifier(self.featurizer(x))
