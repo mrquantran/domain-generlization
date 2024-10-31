@@ -18,229 +18,91 @@ from domainbed.cyclegan.utils import get_sources
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-from scipy.stats import wasserstein_distance
-from numpy import cov, trace, iscomplexobj
-from scipy.linalg import sqrtm
-
-
-import torch
-import torch.nn as nn
 import numpy as np
-from sklearn.metrics import silhouette_score
-import numpy.polynomial.polynomial as poly
 
 
-class ALDModule(nn.Module):
-    """Adaptive Latent Dimensionality Module optimized for domain generalization"""
+class DomainSpecificConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, num_domains):
+        super(DomainSpecificConvLayer, self).__init__()
+        self.num_domains = num_domains
+        self.weights = nn.Parameter(
+            torch.randn(num_domains, out_channels, in_channels, 3, 3)
+        )
+        self.biases = nn.Parameter(torch.zeros(num_domains, out_channels))
 
-    def __init__(
-        self,
-        initial_dim=512,  # Increased from 256 to capture more domain-invariant features initially
-        latent_decrease=4,  # More conservative decrease to preserve important features
-        patience=5,  # Reduced to check more frequently
-        window_size=20,  # Keep as per paper
-        n_classes=7,  # Depends on dataset (7 for PACS, 65 for OfficeHome)
-        min_dim=64,  # Increased minimum to ensure enough capacity for cross-domain features
-        slope_threshold=5e-4,  # More sensitive threshold
-        improvement_threshold=1e-4,  # New parameter for meaningful improvements
-    ):
-        super(ALDModule, self).__init__()
-        self.current_dim = initial_dim
-        self.latent_decrease = latent_decrease
-        self.patience = patience
-        self.window_size = window_size
-        self.n_classes = n_classes
-        self.min_dim = min_dim
-        self.slope_threshold = slope_threshold
-        self.improvement_threshold = improvement_threshold
+        # Khởi tạo trọng số
+        nn.init.kaiming_normal_(self.weights, mode="fan_out")
 
-        # Enhanced tracking
-        self.s_scores = []
-        self.recon_losses = []
-        self.compressing = True
-        self.best_score = float("-inf")
-        self.epochs_no_improve = 0
-        self.slow_compression = False
+    def forward(self, x, domain_idx):
+        # Lựa chọn weights và bias cho domain cụ thể
+        weight = self.weights[domain_idx]
+        bias = self.biases[domain_idx]
 
-    def polyfit_slope(self, values, deg=1):
-        """Calculate slope using polynomial fitting with enhanced stability"""
-        if len(values) < self.window_size:
-            return 0.0
-
-        y = np.array(values[-self.window_size :])
-        x = np.arange(len(y))
-
-        # Normalize values for numerical stability
-        y_mean = np.mean(y)
-        y_std = np.std(y) if np.std(y) != 0 else 1
-        y_normalized = (y - y_mean) / y_std
-
-        try:
-            coeffs = poly.polyfit(x, y_normalized, deg)
-            slope = coeffs[1] * y_std
-            return slope
-        except np.linalg.LinAlgError:
-            return 0.0
-
-    def should_adjust_dimension(self, epoch) -> bool:
-        """Enhanced dimension adjustment check with domain generalization focus"""
-        if self.current_dim <= self.min_dim:
-            return False
-
-        if epoch % self.patience == 0:
-            # Step 16-19: Calculate slopes and check for improvements
-            recon_slope = self.polyfit_slope(self.recon_losses)
-            sil_slope = self.polyfit_slope(self.s_scores)
-
-            # Check if all slopes are positive
-            if recon_slope > 0 and sil_slope > 0:
-                self.compressing = False
-                return False
-
-            # Transition to slower compression if silhouette score slope is positive
-            if sil_slope > 0 and self.latent_decrease > 1:
-                self.latent_decrease = max(1, self.latent_decrease // 2)
-
-            return True
-
-        return False
-
-    def adjust_dimension(self):
-        """Adjust dimension with domain generalization considerations"""
-        if not self.compressing:
-            return False, self.current_dim
-
-        # Calculate new dimension
-        decrease = self.latent_decrease
-        if self.current_dim - decrease < self.min_dim:
-            decrease = self.current_dim - self.min_dim
-
-        new_dim = max(self.min_dim, self.current_dim - decrease)
-
-        # Stop if we can't decrease further
-        if new_dim == self.current_dim:
-            self.compressing = False
-            return False, self.current_dim
-
-        self.current_dim = new_dim
-        return True, new_dim
-
-    def update_metrics(self, x_source_list, x_target_list):
-        """Update metrics with domain-aware calculations"""
-        reconstruction_losses = []
-        silhouette_scores = []
-
-        # Process each domain pair
-        for (x_source, _), (x_target, _) in zip(x_source_list, x_target_list):
-            if not torch.is_tensor(x_source) or not torch.is_tensor(x_target):
-                raise ValueError(
-                    f"Invalid input types: {type(x_source)}, {type(x_target)}"
-                )
-
-            # Calculate domain-aware silhouette score
-            z_numpy = x_source.view(x_source.shape[0], -1).detach().cpu().numpy()
-            if z_numpy.shape[0] < self.n_classes:
-                continue  # Skip if batch is too small instead of raising error
-
-            kmeans = KMeans(n_clusters=self.n_classes, random_state=0, n_init="auto")
-            labels = kmeans.fit_predict(z_numpy)
-
-            if len(np.unique(labels)) > 1:
-                s_score = silhouette_score(z_numpy, labels, metric="euclidean")
-                silhouette_scores.append(float(s_score))
-
-            # Calculate reconstruction loss with domain alignment consideration
-            recon_loss = F.mse_loss(x_source, x_target).item()
-            reconstruction_losses.append(recon_loss)
-
-            # Calculate reconstruction loss using KL divergence
-            mu_source, logvar_source = torch.mean(x_source, dim=0), torch.var(
-                x_source, dim=0
-            )
-            mu_target, logvar_target = torch.mean(x_target, dim=0), torch.var(
-                x_target, dim=0
-            )
-
-            # Ensure numerical stability
-            logvar_source = torch.clamp(logvar_source, min=1e-6)
-            logvar_target = torch.clamp(logvar_target, min=1e-6)
-
-            # KL divergence between source and target distributions
-            kl_div = 0.5 * torch.sum(
-                logvar_target
-                - logvar_source
-                + (logvar_source.exp() + (mu_source - mu_target).pow(2))
-                / logvar_target.exp()
-                - 1
-            )
-            reconstruction_losses.append(kl_div.item())
-
-        # Update tracking metrics if we have valid scores
-        if silhouette_scores and reconstruction_losses:
-            self.s_scores.append(torch.tensor(silhouette_scores).mean())
-            self.recon_losses.append(torch.tensor(reconstruction_losses).mean())
-
-        return bool(silhouette_scores and reconstruction_losses)
+        # Thực hiện convolution
+        return F.conv2d(x, weight, bias, padding=1)
 
 
 class GLOGenerator(nn.Module):
-    """Generator network following GLO paper architecture"""
-
-    def __init__(self, latent_dim=100, output_dim=3):
+    def __init__(self, latent_dim=100, output_dim=3, num_domains=4):
         super(GLOGenerator, self).__init__()
+        self.num_domains = num_domains
 
-        # Following GLO paper architecture
+        # Layer fully connected ban đầu
         self.fc = nn.Linear(latent_dim, 14 * 14 * 256)
 
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1),
-            nn.Tanh(),
+        # Domain-specific layers
+        self.domain_conv_layers = nn.ModuleList(
+            [
+                DomainSpecificConvLayer(256, 128, num_domains),
+                DomainSpecificConvLayer(128, 64, num_domains),
+                DomainSpecificConvLayer(64, 32, num_domains),
+                DomainSpecificConvLayer(32, output_dim, num_domains),
+            ]
         )
 
-    def forward(self, z):
+        # Batch norm layers
+        self.bn_layers = nn.ModuleList(
+            [nn.BatchNorm2d(128), nn.BatchNorm2d(64), nn.BatchNorm2d(32)]
+        )
+
+    def forward(self, z, domain_idx):
         x = self.fc(z)
         x = x.view(-1, 256, 14, 14)
-        x = self.deconv(x)
+
+        # Áp dụng domain-specific convolution
+        for i, (conv_layer, bn_layer) in enumerate(
+            zip(self.domain_conv_layers[:-1], self.bn_layers)
+        ):
+            x = conv_layer(x, domain_idx)
+            x = bn_layer(x)
+            x = F.relu(x)
+
+        # Layer cuối cùng
+        x = self.domain_conv_layers[-1](x, domain_idx)
+        x = torch.tanh(x)
+
         return x
 
 class GLOModule(nn.Module):
-    def __init__(self, latent_dim=100, num_domains=3, batch_size=32):
+    def __init__(self, latent_dim=100, num_domains=4, batch_size=32):
         super(GLOModule, self).__init__()
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
 
-        # Generator following GLO paper
-        self.generator = GLOGenerator(latent_dim)
+        # Generator cải tiến
+        self.generator = GLOGenerator(latent_dim, num_domains=num_domains)
 
-        # Learnable latent codes for each domain - key difference from original GLO
-        # We maintain separate latent codes for each domain
+        # Domain latents
         self.domain_latents = nn.Parameter(
             torch.randn(num_domains, batch_size, latent_dim)
         )
-
-        # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
     def forward(self, x, domain_idx):
         batch_size = x.size(0)
-
-        # Get corresponding latent codes for the domain
         z = self.domain_latents[domain_idx, :batch_size]
-
-        # Generate images
-        generated = self.generator(z)
+        generated = self.generator(z, domain_idx)
         return generated, z
 
 
