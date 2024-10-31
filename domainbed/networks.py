@@ -35,7 +35,7 @@ class GLOGenerator(nn.Module):
         self.fc = nn.Linear(latent_dim, 14 * 14 * 256)
 
         self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), 
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
             nn.ReLU(True),
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.BatchNorm2d(64),
@@ -54,11 +54,13 @@ class GLOGenerator(nn.Module):
         return x
 
 class GLOModule(nn.Module):
-    def __init__(self, latent_dim=512, num_domains=3, batch_size=32):
+
+    def __init__(self, latent_dim=512, num_domains=3, batch_size=32, temperature=0.07):
         super(GLOModule, self).__init__()
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
+        self.temperature = temperature
 
         # Generator following GLO paper
         self.generator = GLOGenerator(latent_dim)
@@ -71,6 +73,74 @@ class GLOModule(nn.Module):
 
         # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
+
+        # Projection head for clustering
+        self.projection_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.ReLU(),
+            nn.Linear(latent_dim // 2, latent_dim // 4),
+        )
+
+    def get_projected_latents(self, z):
+        """Project latents to lower-dimensional space for clustering"""
+        return self.projection_head(z)
+
+    def compute_clustering_loss(self, z, domain_labels, temperature=None):
+        """
+        Công thức Contrastive Loss chuẩn theo paper:
+        L = -log[ exp(sim(z_i, z_j)/temperature) / Σ_k exp(sim(z_i, z_k)/temperature) ]
+
+        Args:
+            features: Tensor của projected features [N, D]
+            domain_labels: Tensor của domain labels [N]
+            temperature: Scalar cho temperature scaling
+        """
+        # Convert domain_labels to tensor and ensure it's 1-dimensional
+        if not isinstance(domain_labels, torch.Tensor):
+            domain_labels = torch.tensor(domain_labels, device=z.device)
+
+        if domain_labels.dim() == 0:
+            domain_labels = domain_labels.unsqueeze(0)
+
+        features = self.get_projected_latents(z)
+
+        if temperature is None:
+            temperature = self.temperature
+
+        # Normalize features
+        features = F.normalize(features, dim=1)
+
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(features, features.T)  # [N, N]
+
+        # Mask for positive pairs (same domain)
+        pos_mask = (domain_labels.unsqueeze(0) == domain_labels.unsqueeze(1)).float()
+        # Remove self-contrast
+        pos_mask = pos_mask - torch.eye(pos_mask.shape[0], device=pos_mask.device)
+
+        # Mask for valid positive pairs
+        valid_pos_mask = (pos_mask.sum(dim=1) > 0).float()
+
+        # Compute exp(sim/temp) for all pairs
+        exp_sim = torch.exp(sim_matrix / temperature)
+
+        # Zero out self-contrast
+        exp_sim = exp_sim * (1 - torch.eye(exp_sim.shape[0], device=exp_sim.device))
+
+        # Compute positive pairs loss
+        pos_pairs = exp_sim * pos_mask
+        pos_pairs = pos_pairs.sum(dim=1)  # [N]
+
+        # Compute denominator (all possible pairs except self)
+        denominator = exp_sim.sum(dim=1)  # [N]
+
+        # Compute log ratios for valid samples
+        log_ratios = -torch.log(pos_pairs / denominator + 1e-8) * valid_pos_mask
+
+        # Normalize by number of valid positive samples
+        loss = log_ratios.sum() / (valid_pos_mask.sum() + 1e-8)
+
+        return loss
 
     def forward(self, x, domain_idx):
         batch_size = x.size(0)
