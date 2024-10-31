@@ -288,6 +288,7 @@ class CYCLEMIX(Algorithm):
             cluster_loss += self.cyclemixLayer.glo.compute_clustering_loss(
                 z, domain_idx
             )
+            print(f"Cluster loss: {cluster_loss}")
 
         # Total loss
         total_loss = class_loss + glo_loss + cluster_loss * self.clustering_lambda

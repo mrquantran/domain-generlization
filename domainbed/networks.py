@@ -57,6 +57,7 @@ class GLOModule(nn.Module):
 
     def __init__(self, latent_dim=512, num_domains=3, batch_size=32, temperature=0.07):
         super(GLOModule, self).__init__()
+        print('latent_dim:', latent_dim)
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
@@ -162,7 +163,7 @@ class CycleMixLayer(nn.Module):
 
         # GLO components
         self.glo = GLOModule(
-            latent_dim=hparams.get("latent_dim", 512),
+            latent_dim=hparams.get("latent_dim", 96),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
         ).to(device)
