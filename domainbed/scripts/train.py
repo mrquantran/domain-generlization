@@ -212,6 +212,13 @@ if __name__ == "__main__":
     eval_loader_names += ["env{}_out".format(i) for i in range(len(out_splits))]
     eval_loader_names += ["env{}_uda".format(i) for i in range(len(uda_splits))]
 
+    steps_per_epoch = min([len(env) / hparams["batch_size"] for env, _ in in_splits])
+
+    n_steps = args.steps or dataset.N_STEPS
+    hparams["n_steps"] = n_steps
+    hparams["steps_per_epoch"] = steps_per_epoch
+    hparams["num_epochs"] = n_steps / steps_per_epoch
+    
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
     algorithm = algorithm_class(
         dataset.input_shape,
@@ -229,12 +236,6 @@ if __name__ == "__main__":
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
 
-    steps_per_epoch = min([len(env) / hparams["batch_size"] for env, _ in in_splits])
-
-    n_steps = args.steps or dataset.N_STEPS
-    hparams["n_steps"] = n_steps
-    hparams["steps_per_epoch"] = steps_per_epoch
-    hparams["num_epochs"] = n_steps / steps_per_epoch
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
 
     def save_checkpoint(filename):
@@ -325,20 +326,20 @@ if __name__ == "__main__":
             if args.save_model_every_checkpoint:
                 save_checkpoint(f"model_step{step}.pkl")
 
-            # Early stopping mechanism based on loss
-            if 'best_loss' not in globals():
-                best_loss = float('inf')
-                patience_counter = 0
+            # # Early stopping mechanism based on loss
+            # if 'best_loss' not in globals():
+            #     best_loss = float('inf')
+            #     patience_counter = 0
 
-            if loss < best_loss:
-                best_loss = loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
+            # if loss < best_loss:
+            #     best_loss = loss
+            #     patience_counter = 0
+            # else:
+            #     patience_counter += 1
 
-            if patience_counter >= 10:
-                misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
-                break
+            # if patience_counter >= 50:
+            #     misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
+            #     break
 
     save_checkpoint("model.pkl")
 

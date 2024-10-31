@@ -88,7 +88,7 @@ class ALDModule(nn.Module):
         """Enhanced dimension adjustment check with domain generalization focus"""
         if self.current_dim <= self.min_dim:
             return False
-            
+
         if epoch % self.patience == 0:
             # Step 16-19: Calculate slopes and check for improvements
             recon_slope = self.polyfit_slope(self.recon_losses)
@@ -102,9 +102,9 @@ class ALDModule(nn.Module):
             # Transition to slower compression if silhouette score slope is positive
             if sil_slope > 0 and self.latent_decrease > 1:
                 self.latent_decrease = max(1, self.latent_decrease // 2)
-                
+
             return True
-                
+
         return False
 
     def adjust_dimension(self):
@@ -154,6 +154,7 @@ class ALDModule(nn.Module):
             # Calculate reconstruction loss with domain alignment consideration
             recon_loss = F.mse_loss(x_source, x_target).item()
             reconstruction_losses.append(recon_loss)
+
             # Calculate reconstruction loss using KL divergence
             mu_source, logvar_source = torch.mean(x_source, dim=0), torch.var(
                 x_source, dim=0
@@ -185,21 +186,13 @@ class ALDModule(nn.Module):
 
 
 class GLOGenerator(nn.Module):
-    """Generator network with proper dimension handling"""
+    """Generator network following GLO paper architecture"""
 
-    def __init__(self, latent_dim=256, output_shape=(3, 224, 224)):
+    def __init__(self, latent_dim=100, output_dim=3):
         super(GLOGenerator, self).__init__()
-        self.latent_dim = latent_dim
-        self.output_shape = output_shape
 
-        # Calculate proper dimensions
-        c, h, w = output_shape
-        self.init_h = h // 16
-        self.init_w = w // 16
-        self.init_channels = 256
-
-        # Proper FC layer initialization
-        self.fc = nn.Linear(latent_dim, self.init_h * self.init_w * self.init_channels)
+        # Following GLO paper architecture
+        self.fc = nn.Linear(latent_dim, 14 * 14 * 256)
 
         self.deconv = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
@@ -211,387 +204,55 @@ class GLOGenerator(nn.Module):
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(True),
-            nn.ConvTranspose2d(32, c, 4, stride=2, padding=1),
+            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1),
             nn.Tanh(),
         )
 
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.ConvTranspose2d)):
-                nn.init.normal_(m.weight, 0.0, 0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.normal_(m.weight, 1.0, 0.02)
-                nn.init.constant_(m.bias, 0)
-
     def forward(self, z):
-        batch_size = z.size(0)
-
-        # Ensure proper shape handling
         x = self.fc(z)
-        x = x.view(batch_size, self.init_channels, self.init_h, self.init_w)
+        x = x.view(-1, 256, 14, 14)
         x = self.deconv(x)
         return x
 
-
 class GLOModule(nn.Module):
-    def __init__(
-        self, latent_dim=512, num_domains=3, num_classes=7, batch_size=32, device="cuda"
-    ):
+    def __init__(self, latent_dim=100, num_domains=3, batch_size=32):
         super(GLOModule, self).__init__()
-        self.device = device
-        self.ald = ALDModule(initial_dim=latent_dim, n_classes=num_classes).to(
-            self.device
-        )
+        self.latent_dim = latent_dim
+        self.num_domains = num_domains
+        self.batch_size = batch_size
 
-        # Add dimension validator
-        self.input_validator = nn.Linear(self.ald.current_dim, self.ald.current_dim).to(
-            self.device
-        )
+        # Generator following GLO paper
+        self.generator = GLOGenerator(latent_dim)
 
-        # Initialize with proper output shape
-        self.generator = GLOGenerator(
-            latent_dim=self.ald.current_dim,
-            output_shape=(3, 224, 224),
-        ).to(self.device)
-
-        # Add dimension adapter layer
-        self.fc_output_size = (
-            self.generator.init_h * self.generator.init_w * self.generator.init_channels
-        )
-        self.dim_adapter = nn.ModuleDict(
-            {
-                "fc": nn.Linear(self.ald.current_dim, self.fc_output_size),
-                "relu": nn.ReLU(),
-                "bn": nn.BatchNorm1d(self.fc_output_size),
-            }
-        ).to(device)
-
+        # Learnable latent codes for each domain - key difference from original GLO
+        # We maintain separate latent codes for each domain
         self.domain_latents = nn.Parameter(
-            torch.randn(
-                num_domains, batch_size, self.ald.current_dim, device=self.device
-            )
+            torch.randn(num_domains, batch_size, latent_dim)
         )
-        self._init_domain_latents()
-        self.prev_domain_latents = torch.zeros_like(self.domain_latents)
 
-    def _init_domain_latents(self):
+        # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
-    def get_most_important_neurons(self, domain_latents, k=5):
-        """Identify important neurons using multiple metrics"""
-        # 1. Magnitude of activations
-        magnitude_scores = torch.abs(domain_latents).mean(dim=(0, 1))
-
-        # 2. Variance across domains
-        variance_scores = torch.var(domain_latents, dim=(0, 1))
-
-        # 3. Domain distinctiveness
-        domain_means = torch.mean(
-            domain_latents, dim=1
-        )  # Tính trung bình trên từng miền
-        domain_separation_scores = torch.zeros(
-            domain_means.shape[1],
-            device=self.device,
-        )  # Khởi tạo điểm phân tách miền
-
-        for i in range(domain_means.shape[1]):  # Lặp qua từng neuron
-            corr_matrix = torch.corrcoef(domain_means[:, i])
-            domain_separation_scores[i] = (
-                1.0 - corr_matrix.mean()
-            )  # Độ tương quan trung bình nghịch đảo
-
-        # Calculate contribution to domain separation
-        for i in range(domain_means.size(1)):
-            neuron_dists = torch.pdist(domain_means[:, i : i + 1])
-            domain_separation_scores[i] = torch.mean(neuron_dists)
-
-        # 4. Temporal stability - Chỉ so sánh khi dimensions giống nhau
-        if hasattr(self, "prev_domain_latents") and self.prev_domain_latents.size(
-            -1
-        ) == domain_latents.size(-1):
-            temporal_scores = 1.0 - torch.abs(
-                torch.mean(domain_latents, dim=(0, 1))
-                - torch.mean(self.prev_domain_latents, dim=(0, 1))
-            )
-        else:
-            temporal_scores = torch.ones_like(magnitude_scores)
-
-        # Normalize scores
-        magnitude_scores = F.normalize(magnitude_scores, dim=0)
-        variance_scores = F.normalize(variance_scores, dim=0)
-        domain_separation_scores = F.normalize(domain_separation_scores, dim=0)
-        temporal_scores = F.normalize(temporal_scores, dim=0)
-
-        # Combine scores with weights
-        importance_scores = (
-            0.2 * magnitude_scores
-            + 0.35 * variance_scores
-            + 0.35 * domain_separation_scores
-            + 0.1 * temporal_scores
-        )
-
-        # Store current latents for next iteration with matching shape
-        self.prev_domain_latents = domain_latents.detach().clone()
-
-        important_indices = torch.topk(
-            importance_scores, k=min(k, len(importance_scores)), largest=True
-        )[1]        
-        return importance_scores, important_indices
-
-    def _find_optimal_neighbors(self, domain_latents, idx, importance_scores, k=3):
-        """Find optimal neighbors based on correlation"""
-        target_neuron = domain_latents[:, :, idx].flatten()
-        correlations = torch.zeros(domain_latents.size(2), device=self.device)
-
-        for i in range(domain_latents.size(2)):
-            if i != idx:
-                current_neuron = domain_latents[:, :, i].flatten()
-                correlations[i] = torch.corrcoef(
-                    torch.stack([target_neuron, current_neuron])
-                )[0, 1]
-
-        # Combine correlation with importance
-        neighbor_scores = correlations * (
-            1 - torch.abs(importance_scores - importance_scores[idx])
-        )
-        neighbor_scores[idx] = float("-inf")
-
-        return torch.topk(neighbor_scores, k=k, largest=True)[1]
-
-    def _verify_domain_separation(self, prune_mask):
-        """Verify domain separation after pruning"""
-        remaining_latents = self.domain_latents[:, :, prune_mask]
-        domain_means = torch.mean(remaining_latents, dim=1)
-
-        # Check minimum separation
-        domain_dists = torch.pdist(domain_means)
-
-        return torch.min(domain_dists) > 0.1
-
-
-    def update_dimension(self, x_source=None, x_target=None, current_epoch=0):
-        old_dim = self.ald.current_dim
-        self.ald.update_metrics(x_source_list=x_source, x_target_list=x_target)
-        action = self.ald.should_adjust_dimension(current_epoch)
-
-        if action:
-            action, new_dim = self.ald.adjust_dimension()
-
-            if new_dim != old_dim:
-                if new_dim <= 0:
-                    print("Warning: Invalid new dimension. Skipping update.")
-                    return
-
-                try:
-                    if new_dim < old_dim:
-                        # Get important neurons for pruning
-                        importance_scores, important_indices = (
-                            self.get_most_important_neurons(
-                                self.domain_latents, k=new_dim
-                            )
-                        )
-                        # Prune to keep only important neurons
-                        new_domain_latents = self.domain_latents[
-                            :, :, important_indices
-                        ]
-                    else:
-                        # Handling dimension increase
-                        new_domain_latents = torch.randn(
-                            self.domain_latents.size(0),
-                            self.domain_latents.size(1),
-                            new_dim,
-                            device=self.device,
-                            dtype=self.domain_latents.dtype,
-                        )
-                        # Copy existing values
-                        new_domain_latents[:, :, :old_dim] = self.domain_latents
-
-                    # Verify shape before assignment
-                    expected_shape = (
-                        self.domain_latents.size(0),
-                        self.domain_latents.size(1),
-                        new_dim,
-                    )
-                    if new_domain_latents.shape != expected_shape:
-                        raise ValueError(
-                            f"Shape mismatch: Expected {expected_shape}, "
-                            f"got {new_domain_latents.shape}"
-                        )
-
-                    # Update domain_latents
-                    self.domain_latents = nn.Parameter(new_domain_latents)
-
-                    # Update other layers
-                    self.input_validator = nn.Linear(new_dim, new_dim).to(self.device)
-                    self.fc_output_size = (
-                        self.generator.init_h
-                        * self.generator.init_w
-                        * self.generator.init_channels
-                    )
-                    self.dim_adapter = nn.ModuleDict(
-                        {
-                            "fc": nn.Linear(new_dim, self.fc_output_size),
-                            "relu": nn.ReLU(),
-                            "bn": nn.BatchNorm1d(self.fc_output_size),
-                        }
-                    ).to(self.device)
-
-                    # Update ALD's current_dim
-                    self.ald.current_dim = new_dim
-
-                    self.reset_batch_norm()
-                    self.validate_dimensions()
-
-                except Exception as e:
-                    print(f"Error during dimension update: {str(e)}")
-                    self.ald.current_dim = old_dim
-                    raise
-
-    def reset_batch_norm(self):
-        """Reset BatchNorm statistics when dimension changes"""
-        if hasattr(self.dim_adapter, "bn"):
-            self.dim_adapter.bn.reset_parameters()
-            self.dim_adapter.bn.to(self.device)
-
-    def validate_dimensions(self):
-        """Validate dimensions of all components"""
-        try:
-            current_dim = self.ald.current_dim
-
-            # Add detailed validation messages
-            if self.domain_latents.size(-1) != current_dim:
-                raise AssertionError(
-                    f"Domain latents dimension mismatch. "
-                    f"Expected: {current_dim}, Got: {self.domain_latents.size(-1)}"
-                )
-
-            if self.input_validator.in_features != current_dim:
-                raise AssertionError(
-                    f"Input validator dimension mismatch. "
-                    f"Expected: {current_dim}, Got: {self.input_validator.in_features}"
-                )
-
-            if self.dim_adapter["fc"].in_features != current_dim:
-                raise AssertionError(
-                    f"Dimension adapter dimension mismatch. "
-                    f"Expected: {current_dim}, Got: {self.dim_adapter['fc'].in_features}"
-                )
-
-        except Exception as e:
-            print(f"Dimension validation failed: {str(e)}")
-            raise
-
     def forward(self, x, domain_idx):
-        device = x.device
         batch_size = x.size(0)
 
-        # Get latent vectors with correct dimension
-        z = self.domain_latents[domain_idx, :batch_size].to(device)
-        current_dim = self.ald.current_dim
+        # Get corresponding latent codes for the domain
+        z = self.domain_latents[domain_idx, :batch_size]
 
-        if z.size(-1) != current_dim:
-            # Handle dimension mismatch
-            new_z = torch.zeros(batch_size, current_dim, device=device)
-            min_dim = min(z.size(-1), current_dim)
-            new_z[:, :min_dim] = z[:, :min_dim]
-            z = new_z
-
-        z = self.input_validator(z)
-        z = self.dim_adapter["fc"](z)
-        z = self.dim_adapter["relu"](z)
-        z = self.dim_adapter["bn"](z)
-        z = z.view(
-            batch_size,
-            self.generator.init_channels,
-            self.generator.init_h,
-            self.generator.init_w,
-        )
-
-        generated = self.generator.deconv(z)
-        return generated, z.view(batch_size, -1)
-
-    def reset_batch_norm(self):
-        """Reset BatchNorm statistics when dimension changes"""
-        if hasattr(self.dim_adapter, "bn"):
-            self.dim_adapter.bn.reset_parameters()
-            self.dim_adapter.bn.to(self.device)
-
-    def validate_dimensions(self):
-        """Validate dimensions of all components"""
-        try:
-            current_dim = self.ald.current_dim
-
-            # Add detailed validation messages
-            if self.domain_latents.size(-1) != current_dim:
-                raise AssertionError(
-                    f"Domain latents dimension mismatch. "
-                    f"Expected: {current_dim}, Got: {self.domain_latents.size(-1)}"
-                )
-
-            if self.input_validator.in_features != current_dim:
-                raise AssertionError(
-                    f"Input validator dimension mismatch. "
-                    f"Expected: {current_dim}, Got: {self.input_validator.in_features}"
-                )
-
-            if self.dim_adapter['fc'].in_features != current_dim:
-                raise AssertionError(
-                    f"Dimension adapter dimension mismatch. "
-                    f"Expected: {current_dim}, Got: {self.dim_adapter['fc'].in_features}"
-                )
-
-        except Exception as e:
-            print(f"Dimension validation failed: {str(e)}")
-            raise
-
-    def forward(self, x, domain_idx):
-        device = x.device
-        batch_size = x.size(0)
-
-        # Get latent vectors with correct dimension
-        z = self.domain_latents[domain_idx, :batch_size].to(device)
-        current_dim = self.ald.current_dim
-
-        if z.size(-1) != current_dim:
-            # Handle dimension mismatch
-            new_z = torch.zeros(batch_size, current_dim, device=device)
-            min_dim = min(z.size(-1), current_dim)
-            new_z[:, :min_dim] = z[:, :min_dim]
-            z = new_z
-
-        z = self.input_validator(z)
-        z = self.dim_adapter["fc"](z)
-        z = self.dim_adapter["relu"](z)
-        z = self.dim_adapter["bn"](z)
-        z = z.view(
-            batch_size,
-            self.generator.init_channels,
-            self.generator.init_h,
-            self.generator.init_w,
-        )
-
-        generated = self.generator.deconv(z)
-        return generated, z.view(batch_size, -1)
+        # Generate images
+        generated = self.generator(z)
+        return generated, z
 
 
 class ProjectionHead(nn.Module):
-    """Enhanced projection head with dynamic dimension handling"""
+    """Projection head for contrastive learning"""
 
     def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
         super(ProjectionHead, self).__init__()
-
-        # Adjust hidden dimension based on input
-        adjusted_hidden_dim = min(hidden_dim, input_dim * 2)
-
         self.net = nn.Sequential(
-            nn.Linear(input_dim, adjusted_hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(adjusted_hidden_dim),
-            nn.Linear(adjusted_hidden_dim, output_dim),
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, x):
@@ -633,23 +294,19 @@ class CycleMixLayer(nn.Module):
         super(CycleMixLayer, self).__init__()
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
-        self.num_classes = len(self.sources)
+        # Dynamic feature dimension based on backbone
         self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
-
-        self.latent_dim = hparams.get("latent_dim", 512)
 
         # GLO components
         self.glo = GLOModule(
-            latent_dim=self.latent_dim,
+            latent_dim=hparams.get("latent_dim", 100),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
-            device=self.device,
-            num_classes=self.num_classes,
         ).to(device)
 
         # Projection head for contrastive learning
         self.projection = ProjectionHead(
-            input_dim=self.latent_dim,  # Use latent dimension
+            input_dim=self.feature_dim,
             hidden_dim=hparams.get("proj_hidden_dim", 2048),
             output_dim=hparams.get("proj_output_dim", 128),
         ).to(device)
@@ -663,27 +320,18 @@ class CycleMixLayer(nn.Module):
         )
 
     def process_domain(self, batch, domain_idx, featurizer):
+        """Process single domain data"""
         x, y = batch
-        device = next(featurizer.parameters()).device
-        x = x.to(device)
-        y = y.to(device)
-
-        # Create adapter if not exists
-        if not hasattr(self, "featurizer_adapter"):
-            self.featurizer_adapter = FeaturizerAdapter(
-                featurizer, self.glo.ald.current_dim, device
-            ).to(device)
 
         # Generate domain-mixed samples
         x_hat, z = self.glo(x, domain_idx)
 
-        # Extract and project features using adapter
-        feat = self.featurizer_adapter(x)
+        # Extract and project features
+        feat = featurizer(x)
         proj = self.projection(feat)
         proj = F.normalize(proj, dim=1)
 
         # Normalize generated samples
-        x_hat = x_hat.to(device)
         x_hat = self.norm(x_hat)
 
         return (x, y), (x_hat, y), proj
@@ -695,7 +343,7 @@ class CycleMixLayer(nn.Module):
             featurizer: Feature extractor from DomainBed
         Returns:
             original_and_generated: list of tuples [(x_i, y_i), (x_i_hat, y_i)]
-            projections: list of normalized projections [proj_1, ..., proj_n]of normalized projections [proj_1, ..., proj_n]
+            projections: list of normalized projections [proj_1, ..., proj_n]
         """
         num_domains = len(x)
 
@@ -712,38 +360,6 @@ class CycleMixLayer(nn.Module):
 
         # Return in required format
         return all_samples, [projections]
-
-
-class FeaturizerAdapter(nn.Module):
-    def __init__(self, featurizer, latent_dim, device="cuda"):
-        super(FeaturizerAdapter, self).__init__()
-        self.device = device
-        self.featurizer = featurizer
-        self.feature_dim = self._get_feature_dim()
-
-        # Two-stage adaptation for better dimension handling
-        intermediate_dim = min(self.feature_dim, 1024)  # Prevent excessive dimensions
-        self.adapter = nn.Sequential(
-            nn.Linear(self.feature_dim, intermediate_dim),
-            nn.ReLU(),
-            nn.BatchNorm1d(intermediate_dim),
-            nn.Linear(intermediate_dim, latent_dim),
-            nn.ReLU(),
-            nn.BatchNorm1d(latent_dim),
-        ).to(device)
-
-    def _get_feature_dim(self):
-        with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 224, 224, device=self.device)
-            features = self.featurizer(dummy_input)
-            return features.shape[1]
-
-    def forward(self, x):
-        features = self.featurizer(x)
-        features = features.view(features.size(0), -1)  # Flatten if needed
-        adapted_features = self.adapter(features)
-        return adapted_features
-
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
