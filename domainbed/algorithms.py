@@ -223,7 +223,16 @@ class CYCLEMIX(Algorithm):
         self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
         self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
 
-        # Optimizers
+        self.base_lr = hparams.get("lr", 1e-4)  # Base learning rate
+        self.max_lr = self.base_lr * 10  # Peak learning rate typically 10x base_lr
+
+        steps_per_epoch = hparams["steps_per_epoch"]
+        num_epochs = hparams["num_epochs"]
+        total_steps = int(steps_per_epoch * num_epochs)
+        print(f"Total steps: {total_steps}")
+        print(f'steps_per_epoch: {steps_per_epoch}')
+        print(f'num_epochs: {num_epochs}')
+
         self.optimizer = torch.optim.Adam(
             list(self.network.parameters())
             + list(self.cyclemixLayer.projection.parameters()),
@@ -234,6 +243,23 @@ class CYCLEMIX(Algorithm):
         self.glo_optimizer = torch.optim.Adam(
             self.cyclemixLayer.glo.parameters(),
             lr=hparams.get("glo_lr", 1e-4),
+            betas=(0.5, 0.999),
+        )
+
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.max_lr,
+            total_steps=total_steps,
+            pct_start=0.3,  # Warm-up phase is 30% of training
+            div_factor=25,  # Initial lr = max_lr/25
+            final_div_factor=1e4,  # Min lr = initial_lr/10000
+            three_phase=False,  # Use two-phase policy
+            verbose=False,
+        )
+        
+        self.ssl_rotation_predictor_optimizer = torch.optim.Adam(
+            self.cyclemixLayer.ssl_rotation_predictor.parameters(),
+            lr=hparams.get("ssl_rotation_predictor_lr", 1e-4),
             betas=(0.5, 0.999),
         )
 
@@ -255,58 +281,57 @@ class CYCLEMIX(Algorithm):
                     )
         return total_loss
 
-    def update(self, minibatches, unlabeled=None):
-        if not hasattr(self, 'current_epoch'):
-            self.current_epoch = 0
-        self.current_epoch += 1
+    def update(self, minibatches, unlabeled=None, epoch=0):
+        minibatches_aug, projections, ssl_losses = self.cyclemixLayer(
+            minibatches, self.featurizer, epoch
+        )
 
-        device = next(self.network.parameters()).device
-        minibatches = [(x.to(device), y.to(device)) for x, y in minibatches]
-        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
+        # Existing loss computations
+        orig_samples = minibatches_aug[: len(minibatches)]
+        aug_samples = minibatches_aug[len(minibatches) :]
 
-        # Source and target samples
-        source_samples = minibatches_aug[: len(minibatches)]
-        target_samples = minibatches_aug[len(minibatches) :]
-
-        # Classification
-        all_x = torch.cat([x for x, y in source_samples])
-        all_y = torch.cat([y for x, y in target_samples])
+        # Classification loss
+        all_x = torch.cat([x for x, y in orig_samples])
+        all_y = torch.cat([y for x, y in orig_samples])
         class_loss = F.cross_entropy(self.predict(all_x), all_y)
 
         # GLO loss computation
         glo_loss = 0
+        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
+            _, z = self.cyclemixLayer.glo(x_orig, 0)
+            glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
 
-        for (x_source, _), (x_target, _) in zip(source_samples, target_samples):
-            _, z = self.cyclemixLayer.glo(x_source, 0)
-            current_glo_loss = self.compute_glo_loss(x_source, x_target, z)
-            glo_loss += current_glo_loss
-
-        self.cyclemixLayer.glo.update_dimension(
-            x_source=source_samples,
-            x_target=target_samples,
-            current_epoch=self.current_epoch,
-        )
-        
-        # Contrastive loss
+        # Contrastive loss computation
         contrastive_loss = self.compute_contrastive_loss(projections)
 
-        # Total loss
-        total_loss = class_loss + glo_loss + self.contrastive_lambda * contrastive_loss
+        # SSL Rotation Loss
+        ssl_loss = sum(ssl_losses)
 
-        # Optimization
+        # Total loss with adaptive SSL weight
+        total_loss = (
+            class_loss
+            + glo_loss
+            # + self.contrastive_lambda * (contrastive_loss)
+            # + ssl_loss
+        )
+
+        # Optimization steps
         self.optimizer.zero_grad()
         self.glo_optimizer.zero_grad()
+        # self.ssl_rotation_predictor_optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
         self.glo_optimizer.step()
+        self.scheduler.step()
+        # self.ssl_rotation_predictor_optimizer.step()
 
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
-            "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
-            "current_epoch": self.current_epoch,
+            "ssl_loss": ssl_loss.item(),
+            "learning_rate": self.scheduler.get_last_lr()[0],
         }
 
     def predict(self, x):
