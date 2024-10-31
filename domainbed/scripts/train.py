@@ -312,9 +312,8 @@ if __name__ == "__main__":
 
             loss = results["loss"]
             class_loss = results["class_loss"]
-            contrastive_loss = results["contrastive_loss"]
             glo_loss = results["glo_loss"]
-            misc.print_row(["loss", loss, "class_loss", class_loss, "contrastive_loss", contrastive_loss, "glo_loss", glo_loss], colwidth=12)
+            misc.print_row(["loss", loss, "class_loss", class_loss, "glo_loss", glo_loss], colwidth=12)
             misc.print_row(["mean_out_acc", mean_out_acc], colwidth=12)
 
             results.update({"hparams": hparams, "args": vars(args)})

@@ -221,8 +221,7 @@ class CYCLEMIX(Algorithm):
         # Parameters
         self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
         self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
-        self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
-
+        
         self.base_lr = hparams.get("lr", 1e-4)  # Base learning rate
         self.max_lr = self.base_lr * 10  # Peak learning rate typically 10x base_lr
 
@@ -234,8 +233,7 @@ class CYCLEMIX(Algorithm):
         print(f'num_epochs: {num_epochs}')
 
         self.optimizer = torch.optim.Adam(
-            list(self.network.parameters())
-            + list(self.cyclemixLayer.projection.parameters()),
+            list(self.network.parameters()),
             lr=self.hparams["lr"],
             weight_decay=self.hparams["weight_decay"],
         )
@@ -265,18 +263,8 @@ class CYCLEMIX(Algorithm):
             + self.latent_reg_lambda * latent_reg
         )
 
-    def compute_contrastive_loss(self, projections):
-        total_loss = 0
-        for proj_tuple in projections:
-            for i in range(len(proj_tuple)):
-                for j in range(i + 1, len(proj_tuple)):
-                    total_loss += self.cyclemixLayer.nt_xent(
-                        proj_tuple[i], proj_tuple[j]
-                    )
-        return total_loss
-
     def update(self, minibatches, unlabeled=None):
-        minibatches_aug, projections = self.cyclemixLayer(minibatches, self.featurizer)
+        minibatches_aug = self.cyclemixLayer(minibatches)
 
         # Separate original and augmented samples
         orig_samples = minibatches_aug[: len(minibatches)]
@@ -295,9 +283,6 @@ class CYCLEMIX(Algorithm):
             _, z = self.cyclemixLayer.glo(x_orig, 0)
             glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
 
-        # Contrastive loss computation
-        contrastive_loss = self.compute_contrastive_loss(projections)
-
         # Total loss
         total_loss = class_loss + glo_loss
 
@@ -307,12 +292,12 @@ class CYCLEMIX(Algorithm):
         total_loss.backward()
         self.optimizer.step()
         self.glo_optimizer.step()
+        self.scheduler.step()
 
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
-            "glo_loss": glo_loss.item(),
-            "contrastive_loss": contrastive_loss.item(),
+            "glo_loss": glo_loss.item()
         }
 
     def predict(self, x):
