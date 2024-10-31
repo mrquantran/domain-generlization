@@ -55,7 +55,7 @@ class GLOGenerator(nn.Module):
 
 class GLOModule(nn.Module):
 
-    def __init__(self, latent_dim=512, num_domains=3, batch_size=32, temperature=0.07):
+    def __init__(self, latent_dim=1024, num_domains=3, batch_size=32, temperature=0.07):
         super(GLOModule, self).__init__()
         print('latent_dim:', latent_dim)
         self.latent_dim = latent_dim
@@ -141,7 +141,7 @@ class GLOModule(nn.Module):
         # Normalize by number of valid positive samples
         loss = log_ratios.sum() / (valid_pos_mask.sum() + 1e-8)
 
-        return loss
+        return loss # if loss = 0, it means that all the samples are in the same domain
 
     def forward(self, x, domain_idx):
         batch_size = x.size(0)
