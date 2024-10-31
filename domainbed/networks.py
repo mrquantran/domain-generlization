@@ -17,7 +17,7 @@ from domainbed.cyclegan.utils import get_sources
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from domainbed.model.AlexNet import AlexNet
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -34,17 +34,39 @@ class ResidualBlock(nn.Module):
 
 
 class SSLRotationPredictor(nn.Module):
-    def __init__(self, num_rotations=4):
+    def __init__(
+        self,
+        num_rotations=4,
+        pretrained_model_path="/kaggle/input/rotnet/pytorch/default/1/model_net_epoch50",
+    ):
         super(SSLRotationPredictor, self).__init__()
-        # Use a pretrained ResNet18 model
-        self.rotation_predictor = torchvision.models.resnet18(pretrained=True)
+        # Load AlexNet model
+        self.backbone = AlexNet({"num_classes": num_rotations})
 
-        # Replace the final fully connected layer
-        num_ftrs = self.rotation_predictor.fc.in_features
-        self.rotation_predictor.fc = nn.Linear(num_ftrs, num_rotations)
+        # Load pretrained weights if available
+        if pretrained_model_path:
+            self._load_pretrained_weights(pretrained_model_path)
+
+        self.rotation_classifier = nn.Linear(
+            4096, num_rotations
+        )  # 4096 corresponds to the fc layer output
+
+    def _load_pretrained_weights(self, path):
+        try:
+            checkpoint = torch.load(path)
+            self.backbone.load_state_dict(checkpoint, strict=False)
+            print("Pretrained RotNet weights loaded successfully.")
+        except Exception as e:
+            print(f"Failed to load pretrained weights: {e}")
 
     def forward(self, x):
-        return self.rotation_predictor(x)
+        # Forward pass through AlexNet backbone up to the fully connected layer
+        features = self.backbone(
+            x, out_feat_keys=["fc_block"]
+        )  # Retrieve output from fc_block layer
+        features = features.view(features.size(0), -1)  # Flatten for classifier input
+        rotation_logits = self.rotation_classifier(features)
+        return rotation_logits
 
 
 class GLOGenerator(nn.Module):
@@ -259,55 +281,59 @@ class CycleMixLayer(nn.Module):
     def process_domain_with_ssl(self, batch, domain_idx, featurizer, epoch):
         x, y = batch
         batch_size = x.size(0)
+        # get image size
+        size = x.size(-1)
 
-        # Sinh augmented samples
+        # Prepare augmented samples with rotations
         augmentations = []
         rotation_targets = []
 
         for i in range(batch_size):
-            # Chọn ngẫu nhiên góc xoay cho từng ảnh
+            # Get individual image
+            img = x[i].unsqueeze(0)
+
+            # Apply random rotation from the 4 possible angles
             rotation = np.random.choice(self.rotation_choices)
             rotation_idx = self.rotation_choices.index(rotation)
 
-            # Áp dụng rotation và lưu target
-            x_aug = self.rotate_image(x[i].unsqueeze(0), rotation)
-            augmentations.append(x_aug)
+            # Ensure image is correct size and format
+            if img.size(-1) != size:
+                img = F.interpolate(
+                    img, size=(size, size), mode="bilinear", align_corners=False
+                )
+
+            # Apply rotation transformation
+            rotated_img = self.rotate_image(img, rotation)
+            augmentations.append(rotated_img)
             rotation_targets.append(rotation_idx)
 
-        # Chuyển augmentations và targets thành tensor
+        # Convert to batched tensor
         augmentations = torch.cat(augmentations, dim=0)
-        rotation_targets = torch.tensor(rotation_targets).to(self.device)
+        rotation_targets = torch.tensor(rotation_targets, dtype=torch.long).to(
+            self.device
+        )
 
-        # Sinh samples với GLO
+        # Generate GLO samples
         x_hat, z = self.glo(x, domain_idx)
 
-        # Kiểm tra và điều chỉnh kích thước batch
-        # Kết hợp augmented samples và GLO samples
-        combined_samples = torch.cat([x, augmentations, x_hat])
-        combined_targets = torch.cat(
-            [y, rotation_targets, y]  # Sử dụng lại labels ban đầu cho GLO samples
-        )
+        # Get rotation predictions using SSL rotation predictor
+        with torch.no_grad():  # More efficient inference
+            rotation_logits = self.ssl_rotation_predictor(augmentations)
+            rotation_pred = F.softmax(rotation_logits, dim=1)
 
-        # Feature extraction cho combined samples
-        z_combined = featurizer(combined_samples)
-
-        # Predict rotations cho augmented samples
-        rotation_pred = self.ssl_rotation_predictor(
-            z_combined[batch_size : 2 * batch_size]
-        )
-
-        # Điều chỉnh SSL rotation loss
+        # Calculate SSL rotation loss
         ssl_rotation_loss = F.cross_entropy(rotation_pred, rotation_targets)
 
-        # Điều chỉnh kích thước lambda
+        # Apply dynamic lambda scaling
         current_ssl_lambda = self.ssl_lambda_scheduler(epoch)
+        scaled_ssl_loss = ssl_rotation_loss * current_ssl_lambda
 
-        # Feature extraction và projection cho original samples
+        # Feature extraction and projection
         feat = featurizer(x)
         proj = self.projection(feat)
         proj = F.normalize(proj, dim=1)
 
-        return (x, y), (x_hat, y), proj, ssl_rotation_loss * current_ssl_lambda
+        return (x, y), (x_hat, y), proj, scaled_ssl_loss
 
     def forward(self, x: list, featurizer, epoch):
         # Giữ nguyên logic của forward method

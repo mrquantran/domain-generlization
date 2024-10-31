@@ -256,12 +256,6 @@ class CYCLEMIX(Algorithm):
             three_phase=False,  # Use two-phase policy
             verbose=False,
         )
-        
-        self.ssl_rotation_optimizer = torch.optim.Adam(
-            self.cyclemixLayer.ssl_rotation_predictor.parameters(),
-            lr=hparams.get('ssl_rotation_lr', 1e-3),
-            weight_decay=1e-5
-        )
 
     def compute_glo_loss(self, original, generated, latent):
         reconstruction_loss = F.mse_loss(generated, original)
@@ -311,16 +305,14 @@ class CYCLEMIX(Algorithm):
         total_loss = (
             class_loss
             + glo_loss
-            + self.contrastive_lambda * contrastive_loss
+            + self.contrastive_lambda * (contrastive_loss)
             + ssl_loss
         )
 
         # Optimization steps
         self.optimizer.zero_grad()
         self.glo_optimizer.zero_grad()
-        self.ssl_rotation_optimizer.zero_grad()
         total_loss.backward()
-        self.ssl_rotation_optimizer.step()
         self.optimizer.step()
         self.glo_optimizer.step()
         self.scheduler.step()
