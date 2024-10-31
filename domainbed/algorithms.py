@@ -247,7 +247,7 @@ class CYCLEMIX(Algorithm):
             self.optimizer,
             max_lr=self.max_lr,
             total_steps=total_steps,
-            pct_start=0.15,  # Warm-up phase is 30% of training
+            pct_start=0.2,  # Warm-up phase is 30% of training
             div_factor=25,  # Initial lr = max_lr/25
             final_div_factor=1e4,  # Min lr = initial_lr/10000
             three_phase=False,  # Use two-phase policy
@@ -288,7 +288,6 @@ class CYCLEMIX(Algorithm):
             cluster_loss += self.cyclemixLayer.glo.compute_clustering_loss(
                 z, domain_idx
             )
-            print(f"Cluster loss: {cluster_loss}")
 
         # Total loss
         total_loss = class_loss + glo_loss + cluster_loss * self.clustering_lambda
