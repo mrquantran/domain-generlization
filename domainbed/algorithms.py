@@ -223,7 +223,13 @@ class CYCLEMIX(Algorithm):
         self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
         self.contrastive_lambda = hparams.get("contrastive_lambda", 0.1)
 
-        # Optimizers
+        self.base_lr = hparams.get("lr", 1e-4)  # Base learning rate
+        self.max_lr = self.base_lr * 10  # Peak learning rate typically 10x base_lr
+
+        steps_per_epoch = hparams["steps_per_epoch"]
+        num_epochs = hparams["num_epochs"]
+        total_steps = steps_per_epoch * num_epochs
+        
         self.optimizer = torch.optim.Adam(
             list(self.network.parameters())
             + list(self.cyclemixLayer.projection.parameters()),
@@ -235,6 +241,17 @@ class CYCLEMIX(Algorithm):
             self.cyclemixLayer.glo.parameters(),
             lr=hparams.get("glo_lr", 1e-4),
             betas=(0.5, 0.999),
+        )
+        
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.max_lr,
+            total_steps=total_steps,
+            pct_start=0.3,  # Warm-up phase is 30% of training
+            div_factor=25,  # Initial lr = max_lr/25
+            final_div_factor=1e4,  # Min lr = initial_lr/10000
+            three_phase=False,  # Use two-phase policy
+            verbose=False,
         )
 
     def compute_glo_loss(self, original, generated, latent):
@@ -255,8 +272,32 @@ class CYCLEMIX(Algorithm):
                     )
         return total_loss
 
+    def find_lr(self, train_loader, min_lr=1e-7, max_lr=1, num_iterations=100):
+        """
+        Learning rate finder để xác định learning rate tối ưu
+        """
+        from torch_lr_finder import LRFinder
+
+        criterion = nn.CrossEntropyLoss()
+        lr_finder = LRFinder(self.network, self.optimizer, criterion)
+
+        lr_finder.range_test(
+            train_loader,
+            start_lr=min_lr,
+            end_lr=max_lr,
+            num_iter=num_iterations,
+            step_mode="exp",
+            smooth_f=0.05,
+        )
+
+        # Get suggested learning rate
+        suggested_lr = lr_finder.suggestion()
+        lr_finder.reset()
+
+        return suggested_lr
+
     def update(self, minibatches, unlabeled=None):
-        if not hasattr(self, 'current_epoch'):
+        if not hasattr(self, "current_epoch"):
             self.current_epoch = 0
         self.current_epoch += 1
 
@@ -286,7 +327,6 @@ class CYCLEMIX(Algorithm):
             x_target=target_samples,
             current_epoch=self.current_epoch,
         )
-        
         # Contrastive loss
         contrastive_loss = self.compute_contrastive_loss(projections)
 
@@ -300,13 +340,18 @@ class CYCLEMIX(Algorithm):
         self.optimizer.step()
         self.glo_optimizer.step()
 
+        # Step the scheduler
+        self.scheduler.step()
+
+        current_lr = self.scheduler.get_last_lr()[0]
+
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
             "current_latent_dim": self.cyclemixLayer.glo.ald.current_dim,
-            "current_epoch": self.current_epoch,
+            "learning_rate": current_lr,
         }
 
     def predict(self, x):
