@@ -25,8 +25,8 @@ class LatentInterpolator(nn.Module):
         num_domains,
         latent_dim,
         num_interpolation_points=5,
-        smoothness_lambda=0.1,
         consistency_lambda=0.1,
+        cycle_lambda=0.1,
         diversity_lambda=0.05,
         momentum_beta=0.9,
         temperature=0.1,
@@ -35,41 +35,57 @@ class LatentInterpolator(nn.Module):
         self.num_domains = num_domains
         self.latent_dim = latent_dim
         self.num_points = num_interpolation_points
-        self.smoothness_lambda = smoothness_lambda
         self.consistency_lambda = consistency_lambda
+        self.cycle_lambda = cycle_lambda
         self.diversity_lambda = diversity_lambda
         self.momentum_beta = momentum_beta
         self.temperature = temperature
 
-        # Cache for momentum
+        # Cache
+        self.register_buffer(
+            "interpolation_weights", torch.linspace(0, 1, num_interpolation_points)
+        )
         self.register_buffer("momentum", torch.zeros(1, latent_dim))
 
-    def interpolate(self, z1: torch.Tensor, z2: torch.Tensor, weights: torch.Tensor):
-        return z1.unsqueeze(0) * weights + z2.unsqueeze(0) * (1 - weights)
+    @torch.amp.autocast("cuda")
+    def compute_adaptive_weights(self, z1, z2):
+        cosine_sim = nn.CosineSimilarity(dim=-1)
+        similarity = cosine_sim(z1, z2)
+        weights = torch.sigmoid(similarity / self.temperature)
+        return weights.to(z1.device)
+
+    @torch.amp.autocast("cuda")
+    def interpolate(
+        self,
+        z1: torch.Tensor,
+        z2: torch.Tensor,
+        weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Interpolate between two latent vectors using provided weights
+        """
+        weights = weights.to(z1.device)
+
+        # Apply adaptive weighting
+        adaptive_w = self.compute_adaptive_weights(z1, z2).unsqueeze(-1)
+        weights = weights * adaptive_w
+
+        return torch.lerp(z1, z2, weights)
 
     def linear_interpolate(
         self, z1: torch.Tensor, z2: torch.Tensor, num_points: int = None
     ) -> torch.Tensor:
         """
         Perform linear interpolation between two latent vectors
-
-        Args:
-            z1: Starting latent vector (batch_size, latent_dim)
-            z2: Ending latent vector (batch_size, latent_dim)
-            num_points: Number of interpolation points
-
-        Returns:
-            Interpolated points (num_points, batch_size, latent_dim)
         """
         if num_points is None:
             num_points = self.num_points
 
         # Generate interpolation weights
-        weights = torch.linspace(0, 1, self.num_points, device=z1.device)
-        weights = weights.view(-1, 1, 1)
+        weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
 
         # Compute adaptive domain weights
-        domain_weights = self.compute_domain_weights(z1, z2)  # [batch_size, 1]
+        domain_weights = self.compute_domain_weights(z1, z2)
 
         # Reshape inputs for broadcasting
         z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
@@ -78,8 +94,9 @@ class LatentInterpolator(nn.Module):
         # Linear interpolation: z = α * z1 + (1-α) * z2
         interpolated = self.interpolate(z1=z1, z2=z2, weights=weights)
 
-        # Compute momentum term
-        # momentum = β * momentum + (1 - β) * (z2 - z1).mean(dim=1)
+        """
+        momentum = β * momentum + (1 - β) * (z2 - z1).mean(dim=1)
+        """
         momentum = self.momentum_beta * self.momentum + (1 - self.momentum_beta) * (
             z2 - z1
         ).mean(dim=1)
@@ -94,7 +111,8 @@ class LatentInterpolator(nn.Module):
     @torch.amp.autocast("cuda")
     def compute_diversity_loss(self, interpolated_points: torch.Tensor) -> torch.Tensor:
         """
-        Optimized diversity loss computation
+        Diversity loss to ensure that the latent space is diverse
+        L_diversity = -Σ Σ ||z_i - z_j||₂²
         """
         # Reshape to 2D for efficient computation
         points_flat = interpolated_points.view(-1, self.latent_dim)
@@ -108,6 +126,19 @@ class LatentInterpolator(nn.Module):
         distances = dist_matrix * mask
 
         return -torch.mean(distances[distances > 0])
+
+    @torch.amp.autocast("cuda")
+    def compute_cycle_consistency_loss(self, z1, z2):
+        """
+        Formula for cycle consistency loss:
+        L_cycle = ||z1 - z_interp||₂² + ||z2 - z_interp||₂²
+        Ensure cycle consistency in interpolation
+        """
+        forward_interp = self.interpolate(z1, z2, self.interpolation_weights)
+        backward_interp = self.interpolate(z2, z1, 1-self.interpolation_weights)
+
+        cycle_loss = F.mse_loss(forward_interp, backward_interp)
+        return cycle_loss
 
     @torch.amp.autocast("cuda")
     def compute_domain_weights(
@@ -126,56 +157,65 @@ class LatentInterpolator(nn.Module):
 
         return weights.unsqueeze(-1)
 
-    @torch.amp.autocast("cuda")
-    def compute_smoothness_loss(self, interpolated_points) -> torch.Tensor:
-        """
-        Calculate smoothness loss between consecutive interpolation points
-        It means that the latent space should be smooth
-        Smooth latent space is important for the generator to generate realistic images
-        L_smooth = Σ ||z_{i+1} - z_i||₂²
-        """
-        # Check for invalid values
-        if torch.isnan(interpolated_points).any() or torch.isinf(interpolated_points).any():
-            return torch.tensor(0.0, device=interpolated_points.device)
+    # @torch.amp.autocast("cuda")
+    # def compute_smoothness_loss(self, interpolated_points) -> torch.Tensor:
+    #     """
+    #     Calculate smoothness loss between consecutive interpolation points
+    #     It means that the latent space should be smooth
+    #     Smooth latent space is important for the generator to generate realistic images
+    #     L_smooth = Σ ||z_{i+1} - z_i||₂²
+    #     """
+    #     # Check for invalid values
+    #     if torch.isnan(interpolated_points).any() or torch.isinf(interpolated_points).any():
+    #         return torch.tensor(0.0, device=interpolated_points.device)
 
-        # Compute differences between consecutive points
-        diffs = interpolated_points[1:] - interpolated_points[:-1]
+    #     # Compute differences between consecutive points
+    #     diffs = interpolated_points[1:] - interpolated_points[:-1]
 
-        # Clip gradients to prevent explosion
-        diffs = torch.clamp(diffs, min=-100.0, max=100.0)
+    #     # Clip gradients to prevent explosion
+    #     diffs = torch.clamp(diffs, min=-100.0, max=100.0)
 
-        # Compute L2 norm with epsilon for numerical stability
-        norms = torch.norm(diffs, dim=-1, keepdim=True) + 1e-8
+    #     # Compute L2 norm with epsilon for numerical stability
+    #     norms = torch.norm(diffs, dim=-1, keepdim=True) + 1e-8
 
-        # Square and mean
-        loss = torch.mean(norms ** 2)
+    #     # Square and mean
+    #     loss = torch.mean(norms ** 2)
 
-        # Return 0 if loss is invalid
-        return loss if torch.isfinite(loss) else torch.tensor(0.0, device=interpolated_points.device)
+    #     # Return 0 if loss is invalid
+    #     return loss if torch.isfinite(loss) else torch.tensor(0.0, device=interpolated_points.device)
 
     @torch.amp.autocast("cuda")
     def compute_consistency_loss(
         self, z1: torch.Tensor, z2: torch.Tensor, interpolated_points: torch.Tensor
     ) -> torch.Tensor:
         """
-        Đảm bảo tính nhất quán của interpolation
         L_consist = ||z_interp - z_target||₂²
+        - Consistency loss ensures that the interpolation is consistent with the target points
+        - Target points are generated by linear interpolation between z1 and z2
+        - Target points mean that the interpolation should be consistent with the linear interpolation
+        - Consistent interpolation is important for the generator to generate realistic images, and it helps to prevent mode collapse
         """
+        # Get the number of interpolation points from interpolated_points
+        num_points = interpolated_points.size(0)
+
         # Generate target points
-        alphas = torch.linspace(0, 1, interpolated_points.size(1), device=z1.device)
-        alphas = alphas.view(1, -1, 1, 1)  # Shape: [1, num_points, 1, 1]
+        alphas = torch.linspace(0, 1, num_points, device=z1.device)
+        alphas = alphas.view(-1, 1, 1)  # Shape: [num_points, 1, 1]
 
         # Compute domain weights
         domain_weights = self.compute_domain_weights(z1, z2)
-        domain_weights = domain_weights.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, batch_size, 1]
+        domain_weights = domain_weights.unsqueeze(0)  # Shape: [1, batch_size, 1]
 
-        # Generate target points with domain weights
-        z1_expanded = z1.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, batch_size, latent_dim]
-        z2_expanded = z2.unsqueeze(0).unsqueeze(1)  # Shape: [1, 1, batch_size, latent_dim]
+        # Reshape inputs for broadcasting
+        z1 = z1.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
+        z2 = z2.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
 
         # Generate target points with broadcasting
-        target_points = alphas * z1_expanded + (1 - alphas) * z2_expanded
-        target_points = target_points * domain_weights  # Shape matches interpolated_points
+        target_points = alphas * z1 + (1 - alphas) * z2  # Shape: [num_points, batch_size, latent_dim]
+        target_points = target_points * domain_weights  # Apply domain weights
+
+        # Ensure interpolated_points has the same shape as target_points
+        interpolated_points = interpolated_points.view(num_points, -1, self.latent_dim)
 
         return F.mse_loss(interpolated_points, target_points)
 
@@ -189,13 +229,15 @@ class LatentInterpolator(nn.Module):
 
         if self.training:
             # Calculate losses only during training
-            smoothness_loss = self.compute_smoothness_loss(interpolated)
+            # smoothness_loss = self.compute_smoothness_loss(interpolated)
             consistency_loss = self.compute_consistency_loss(z1, z2, interpolated)
             diversity_loss = self.compute_diversity_loss(interpolated)
+            cycle_loss = self.compute_cycle_consistency_loss(z1, z2)
             total_loss = (
-                self.smoothness_lambda * smoothness_loss
-                + self.consistency_lambda * consistency_loss
+                # self.smoothness_lambda * smoothness_loss
+                self.consistency_lambda * consistency_loss
                 + self.diversity_lambda * diversity_loss
+                + self.cycle_lambda * cycle_loss
             )
             return interpolated, total_loss
 
@@ -218,14 +260,14 @@ class LatentInterpolator(nn.Module):
                 interpolated = self.linear_interpolate(z1[b], z2[b])
 
                 if self.training:
-                    smoothness_loss = self.compute_smoothness_loss(interpolated)
                     consistency_loss = self.compute_consistency_loss(z1[b], z2[b], interpolated)
                     diversity_loss = self.compute_diversity_loss(interpolated)
-
+                    cycle_loss = self.compute_cycle_consistency_loss(z1[b], z2[b])
                     loss = (
-                        self.smoothness_lambda * smoothness_loss +
-                        self.consistency_lambda * consistency_loss +
-                        self.diversity_lambda * diversity_loss
+                        # self.smoothness_lambda * smoothness_loss +
+                        self.consistency_lambda * consistency_loss
+                        + self.diversity_lambda * diversity_loss
+                        + self.cycle_lambda * cycle_loss
                     )
                     return interpolated, loss
                 return interpolated, torch.tensor(0.0, device=z1.device)
@@ -291,7 +333,7 @@ class GLOModule(nn.Module):
         num_domains=3,
         batch_size=32,
         temperature=0.07,
-        smoothness_lambda=0.1,
+        cycle_lambda=0.1,
         consistency_lambda=0.1,
         diversity_lambda=0.05,
     ):
@@ -312,9 +354,9 @@ class GLOModule(nn.Module):
         self.interpolator = LatentInterpolator(
             num_domains,
             latent_dim,
-            smoothness_lambda=smoothness_lambda,
             consistency_lambda=consistency_lambda,
             diversity_lambda=diversity_lambda,
+            cycle_lambda=cycle_lambda,
         )
 
         # Projection and discrimination
