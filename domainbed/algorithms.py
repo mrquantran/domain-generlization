@@ -222,7 +222,9 @@ class CYCLEMIX(Algorithm):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.network = nn.Sequential(self.featurizer, self.classifier).to(device)
-        self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
+        self.cyclemixLayer = networks.CycleMixLayer(
+            hparams, device
+        )
 
         # Loss weights
         self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
@@ -365,7 +367,16 @@ class CYCLEMIX(Algorithm):
         self.optimizer.zero_grad()
         self.glo_optimizer.zero_grad()
 
-        # Backward pass
+        # Compute total loss with fresh tensors
+        total_loss = (
+            class_loss
+            + glo_loss
+            + self.clustering_lambda * cluster_loss
+            + self.interpolation_lambda * interpolation_loss
+            + cyclemix_loss
+        )
+
+        # Normal backward pass without retain_graph
         total_loss.backward()
 
         # Clip gradients to prevent explosion
