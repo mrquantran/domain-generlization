@@ -10,6 +10,7 @@ import torchvision.models
 from torchvision import transforms
 from transformers import ViTModel
 
+import time
 import numpy as np
 
 from domainbed.lib import wide_resnet
@@ -214,33 +215,33 @@ class LatentInterpolator(nn.Module):
             # smoothness_loss = self.compute_smoothness_loss(interpolated)
             consistency_loss = self.compute_consistency_loss(z1, z2, interpolated)
             diversity_loss = self.compute_diversity_loss(interpolated)
-            cycle_loss = self.compute_cycle_consistency_loss(z1, z2)
+            # cycle_loss = self.compute_cycle_consistency_loss(z1, z2)
             total_loss = (
                 # self.smoothness_lambda * smoothness_loss
                 self.consistency_lambda * consistency_loss
                 + self.diversity_lambda * diversity_loss
-                + self.cycle_lambda * cycle_loss
+                # + self.cycle_lambda * cycle_loss
             )
             return interpolated, total_loss
 
         return interpolated, torch.tensor(0.0, device=z1.device)
 
-    @torch.amp.autocast("cuda")
-    def compute_cycle_consistency_loss(self, z1, z2):
-        """Ensure cycle consistency in interpolation"""
-        # Reshape inputs and weights for correct broadcasting
-        z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
-        z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
-        weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
+    # @torch.amp.autocast("cuda")
+    # def compute_cycle_consistency_loss(self, z1, z2):
+    #     """Ensure cycle consistency in interpolation"""
+    #     # Reshape inputs and weights for correct broadcasting
+    #     z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
+    #     z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
+    #     weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
 
-        epsilon = 1e-8
+    #     epsilon = 1e-8
 
-        # Compute forward and backward interpolations
-        forward_interp = self.interpolate(z1, z2, weights)
-        backward_interp = self.interpolate(z2, z1, 1 - weights)
+    #     # Compute forward and backward interpolations
+    #     forward_interp = self.interpolate(z1, z2, weights)
+    #     backward_interp = self.interpolate(z2, z1, 1 - weights)
 
-        cycle_loss = F.l1_loss(forward_interp, backward_interp) + epsilon
-        return cycle_loss
+    #     cycle_loss = F.l1_loss(forward_interp, backward_interp) + epsilon
+    #     return cycle_loss
 
     def forward(
         self, domain_latents: torch.Tensor
@@ -261,12 +262,12 @@ class LatentInterpolator(nn.Module):
                 if self.training:
                     consistency_loss = self.compute_consistency_loss(z1[b], z2[b], interpolated)
                     diversity_loss = self.compute_diversity_loss(interpolated)
-                    cycle_loss = self.compute_cycle_consistency_loss(z1[b], z2[b])
+                    # cycle_loss = self.compute_cycle_consistency_loss(z1[b], z2[b])
                     loss = (
                         # self.smoothness_lambda * smoothness_loss +
                         self.consistency_lambda * consistency_loss
                         + self.diversity_lambda * diversity_loss
-                        + self.cycle_lambda * cycle_loss
+                        # + self.cycle_lambda * cycle_loss
                     )
                     return interpolated, loss
                 return interpolated, torch.tensor(0.0, device=z1.device)
@@ -328,6 +329,33 @@ class GLOGenerator(nn.Module):
         x = x.view(-1, 256, 14, 14)
         x = self.deconv(x)
         return x
+
+    def save_image(self, z, save_path):
+        """
+        Generate and save an image from a latent vector
+        Args:
+            z (torch.Tensor): Input latent vector
+            save_path (str): Path to save the generated image
+        """
+        # Ensure the model is in eval mode
+        self.eval()
+
+        # Generate image
+        with torch.no_grad():
+            x = self.forward(z)
+
+        # Convert from [-1,1] range to [0,1] range (due to tanh activation)
+        x = (x + 1) / 2.0
+
+        # Convert to numpy array
+        x = x.detach().cpu().numpy()
+
+        # Transpose from (C,H,W) to (H,W,C)
+        x = np.transpose(x, (0,2,3,1))
+
+        # Save first image if batch
+        import matplotlib.pyplot as plt
+        plt.imsave(save_path, x[0].clip(0,1))
 
 
 class GLOModule(nn.Module):
@@ -447,6 +475,7 @@ class GLOModule(nn.Module):
 
             # Generate images
             x_generated = self.generator(z)
+
             x_interpolated = self.generator(z_interpolated)
 
             return (
@@ -459,6 +488,10 @@ class GLOModule(nn.Module):
 
         # Inference mode - generate single domain
         x_generated = self.generator(z)
+        # save image
+        random_name_by_timestemp = str(int(time.time())) # random name. for example test163123123
+        self.generator.save_image(z, "./file/test" + random_name_by_timestemp + ".png")
+
         return x_generated, z, None, None, torch.tensor(0.0, device=x.device)
 
 
