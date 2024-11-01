@@ -315,6 +315,7 @@ if __name__ == "__main__":
             glo_loss = results["glo_loss"]
             cluster_loss = results["cluster_loss"]
             interpolar_loss = results["interpolation_loss"]
+            cyclemix_loss = results["cyclemix_loss"]
             misc.print_row(
                 [
                     "loss",
@@ -327,6 +328,8 @@ if __name__ == "__main__":
                     cluster_loss,
                     "interpolar_loss",
                     interpolar_loss,
+                    "cyclemix_loss",
+                    cyclemix_loss,
                 ],
                 colwidth=12,
             )

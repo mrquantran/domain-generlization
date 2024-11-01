@@ -12,6 +12,7 @@ from transformers import ViTModel
 
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 
 from domainbed.lib import wide_resnet
 import copy
@@ -330,34 +331,6 @@ class GLOGenerator(nn.Module):
         x = self.deconv(x)
         return x
 
-    def save_image(self, z, save_path):
-        """
-        Generate and save an image from a latent vector
-        Args:
-            z (torch.Tensor): Input latent vector
-            save_path (str): Path to save the generated image
-        """
-        # Ensure the model is in eval mode
-        self.eval()
-
-        # Generate image
-        with torch.no_grad():
-            x = self.forward(z)
-
-        # Convert from [-1,1] range to [0,1] range (due to tanh activation)
-        x = (x + 1) / 2.0
-
-        # Convert to numpy array
-        x = x.detach().cpu().numpy()
-
-        # Transpose from (C,H,W) to (H,W,C)
-        x = np.transpose(x, (0,2,3,1))
-
-        # Save first image if batch
-        import matplotlib.pyplot as plt
-        plt.imsave(save_path, x[0].clip(0,1))
-
-
 class GLOModule(nn.Module):
     def __init__(
         self,
@@ -488,10 +461,6 @@ class GLOModule(nn.Module):
 
         # Inference mode - generate single domain
         x_generated = self.generator(z)
-        # save image
-        random_name_by_timestemp = str(int(time.time())) # random name. for example test163123123
-        self.generator.save_image(z, "./file/test" + random_name_by_timestemp + ".png")
-
         return x_generated, z, None, None, torch.tensor(0.0, device=x.device)
 
 

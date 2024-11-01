@@ -8,6 +8,8 @@ import torch.autograd as autograd
 from torchvision import transforms
 from torchvision.transforms import v2
 
+import os
+import time
 import copy
 import numpy as np
 from collections import OrderedDict
@@ -28,6 +30,9 @@ from domainbed.lib.misc import (
     proj,
     Nonparametric,
 )
+
+
+from torchvision.utils import save_image
 
 ALGORITHMS = [
     "ERM",
@@ -289,6 +294,33 @@ class CYCLEMIX(Algorithm):
             + self.latent_reg_lambda * latent_reg
         )
 
+    def save_images(self, x, x_generated, x_interpolated=None):
+        """
+        Save the original, generated, and interpolated images to file path.
+        """
+        if self.current_epoch % 25 == 0:
+            os.makedirs("generated_images", exist_ok=True)
+            print(f'Image shape: {x.shape}')
+            print(f'Generated image shape: {x_generated.shape}')
+            # Save original images
+            original_img_path = f"generated_images/original_{self.current_epoch}.png"
+            save_image(x, original_img_path, nrow=10, normalize=True)
+            print(f"Original images saved to {original_img_path}")
+
+            x_generated = x_generated.cpu().detach()
+            # change to range 0-1
+            x_generated = (x_generated - x_generated.min()) / (x_generated.max() - x_generated.min())
+            # Save generated images
+            generated_img_path = f"generated_images/generated_{self.current_epoch}.png"
+            save_image(x_generated, generated_img_path, nrow=10, normalize=True)
+            print(f"Generated images saved to {generated_img_path}")
+
+            # Save interpolated images if available
+            if x_interpolated is not None:
+                interpolated_img_path = f"generated_images/interpolated_{self.current_epoch}.png"
+                save_image(x_interpolated, interpolated_img_path, nrow=20, normalize=True)
+                print(f"Interpolated images saved to {interpolated_img_path}")
+
     def compute_domain_losses(
         self,
         orig_samples: List[Tuple[torch.Tensor, torch.Tensor]],
@@ -319,6 +351,8 @@ class CYCLEMIX(Algorithm):
 
             # Interpolation between domains
             for j in range(domain_idx + 1, num_domains):
+                if j == domain_idx:
+                    continue
                 x_j, _ = orig_samples[j]
                 x_hat_j, z_j, _, _, _ = self.cyclemixLayer.glo(x_j, j)
 
@@ -328,6 +362,8 @@ class CYCLEMIX(Algorithm):
                 )
                 interpolation_loss += interp_loss
 
+            self.save_images(x_i, x_hat_i)
+
         # Normalize losses
         num_pairs = (num_domains * (num_domains - 1)) // 2
         if num_pairs > 0:
@@ -336,13 +372,14 @@ class CYCLEMIX(Algorithm):
         return glo_loss, cluster_loss, interpolation_loss
 
     def update(self, minibatches, unlabeled=None):
+        self.current_epoch += 1
         # Get augmented minibatches using CycleMix
         minibatches_aug, cyclemix_loss = self.cyclemixLayer(minibatches)
 
         # Separate original and augmented samples
         num_orig = len(minibatches)
         orig_samples = minibatches_aug[:num_orig]
-        aug_samples = minibatches_aug[num_orig : 2 * num_orig]
+        aug_samples = minibatches_aug[num_orig: 2 * num_orig]
 
         # Classification loss
         all_x = torch.cat([x for x, y in orig_samples])
@@ -360,7 +397,6 @@ class CYCLEMIX(Algorithm):
             + glo_loss
             + self.clustering_lambda * cluster_loss
             + self.interpolation_lambda * interpolation_loss
-            + cyclemix_loss
         )
 
         # Zero gradients
