@@ -1,13 +1,18 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+from typing import List, Tuple
 import torch
+import torch.amp
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm as SpectralNorm
 import torchvision.models
 from torchvision import transforms
 from transformers import ViTModel
 
+import time
 import numpy as np
+import matplotlib.pyplot as plt
 
 from domainbed.lib import wide_resnet
 import copy
@@ -15,15 +20,288 @@ import copy
 # CYCLEGAN Experiments
 from domainbed.cyclegan.utils import get_sources
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-import torch
-import torch.nn as nn
-import numpy as np
+class LatentInterpolator(nn.Module):
+    def __init__(
+        self,
+        num_domains,
+        latent_dim,
+        num_interpolation_points=5,
+        consistency_lambda=0.1,
+        diversity_lambda=0.05,
+        cycle_lambda=0.1,
+        momentum_beta=0.9,
+        temperature=0.1,
+    ):
+        super(LatentInterpolator, self).__init__()
+        self.num_domains = num_domains
+        self.latent_dim = latent_dim
+        self.num_points = num_interpolation_points
+        self.consistency_lambda = consistency_lambda
+        self.cycle_lambda = cycle_lambda
+        self.diversity_lambda = diversity_lambda
+        self.momentum_beta = momentum_beta
+        self.temperature = temperature
 
-from sklearn.decomposition import PCA
+        # Cache
+        self.register_buffer(
+            "interpolation_weights", torch.linspace(0, 1, num_interpolation_points)
+        )
+        self.register_buffer("momentum", torch.zeros(1, latent_dim))
+
+    @torch.amp.autocast("cuda")
+    def compute_adaptive_weights(self, z1, z2):
+        # Thêm metric đa dạng hơn
+        l2_dist = torch.norm(z1 - z2, dim=-1)
+        consine_sim_F = nn.CosineSimilarity(dim=-1)
+        cosine_sim = consine_sim_F(z1, z2)
+
+        # Kết hợp nhiều metric
+        similarity = (cosine_sim + 1) / 2 - torch.tanh(l2_dist)
+        return torch.sigmoid(similarity / self.temperature)
+
+    @torch.amp.autocast("cuda")
+    def interpolate(
+        self,
+        z1: torch.Tensor,
+        z2: torch.Tensor,
+        weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Interpolate between two latent vectors using provided weights
+        """
+        weights = weights.to(z1.device)
+
+        # Apply adaptive weighting
+        adaptive_w = self.compute_adaptive_weights(z1, z2).unsqueeze(-1)
+        weights = weights * adaptive_w
+
+        return torch.lerp(z1, z2, weights)
+
+    def linear_interpolate(
+        self, z1: torch.Tensor, z2: torch.Tensor, num_points: int = None
+    ) -> torch.Tensor:
+        """
+        Perform linear interpolation between two latent vectors
+        z = α * z1 + (1-α) * z2
+        """
+        if num_points is None:
+            num_points = self.num_points
+
+        # Generate interpolation weights
+        weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
+
+        # Compute adaptive domain weights
+        domain_weights = self.compute_domain_weights(z1, z2)
+
+        # Reshape inputs for broadcasting
+        z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
+        z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
+
+        # Linear interpolation: z = α * z1 + (1-α) * z2
+        interpolated = self.interpolate(z1=z1, z2=z2, weights=weights)
+
+        """
+        momentum = β * momentum + (1 - β) * (z2 - z1).mean(dim=1)
+        """
+        momentum = self.momentum_beta * self.momentum + (1 - self.momentum_beta) * (
+            z2 - z1
+        ).mean(dim=1)
+        self.momentum = momentum.detach()  # Update momentum cache
+
+        # Apply momentum correction
+        correction = momentum.unsqueeze(0) * weights * (1 - weights)
+        interpolated = interpolated + correction * domain_weights
+
+        return interpolated
+
+    @torch.amp.autocast("cuda")
+    def compute_diversity_loss(self, interpolated_points: torch.Tensor) -> torch.Tensor:
+        """
+        Diversity loss to ensure that the latent space is diverse
+        L_diversity = -Σ Σ ||z_i - z_j||₂²
+        """
+        # Reshape to 2D for efficient computation
+        points_flat = interpolated_points.view(-1, self.latent_dim)
+
+        # Compute pairwise distances efficiently
+        norm = torch.sum(points_flat**2, dim=1, keepdim=True)
+        dist_matrix = norm + norm.t() - 2 * torch.mm(points_flat, points_flat.t())
+
+        # Get upper triangle without diagonal
+        mask = torch.triu(torch.ones_like(dist_matrix), diagonal=1)
+        distances = dist_matrix * mask
+
+        return -torch.mean(distances[distances > 0])
+
+    @torch.amp.autocast("cuda")
+    def compute_adaptive_temperature(self, z1, z2):
+        """Calculate adaptive temperature based on domain similarity"""
+        cosine_sim = nn.CosineSimilarity(dim=-1)
+        similarity = cosine_sim(z1, z2).mean()
+        return self.temperature * torch.sigmoid(similarity)
+
+    @torch.amp.autocast("cuda")
+    def compute_domain_weights(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """
+        Compute domain weights based on multiple similarity metrics.
+        """
+        # Add more metrics for better domain similarity
+        l2_dist = torch.norm(z1 - z2, dim=-1)
+        cosine_sim_f = nn.CosineSimilarity(dim=-1)
+        cosine_sim = cosine_sim_f(z1, z2)
+
+        # Ensure inputs are at least 2D tensors
+        if z1.dim() == 1:
+            z1 = z1.unsqueeze(0)
+        if z2.dim() == 1:
+            z2 = z2.unsqueeze(0)
+
+        feature_dist = torch.cdist(z1, z2, p=2).mean()
+
+        # Combine multiple metrics
+        similarity = (cosine_sim + 1.0) / 2.0 - l2_dist.tanh() - feature_dist.tanh()
+
+        # Adaptive temperature
+        temp = self.compute_adaptive_temperature(z1, z2)
+        weights = torch.sigmoid(similarity / temp)
+
+        return weights.unsqueeze(-1)
+
+    @torch.amp.autocast("cuda")
+    def compute_consistency_loss(
+        self, z1: torch.Tensor, z2: torch.Tensor, interpolated_points: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        L_consist = ||z_interp - z_target||₂²
+        - Consistency loss ensures that the interpolation is consistent with the target points
+        - Target points are generated by linear interpolation between z1 and z2
+        - Target points mean that the interpolation should be consistent with the linear interpolation
+        - Consistent interpolation is important for the generator to generate realistic images, and it helps to prevent mode collapse
+        """
+        # Get the number of interpolation points from interpolated_points
+        num_points = interpolated_points.size(0)
+
+        # Generate target points
+        alphas = torch.linspace(0, 1, num_points, device=z1.device)
+        alphas = alphas.view(-1, 1, 1)  # Shape: [num_points, 1, 1]
+
+        # Compute domain weights
+        domain_weights = self.compute_domain_weights(z1, z2)
+        domain_weights = domain_weights.unsqueeze(0)  # Shape: [1, batch_size, 1]
+
+        # Reshape inputs for broadcasting
+        z1 = z1.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
+        z2 = z2.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
+
+        # Generate target points with broadcasting
+        target_points = alphas * z1 + (1 - alphas) * z2  # Shape: [num_points, batch_size, latent_dim]
+        target_points = target_points * domain_weights  # Apply domain weights
+
+        # Ensure interpolated_points has the same shape as target_points
+        interpolated_points = interpolated_points.view(num_points, -1, self.latent_dim)
+
+        return F.mse_loss(interpolated_points, target_points)
+
+    def interpolate_latents(
+        self, z1: torch.Tensor, z2: torch.Tensor, num_points: int = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Interpolate between two latent vectors with regularization
+        """
+        interpolated = self.linear_interpolate(z1, z2, num_points)
+
+        if self.training:
+            # Calculate losses only during training
+            # smoothness_loss = self.compute_smoothness_loss(interpolated)
+            consistency_loss = self.compute_consistency_loss(z1, z2, interpolated)
+            diversity_loss = self.compute_diversity_loss(interpolated)
+            # cycle_loss = self.compute_cycle_consistency_loss(z1, z2)
+            total_loss = (
+                # self.smoothness_lambda * smoothness_loss
+                self.consistency_lambda * consistency_loss
+                + self.diversity_lambda * diversity_loss
+                # + self.cycle_lambda * cycle_loss
+            )
+            return interpolated, total_loss
+
+        return interpolated, torch.tensor(0.0, device=z1.device)
+
+    # @torch.amp.autocast("cuda")
+    # def compute_cycle_consistency_loss(self, z1, z2):
+    #     """Ensure cycle consistency in interpolation"""
+    #     # Reshape inputs and weights for correct broadcasting
+    #     z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
+    #     z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
+    #     weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
+
+    #     epsilon = 1e-8
+
+    #     # Compute forward and backward interpolations
+    #     forward_interp = self.interpolate(z1, z2, weights)
+    #     backward_interp = self.interpolate(z2, z1, 1 - weights)
+
+    #     cycle_loss = F.l1_loss(forward_interp, backward_interp) + epsilon
+    #     return cycle_loss
+
+    def forward(
+        self, domain_latents: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Optimized forward pass with gradient checkpointing
+        """
+        batch_size = domain_latents.size(1)
+        all_interpolated = []
+        total_loss = torch.tensor(0.0, device=domain_latents.device)
+
+        # Use torch.utils.checkpoint for memory efficiency
+        def create_checkpoint_function(i, j, b):
+            def custom_forward(*inputs):
+                z1, z2 = inputs
+                interpolated = self.linear_interpolate(z1[b], z2[b])
+
+                if self.training:
+                    consistency_loss = self.compute_consistency_loss(z1[b], z2[b], interpolated)
+                    diversity_loss = self.compute_diversity_loss(interpolated)
+                    # cycle_loss = self.compute_cycle_consistency_loss(z1[b], z2[b])
+                    loss = (
+                        # self.smoothness_lambda * smoothness_loss +
+                        self.consistency_lambda * consistency_loss
+                        + self.diversity_lambda * diversity_loss
+                        # + self.cycle_lambda * cycle_loss
+                    )
+                    return interpolated, loss
+                return interpolated, torch.tensor(0.0, device=z1.device)
+            return custom_forward
+
+        for i in range(self.num_domains):
+            for j in range(i + 1, self.num_domains):
+                if i == j:
+                    continue
+
+                z1 = domain_latents[i]
+                z2 = domain_latents[j]
+
+                for b in range(batch_size):
+                    if self.training:
+                        interpolated, loss = torch.utils.checkpoint.checkpoint(
+                            create_checkpoint_function(i, j, b),
+                            z1.detach(),
+                            z2.detach(),
+                            use_reentrant=True,
+                        )
+                    else:
+                        interpolated = self.linear_interpolate(
+                            z1[b : b + 1], z2[b : b + 1]
+                        )
+                        loss = torch.tensor(0.0, device=z1.device)
+
+                    all_interpolated.append(interpolated)
+                    total_loss += loss
+
+        interpolated_result = torch.cat(all_interpolated, dim=0) if all_interpolated else domain_latents
+        return interpolated_result, total_loss
+
 
 class GLOGenerator(nn.Module):
     """Generator network following GLO paper architecture"""
@@ -40,10 +318,10 @@ class GLOGenerator(nn.Module):
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), # size 56x56
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),  # size 56x56
             nn.BatchNorm2d(32),
             nn.ReLU(True),
-            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1), # size 112x112
+            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1),  # size 112x112
             nn.Tanh(),
         )
 
@@ -54,33 +332,47 @@ class GLOGenerator(nn.Module):
         return x
 
 class GLOModule(nn.Module):
-
-    def __init__(self, latent_dim=1024, num_domains=3, batch_size=32, temperature=0.07):
+    def __init__(
+        self,
+        latent_dim=1024,
+        num_domains=3,
+        batch_size=32,
+        temperature=0.07,
+        consistency_lambda=0.1,
+        diversity_lambda=0.05,
+        cycle_lambda=0.1,
+    ):
         super(GLOModule, self).__init__()
-        print('latent_dim:', latent_dim)
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
         self.temperature = temperature
 
-        # Generator following GLO paper
+        # Initialize components
         self.generator = GLOGenerator(latent_dim)
-
-        # Learnable latent codes for each domain - key difference from original GLO
-        # We maintain separate latent codes for each domain
         self.domain_latents = nn.Parameter(
             torch.randn(num_domains, batch_size, latent_dim)
         )
-
-        # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
-        # Projection head for clustering
-        self.projection_head = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim // 2, latent_dim // 4),
+        # Updated interpolator
+        self.interpolator = LatentInterpolator(
+            num_domains,
+            latent_dim,
+            consistency_lambda=consistency_lambda,
+            diversity_lambda=diversity_lambda,
+            cycle_lambda=cycle_lambda,
         )
+
+        # Projection and discrimination
+        self.projection_head = self.build_projection_head()
+
+    def build_projection_head(self):
+        return nn.Sequential(
+            SpectralNorm(nn.Linear(self.latent_dim, self.latent_dim // 2)),
+            nn.ReLU(),
+            SpectralNorm(nn.Linear(self.latent_dim // 2, self.latent_dim // 4)),
+        ).to(next(self.parameters()).device)
 
     def get_projected_latents(self, z):
         """Project latents to lower-dimensional space for clustering"""
@@ -90,7 +382,6 @@ class GLOModule(nn.Module):
         """
         Công thức Contrastive Loss chuẩn theo paper:
         L = -log[ exp(sim(z_i, z_j)/temperature) / Σ_k exp(sim(z_i, z_k)/temperature) ]
-
         Args:
             features: Tensor của projected features [N, D]
             domain_labels: Tensor của domain labels [N]
@@ -141,73 +432,95 @@ class GLOModule(nn.Module):
         # Normalize by number of valid positive samples
         loss = log_ratios.sum() / (valid_pos_mask.sum() + 1e-8)
 
-        return loss # if loss = 0, it means that all the samples are in the same domain
+        # if loss = 0, it means that all the samples are in the same domain
+        return loss
 
-    def forward(self, x, domain_idx):
+    def forward(self, x: torch.Tensor, domain_idx: int) -> Tuple:
+        """
+        Forward pass with consistent outputs for both training and inference
+        """
         batch_size = x.size(0)
-
-        # Get corresponding latent codes for the domain
         z = self.domain_latents[domain_idx, :batch_size]
 
-        # Generate images
-        generated = self.generator(z)
-        return generated, z
+        if self.training:
+            # Get interpolated latents and losses
+            z_interpolated, interp_loss = self.interpolator(self.domain_latents)
+
+            # Generate images
+            x_generated = self.generator(z)
+
+            x_interpolated = self.generator(z_interpolated)
+
+            return (
+                x_generated,
+                z,
+                x_interpolated,
+                z_interpolated,
+                interp_loss
+            )
+
+        # Inference mode - generate single domain
+        x_generated = self.generator(z)
+        return x_generated, z, None, None, torch.tensor(0.0, device=x.device)
+
 
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
         super(CycleMixLayer, self).__init__()
         self.device = device
         self.sources = get_sources(hparams["dataset"], hparams["test_envs"])
-        # Dynamic feature dimension based on backbone
-        self.feature_dim = 512 if hparams.get("resnet18", True) else 2048
-
-        # GLO components
         self.glo = GLOModule(
-            latent_dim=hparams.get("latent_dim", 96),
+            latent_dim=hparams.get("latent_dim", 512),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
         ).to(device)
 
-        # Image normalization
-        self.norm = transforms.Compose(
-            [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-        )
+        self.norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-    def process_domain(self, batch, domain_idx):
-        """Process single domain data"""
+    def process_domain(
+        self, batch: Tuple[torch.Tensor, torch.Tensor], domain_idx: int
+    ) -> Tuple:
+        """
+        Process a single domain batch with consistent outputs
+        """
         x, y = batch
 
-        # Generate domain-mixed samples
-        x_hat, z = self.glo(x, domain_idx)
+        if self.training:
+            # Get all outputs during training
+            x_hat, z, x_hat_interp, z_interp, interp_loss = self.glo(x, domain_idx)
+            x_hat = self.norm(x_hat)
+            x_hat_interp = self.norm(x_hat_interp) if x_hat_interp is not None else None
 
-        # Normalize generated samples
+            return (x, y), (x_hat, y), (x_hat_interp, y), interp_loss
+
+        # Simplified output for inference
+        x_hat, z = self.glo(x, domain_idx)[:2]  # Only take first two outputs
         x_hat = self.norm(x_hat)
+        return (x, y), (x_hat, y), (x_hat, y), torch.tensor(0.0, device=x.device)
 
-        return (x, y), (x_hat, y)
-
-    def forward(self, x: list):
+    def forward(
+        self, x: List[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Args:
-            x: list of domain batches [(x_1, y_1), ..., (x_n, y_n)]
-            featurizer: Feature extractor from DomainBed
-        Returns:
-            original_and_generated: list of tuples [(x_i, y_i), (x_i_hat, y_i)]
+        Process all domains and maintain consistent output structure
         """
-        num_domains = len(x)
-
-        # Process each domain
         processed_domains = [
             self.process_domain(batch, idx) for idx, batch in enumerate(x)
         ]
 
-        # Unzip results
-        original_samples, generated_samples = zip(*processed_domains)
+        # Separate components
+        original, generated, interpolated, losses = zip(*processed_domains)
 
-        # Combine original and generated samples
-        all_samples = list(original_samples) + list(generated_samples)
+        # Combine outputs based on training mode
+        if self.training:
+            all_samples = list(original) + list(generated) + list(interpolated)
+        else:
+            all_samples = list(original) + list(generated)
 
-        # Return in required format
-        return all_samples
+        return all_samples, (
+            sum(losses) if self.training else torch.tensor(0.0, device=self.device)
+        )
+
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
@@ -281,11 +594,11 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams["resnet18"]:
-            print('Using ResNet18')
+            print("Using ResNet18")
             self.network = torchvision.models.resnet18(pretrained=False)
             self.n_outputs = 512
         else:
-            print('Using ResNet50')
+            print("Using ResNet50")
             self.network = torchvision.models.resnet50(pretrained=False)
             self.n_outputs = 2048
 

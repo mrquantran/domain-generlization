@@ -218,7 +218,7 @@ if __name__ == "__main__":
     hparams["n_steps"] = n_steps
     hparams["steps_per_epoch"] = steps_per_epoch
     hparams["num_epochs"] = n_steps / steps_per_epoch
-    
+
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
     algorithm = algorithm_class(
         dataset.input_shape,
@@ -314,6 +314,8 @@ if __name__ == "__main__":
             class_loss = results["class_loss"]
             glo_loss = results["glo_loss"]
             cluster_loss = results["cluster_loss"]
+            interpolar_loss = results["interpolation_loss"]
+            cyclemix_loss = results["cyclemix_loss"]
             misc.print_row(
                 [
                     "loss",
@@ -324,6 +326,10 @@ if __name__ == "__main__":
                     glo_loss,
                     "cluster_loss",
                     cluster_loss,
+                    "interpolar_loss",
+                    interpolar_loss,
+                    "cyclemix_loss",
+                    cyclemix_loss,
                 ],
                 colwidth=12,
             )
