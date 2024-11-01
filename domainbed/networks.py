@@ -70,6 +70,9 @@ class GLOModule(nn.Module):
         # Learnable latent codes for each domain - key difference from original GLO
         # We maintain separate latent codes for each domain
         self.encoder = Encoder(latent_dim)
+        self.domain_mu = nn.Parameter(torch.randn(num_domains, latent_dim))
+        self.domain_logvar = nn.Parameter(torch.randn(num_domains, latent_dim))
+        self.domain_latents = nn.Parameter(torch.randn(num_domains, batch_size, latent_dim))
 
         # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
@@ -84,6 +87,31 @@ class GLOModule(nn.Module):
     def get_projected_latents(self, z):
         """Project latents to lower-dimensional space for clustering"""
         return self.projection_head(z)
+
+    def forward(self, x, domain_idx):
+        """Forward pass of the GLO module.
+
+        Args:
+            x: Input tensor of shape [batch_size, channels, height, width]
+            domain_idx: Index of the current domain
+
+        Returns:
+            tuple: (generated images, latent vectors)
+        """
+        batch_size = x.size(0)
+
+        # Encode input images
+        mu, logvar = self.encoder(x)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+
+        # Create new domain latents tensor
+        new_domain_latents = self.domain_latents.clone()
+        new_domain_latents.data[domain_idx, :batch_size] = z.data
+        self.domain_latents = nn.Parameter(new_domain_latents)
+
+        # Generate images
+        generated = self.generator(z)
+        return generated, z
 
     def compute_clustering_loss(self, z, domain_labels, temperature=None):
         """
@@ -142,27 +170,6 @@ class GLOModule(nn.Module):
 
         return loss # if loss = 0, it means that all the samples are in the same domain
 
-    def sample_latents(self, domain_idx, batch_size):
-        if self.training:
-            mean = self.domain_latents.mean[domain_idx]
-            std = self.domain_latents.std[domain_idx]
-            z = torch.normal(mean, std, size=(batch_size, self.latent_dim))
-        else:
-            z = self.domain_latents[domain_idx, :batch_size]
-        return z
-
-    def forward(self, x, domain_idx):
-        batch_size = x.size(0)
-
-        # Encode input images
-        mu, logvar = self.encoder(x)
-
-        # Get corresponding latent codes for the domain
-        z = self.sample_latents(domain_idx, batch_size)
-
-        # Generate images
-        generated = self.generator(z)
-        return generated, z
 
 class Encoder(nn.Module):
     def __init__(self, latent_dim):
