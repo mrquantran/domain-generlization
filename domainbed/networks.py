@@ -135,21 +135,6 @@ class LatentInterpolator(nn.Module):
         return self.temperature * torch.sigmoid(similarity)
 
     @torch.amp.autocast("cuda")
-    def compute_cycle_consistency_loss(self, z1, z2):
-        """Ensure cycle consistency in interpolation"""
-        # Reshape inputs and weights for correct broadcasting
-        z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
-        z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
-        weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
-
-        # Compute forward and backward interpolations
-        forward_interp = self.interpolate(z1, z2, weights)
-        backward_interp = self.interpolate(z2, z1, 1 - weights)
-
-        cycle_loss = F.mse_loss(forward_interp, backward_interp)
-        return cycle_loss
-
-    @torch.amp.autocast("cuda")
     def compute_domain_weights(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         """
         Compute domain weights based on multiple similarity metrics.
@@ -269,14 +254,11 @@ class LatentInterpolator(nn.Module):
 
                 for b in range(batch_size):
                     if self.training:
-                        # Enable gradients for checkpoint inputs
-                        z1_grad = z1.detach().requires_grad_(True)
-                        z2_grad = z2.detach().requires_grad_(True)
                         interpolated, loss = torch.utils.checkpoint.checkpoint(
                             create_checkpoint_function(i, j, b),
-                            z1_grad,
-                            z2_grad,
-                            use_reentrant=True
+                            z1.detach(),
+                            z2.detach(),
+                            use_reentrant=True,
                         )
                     else:
                         interpolated = self.linear_interpolate(
