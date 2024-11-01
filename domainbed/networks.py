@@ -25,9 +25,9 @@ class LatentInterpolator(nn.Module):
         num_domains,
         latent_dim,
         num_interpolation_points=5,
-        smoothness_lambda=0.1,
         consistency_lambda=0.1,
         diversity_lambda=0.05,
+        cycle_lambda=0.1,
         momentum_beta=0.9,
         temperature=0.1,
     ):
@@ -35,8 +35,8 @@ class LatentInterpolator(nn.Module):
         self.num_domains = num_domains
         self.latent_dim = latent_dim
         self.num_points = num_interpolation_points
-        self.smoothness_lambda = smoothness_lambda
         self.consistency_lambda = consistency_lambda
+        self.cycle_labmda = cycle_lambda
         self.diversity_lambda = diversity_lambda
         self.momentum_beta = momentum_beta
         self.temperature = temperature
@@ -128,15 +128,43 @@ class LatentInterpolator(nn.Module):
         return -torch.mean(distances[distances > 0])
 
     @torch.amp.autocast("cuda")
-    def compute_domain_weights(
-        self, z1: torch.Tensor, z2: torch.Tensor
-    ) -> torch.Tensor:
+    def compute_adaptive_temperature(self, z1, z2):
+        """Calculate adaptive temperature based on domain similarity"""
+        cosine_sim = nn.CosineSimilarity(dim=-1)
+        similarity = cosine_sim(z1, z2).mean()
+        return self.temperature * torch.sigmoid(similarity)
+
+    @torch.amp.autocast("cuda")
+    def compute_cycle_consistency_loss(self, z1, z2):
+        """Ensure cycle consistency in interpolation"""
+        # Reshape inputs and weights for correct broadcasting
+        z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
+        z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
+        weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
+
+        # Compute forward and backward interpolations
+        forward_interp = self.interpolate(z1, z2, weights)
+        backward_interp = self.interpolate(z2, z1, 1 - weights)
+
+        cycle_loss = F.mse_loss(forward_interp, backward_interp)
+        return cycle_loss
+
+    @torch.amp.autocast("cuda")
+    def compute_domain_weights(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         """
-        Compute adaptive weights based on domain similarity
+        Compute domain weights based on multiple similarity metrics.
         """
-        # Add L2 distance
+        # Add more metrics for better domain similarity
         l2_dist = torch.norm(z1 - z2, dim=-1)
-        cosine_sim = F.cosine_similarity(z1, z2, dim=-1)
+        cosine_sim_f = nn.CosineSimilarity(dim=-1)
+        cosine_sim = cosine_sim_f(z1, z2)
+
+        # Ensure inputs are at least 2D tensors
+        if z1.dim() == 1:
+            z1 = z1.unsqueeze(0)
+        if z2.dim() == 1:
+            z2 = z2.unsqueeze(0)
+
         feature_dist = torch.cdist(z1, z2, p=2).mean()
 
         # Combine multiple metrics
@@ -147,33 +175,6 @@ class LatentInterpolator(nn.Module):
         weights = torch.sigmoid(similarity / temp)
 
         return weights.unsqueeze(-1)
-
-    # @torch.amp.autocast("cuda")
-    # def compute_smoothness_loss(self, interpolated_points) -> torch.Tensor:
-    #     """
-    #     Calculate smoothness loss between consecutive interpolation points
-    #     It means that the latent space should be smooth
-    #     Smooth latent space is important for the generator to generate realistic images
-    #     L_smooth = Σ ||z_{i+1} - z_i||₂²
-    #     """
-    #     # Check for invalid values
-    #     if torch.isnan(interpolated_points).any() or torch.isinf(interpolated_points).any():
-    #         return torch.tensor(0.0, device=interpolated_points.device)
-
-    #     # Compute differences between consecutive points
-    #     diffs = interpolated_points[1:] - interpolated_points[:-1]
-
-    #     # Clip gradients to prevent explosion
-    #     diffs = torch.clamp(diffs, min=-100.0, max=100.0)
-
-    #     # Compute L2 norm with epsilon for numerical stability
-    #     norms = torch.norm(diffs, dim=-1, keepdim=True) + 1e-8
-
-    #     # Square and mean
-    #     loss = torch.mean(norms ** 2)
-
-    #     # Return 0 if loss is invalid
-    #     return loss if torch.isfinite(loss) else torch.tensor(0.0, device=interpolated_points.device)
 
     @torch.amp.autocast("cuda")
     def compute_consistency_loss(
@@ -225,7 +226,7 @@ class LatentInterpolator(nn.Module):
             diversity_loss = self.compute_diversity_loss(interpolated)
             total_loss = (
                 # self.smoothness_lambda * smoothness_loss
-                + self.consistency_lambda * consistency_loss
+                self.consistency_lambda * consistency_loss
                 + self.diversity_lambda * diversity_loss
             )
             return interpolated, total_loss
@@ -268,9 +269,14 @@ class LatentInterpolator(nn.Module):
 
                 for b in range(batch_size):
                     if self.training:
+                        # Enable gradients for checkpoint inputs
+                        z1_grad = z1.detach().requires_grad_(True)
+                        z2_grad = z2.detach().requires_grad_(True)
                         interpolated, loss = torch.utils.checkpoint.checkpoint(
                             create_checkpoint_function(i, j, b),
-                            z1.detach(), z2.detach()
+                            z1_grad,
+                            z2_grad,
+                            use_reentrant=True
                         )
                     else:
                         interpolated = self.linear_interpolate(
@@ -321,9 +327,9 @@ class GLOModule(nn.Module):
         num_domains=3,
         batch_size=32,
         temperature=0.07,
-        smoothness_lambda=0.1,
         consistency_lambda=0.1,
         diversity_lambda=0.05,
+        cycle_lambda=0.1,
     ):
         super(GLOModule, self).__init__()
         self.latent_dim = latent_dim
@@ -342,9 +348,9 @@ class GLOModule(nn.Module):
         self.interpolator = LatentInterpolator(
             num_domains,
             latent_dim,
-            smoothness_lambda=smoothness_lambda,
             consistency_lambda=consistency_lambda,
             diversity_lambda=diversity_lambda,
+            cycle_lambda=cycle_lambda,
         )
 
         # Projection and discrimination
@@ -353,9 +359,9 @@ class GLOModule(nn.Module):
 
     def build_projection_head(self):
         return nn.Sequential(
-            nn.Linear(self.latent_dim, self.latent_dim // 2),
+            SpectralNorm(nn.Linear(self.latent_dim, self.latent_dim // 2)),
             nn.ReLU(),
-            nn.Linear(self.latent_dim // 2, self.latent_dim // 4),
+            SpectralNorm(nn.Linear(self.latent_dim // 2, self.latent_dim // 4)),
         )
 
     def build_discriminator(self):

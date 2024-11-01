@@ -215,9 +215,7 @@ class CYCLEMIX(Algorithm):
         # Network components
         self.featurizer = networks.Featurizer(input_shape, self.hparams)
         self.classifier = networks.Classifier(
-            self.featurizer.n_outputs,
-            num_classes,
-            self.hparams["nonlinear_classifier"]
+            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
         )
 
         # Move to device
@@ -259,25 +257,41 @@ class CYCLEMIX(Algorithm):
             self.optimizer,
             max_lr=self.max_lr,
             total_steps=self.total_steps,
+            pct_start=0.15,
+            div_factor=25,
+            final_div_factor=1e4,
+            three_phase=False,
+        )
+
+        self.glo_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.glo_optimizer,
+            max_lr=self.max_lr,
+            total_steps=self.total_steps,
             pct_start=0.2,
             div_factor=25,
             final_div_factor=1e4,
             three_phase=False,
         )
 
-    def compute_glo_loss(self, original: torch.Tensor, generated: torch.Tensor,
-                        latent: torch.Tensor) -> torch.Tensor:
+    def compute_glo_loss(
+        self, original: torch.Tensor, generated: torch.Tensor, latent: torch.Tensor
+    ) -> torch.Tensor:
         """
         Compute GLO reconstruction and regularization loss
         """
         reconstruction_loss = F.mse_loss(generated, original)
         latent_reg = torch.mean(torch.norm(latent, dim=1))
 
-        return (self.reconstruction_lambda * reconstruction_loss +
-                self.latent_reg_lambda * latent_reg)
+        return (
+            self.reconstruction_lambda * reconstruction_loss
+            + self.latent_reg_lambda * latent_reg
+        )
 
-    def compute_domain_losses(self, orig_samples: List[Tuple[torch.Tensor, torch.Tensor]],
-                            aug_samples: List[Tuple[torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def compute_domain_losses(
+        self,
+        orig_samples: List[Tuple[torch.Tensor, torch.Tensor]],
+        aug_samples: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute domain-specific losses including GLO, clustering, and interpolation
         """
@@ -287,7 +301,9 @@ class CYCLEMIX(Algorithm):
         interpolation_loss = torch.tensor(0.0, device=self.device)
 
         # Process each domain
-        for domain_idx, ((x_orig, _), (x_aug, _)) in enumerate(zip(orig_samples, aug_samples)):
+        for domain_idx, ((x_orig, _), (x_aug, _)) in enumerate(
+            zip(orig_samples, aug_samples)
+        ):
             # Current domain
             x_i, _ = orig_samples[domain_idx]
             x_hat_i, z_i, _, _, _ = self.cyclemixLayer.glo(x_i, domain_idx)
@@ -295,7 +311,9 @@ class CYCLEMIX(Algorithm):
             # GLO and clustering losses
             x_hat, z, _, _, _ = self.cyclemixLayer.glo(x_orig, domain_idx)
             glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
-            cluster_loss += self.cyclemixLayer.glo.compute_clustering_loss(z, domain_idx)
+            cluster_loss += self.cyclemixLayer.glo.compute_clustering_loss(
+                z, domain_idx
+            )
 
             # Interpolation between domains
             for j in range(domain_idx + 1, num_domains):
@@ -303,7 +321,9 @@ class CYCLEMIX(Algorithm):
                 x_hat_j, z_j, _, _, _ = self.cyclemixLayer.glo(x_j, j)
 
                 # Interpolate between domains
-                z_interp, interp_loss = self.cyclemixLayer.glo.interpolator.interpolate_latents(z_i, z_j)
+                z_interp, interp_loss = (
+                    self.cyclemixLayer.glo.interpolator.interpolate_latents(z_i, z_j)
+                )
                 interpolation_loss += interp_loss
 
         # Normalize losses
@@ -314,16 +334,13 @@ class CYCLEMIX(Algorithm):
         return glo_loss, cluster_loss, interpolation_loss
 
     def update(self, minibatches, unlabeled=None):
-        """
-        Update the model using minibatches of data
-        """
         # Get augmented minibatches using CycleMix
         minibatches_aug, cyclemix_loss = self.cyclemixLayer(minibatches)
 
         # Separate original and augmented samples
         num_orig = len(minibatches)
         orig_samples = minibatches_aug[:num_orig]
-        aug_samples = minibatches_aug[num_orig:2*num_orig]
+        aug_samples = minibatches_aug[num_orig : 2 * num_orig]
 
         # Classification loss
         all_x = torch.cat([x for x, y in orig_samples])
@@ -337,22 +354,34 @@ class CYCLEMIX(Algorithm):
 
         # Total loss
         total_loss = (
-            class_loss +
-            glo_loss +
-            self.clustering_lambda * cluster_loss +
-            self.interpolation_lambda * interpolation_loss +
-            cyclemix_loss
+            class_loss
+            + glo_loss
+            + self.clustering_lambda * cluster_loss
+            + self.interpolation_lambda * interpolation_loss
+            + cyclemix_loss
+        )
+
+        # Zero gradients
+        self.optimizer.zero_grad()
+        self.glo_optimizer.zero_grad()
+
+        # Backward pass
+        total_loss.backward()
+
+        # Clip gradients to prevent explosion
+        torch.nn.utils.clip_grad_norm_(self.network.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(
+            self.cyclemixLayer.glo.parameters(), max_norm=1.0
         )
 
         # Optimization step
-        self.optimizer.zero_grad()
-        self.glo_optimizer.zero_grad()
-        total_loss.backward()
         self.optimizer.step()
         self.glo_optimizer.step()
-        self.scheduler.step()
 
-        # Return metrics
+        # Learning rate step
+        self.scheduler.step()
+        self.glo_scheduler.step()
+
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
@@ -364,9 +393,6 @@ class CYCLEMIX(Algorithm):
         }
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Make predictions for input x
-        """
         return self.network(x)
 
 
