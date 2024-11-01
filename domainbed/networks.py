@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,9 +69,7 @@ class GLOModule(nn.Module):
 
         # Learnable latent codes for each domain - key difference from original GLO
         # We maintain separate latent codes for each domain
-        self.domain_latents = nn.Parameter(
-            torch.randn(num_domains, batch_size, latent_dim)
-        )
+        self.encoder = Encoder(latent_dim)
 
         # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
@@ -143,15 +142,51 @@ class GLOModule(nn.Module):
 
         return loss # if loss = 0, it means that all the samples are in the same domain
 
+    def sample_latents(self, domain_idx, batch_size):
+        if self.training:
+            mean = self.domain_latents.mean[domain_idx]
+            std = self.domain_latents.std[domain_idx]
+            z = torch.normal(mean, std, size=(batch_size, self.latent_dim))
+        else:
+            z = self.domain_latents[domain_idx, :batch_size]
+        return z
+
     def forward(self, x, domain_idx):
         batch_size = x.size(0)
 
+        # Encode input images
+        mu, logvar = self.encoder(x)
+
         # Get corresponding latent codes for the domain
-        z = self.domain_latents[domain_idx, :batch_size]
+        z = self.sample_latents(domain_idx, batch_size)
 
         # Generate images
         generated = self.generator(z)
         return generated, z
+
+class Encoder(nn.Module):
+    def __init__(self, latent_dim):
+        super(Encoder, self).__init__()
+
+        # Khởi tạo mô hình EfficientNet-B1 mà không sử dụng pretrained weights
+        self.efficientnet = torchvision.models.efficientnet_b1(pretrained=torchvision.models.EfficientNet_B1_Weights.DEFAULT)
+
+        # Lấy số features từ lớp cuối cùng của EfficientNet-B1
+        in_features = self.efficientnet.classifier[1].in_features
+
+        # Mean (mu) and log-variance (logvar) layers
+        self.fc_mu = nn.Linear(in_features, latent_dim)
+        self.fc_logvar = nn.Linear(in_features, latent_dim)
+
+    def forward(self, x):
+        features = self.efficientnet.features(x)
+        x = self.efficientnet.avgpool(features)
+        x = torch.flatten(x, 1)
+
+        # Compute mu and logvar
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        return mu, logvar
 
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
@@ -163,7 +198,7 @@ class CycleMixLayer(nn.Module):
 
         # GLO components
         self.glo = GLOModule(
-            latent_dim=hparams.get("latent_dim", 96),
+            latent_dim=hparams.get("latent_dim", 512),
             num_domains=len(self.sources),
             batch_size=hparams["batch_size"],
         ).to(device)
@@ -173,7 +208,13 @@ class CycleMixLayer(nn.Module):
             [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
         )
 
-    def process_domain(self, batch, domain_idx):
+        num_interpolation_points = 5
+        self.num_points = num_interpolation_points
+        self.register_buffer(
+            "interpolation_weights", torch.linspace(0, 1, num_interpolation_points)
+        )
+
+    def process_domain(self, batch, domain_idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process single domain data"""
         x, y = batch
 
@@ -183,7 +224,38 @@ class CycleMixLayer(nn.Module):
         # Normalize generated samples
         x_hat = self.norm(x_hat)
 
-        return (x, y), (x_hat, y)
+        return (x, y), (x_hat, y), z
+
+    @torch.amp.autocast("cuda")
+    def interpolate(
+        self, z1: torch.Tensor, z2: torch.Tensor, weights: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Interpolate between two latent vectors using provided weights
+        """
+        weights = weights.to(z1.device)
+
+        return torch.lerp(z1, z2, weights)
+
+    def linear_interpolate(self, z1: torch.Tensor, z2: torch.Tensor, num_points: int):
+        """
+        Perform linear interpolation between two latent vectors
+        z = α * z1 + (1-α) * z2
+        """
+        if num_points is None:
+            num_points = self.num_points
+
+        # Generate interpolation weights
+        weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
+
+        # Reshape inputs for broadcasting
+        z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
+        z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
+
+        # Linear interpolation: z = α * z1 + (1-α) * z2
+        interpolated = self.interpolate(z1=z1, z2=z2, weights=weights)
+
+        return interpolated
 
     def forward(self, x: list):
         """
@@ -200,8 +272,26 @@ class CycleMixLayer(nn.Module):
             self.process_domain(batch, idx) for idx, batch in enumerate(x)
         ]
 
+        generated_interpolated_samples = []
+        for i in range(num_domains):
+            for j in range(i+1, num_domains):
+                if i == j:
+                    continue
+
+                # Get latent codes for each domain
+                _, _, z1 = processed_domains[i]
+                _, _, z2 = processed_domains[j]
+
+                # Linear interpolation
+                interpolated = self.linear_interpolate(z1, z2, num_points=5)
+
+                # Generate samples
+                generated_interpolated = self.glo.generator(interpolated)
+
+                generated_interpolated_samples.append(generated_interpolated)
+
         # Unzip results
-        original_samples, generated_samples = zip(*processed_domains)
+        original_samples, generated_samples, z_samples = zip(*processed_domains)
 
         # Combine original and generated samples
         all_samples = list(original_samples) + list(generated_samples)

@@ -240,32 +240,33 @@ class CYCLEMIX(Algorithm):
 
         self.glo_optimizer = torch.optim.Adam(
             self.cyclemixLayer.glo.parameters(),
-            lr=hparams.get("glo_lr", 1e-4),
-            betas=(0.5, 0.999),
+            lr=self.hparams["lr"],
+            weight_decay=self.hparams["weight_decay"]
         )
 
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=self.max_lr,
             total_steps=total_steps,
-            pct_start=0.2,  # Warm-up phase is 30% of training
+            pct_start=0.3,  # Warm-up phase is 30% of training
             div_factor=25,  # Initial lr = max_lr/25
             final_div_factor=1e4,  # Min lr = initial_lr/10000
             three_phase=False,  # Use two-phase policy
             verbose=False,
         )
-        self.clustering_lambda = hparams.get("clustering_lambda", 0.1)
 
-        self.glo_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        self.scheduler_glo = torch.optim.lr_scheduler.OneCycleLR(
             self.glo_optimizer,
             max_lr=self.max_lr,
             total_steps=total_steps,
-            pct_start=0.2,  # Warm-up phase is 30% of training
+            pct_start=0.3,  # Warm-up phase is 30% of training
             div_factor=25,  # Initial lr = max_lr/25
             final_div_factor=1e4,  # Min lr = initial_lr/10000
             three_phase=False,  # Use two-phase policy
             verbose=False,
         )
+
+        self.clustering_lambda = hparams.get("clustering_lambda", 0.1)
 
     def save_images(self, x, x_generated):
         """
@@ -309,12 +310,14 @@ class CYCLEMIX(Algorithm):
         minibatches_aug = self.cyclemixLayer(minibatches)
 
         # Separate original and augmented samples
-        orig_samples = minibatches_aug[: len(minibatches)]
-        aug_samples = minibatches_aug[len(minibatches) :]
+        orig_samples = minibatches_aug[:len(minibatches)]
+        aug_samples = minibatches_aug[len(minibatches):]
 
         # Concatenate all samples for classification
-        all_x = torch.cat([x for x, y in orig_samples])
-        all_y = torch.cat([y for x, y in orig_samples])
+        all_x = torch.cat([x for x, y in aug_samples])
+        all_y = torch.cat([y for x, y in aug_samples])
+
+        save_image(all_x, 'all_x.png', nrow=8, normalize=True)
 
         # Classification loss
         class_loss = F.cross_entropy(self.predict(all_x), all_y)
@@ -334,22 +337,22 @@ class CYCLEMIX(Algorithm):
                 z, domain_idx
             )
 
-        # Total loss
-        total_loss = class_loss + glo_loss + cluster_loss * self.clustering_lambda
-
         # Optimization steps
         self.optimizer.zero_grad()
         self.glo_optimizer.zero_grad()
-        total_loss.backward()
+
+        class_loss.backward(retain_graph=True)
+        (glo_loss + self.clustering_lambda * cluster_loss).backward()
+
         self.optimizer.step()
         self.glo_optimizer.step()
 
         # Learning rate scheduling
         self.scheduler.step()
-        self.glo_scheduler.step()
+        self.scheduler_glo.step()
 
         return {
-            "loss": total_loss.item(),
+            "loss": (class_loss + glo_loss + self.clustering_lambda * cluster_loss).item(),
             "class_loss": class_loss.item(),
             "glo_loss": glo_loss.item(),
             "cluster_loss": cluster_loss.item(),
