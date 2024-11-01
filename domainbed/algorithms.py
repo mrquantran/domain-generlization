@@ -5,12 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
 from torchvision import transforms
+import torchvision
 from torchvision.transforms import v2
 from torchvision.utils import save_image
 import copy
 import numpy as np
 from collections import OrderedDict
 import os
+from torch.utils.model_zoo import load_url
 
 try:
     from backpack import backpack, extend  # type: ignore
@@ -205,68 +207,180 @@ class CUTMIX(Algorithm):
     def predict(self, x):
         return self.network(x)
 
+class Identity(nn.Module):
+    """Identity layer"""
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, x):
+        return x
+
+class VAEEncoder(nn.Module):
+    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+    def __init__(self, input_shape, latent_dim):
+        super(VAEEncoder, self).__init__()
+
+        # MoCo v2 checkpoint URL
+        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+
+        self.backbone = torchvision.models.resnet50(pretrained=False)
+        backbone_dim = 2048
+        self._load_moco_weights()
+
+        # Handle input channels
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.backbone.conv1.weight.data.clone()
+            self.backbone.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+            )
+            for i in range(nc):
+                self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # Remove FC layer
+        self.backbone.fc = Identity()
+
+        # VAE heads
+        self.fc_mu = nn.Linear(backbone_dim, latent_dim)
+        self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
+
+        self._freeze_bn()
+
+    def _load_moco_weights(self):
+        """Load MoCo v2 pretrained weights"""
+        try:
+            checkpoint = load_url(self.moco_v2_path, progress=True)
+            state_dict = checkpoint["state_dict"]
+            new_state_dict = {}
+
+            for k in list(state_dict.keys()):
+                if k.startswith("module.encoder_q."):
+                    new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+
+            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
+
+        except Exception as e:
+            print(f"Error loading MoCo v2 weights: {str(e)}")
+            print("Falling back to random initialization")
+
+    def _freeze_bn(self):
+        """Freeze BatchNorm layers"""
+        for m in self.backbone.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.fc_mu(features), self.fc_logvar(features)
+
+    def train(self, mode=True):
+        """Override train mode to keep BN frozen"""
+        super().train(mode)
+        self._freeze_bn()
+
+
+class VAEDecoder(nn.Module):
+    def __init__(self, latent_dim, output_shape, h_dim, w_dim):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.output_shape = output_shape
+
+        # Calculate starting dimensions
+        self.h_dim = h_dim
+        self.w_dim = w_dim
+        self.start_channels = 512
+
+        # Project and reshape
+        self.fc = nn.Linear(latent_dim, self.start_channels * self.h_dim * self.w_dim)
+
+        # Decoder layers - careful to match input dimensions
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(
+                self.start_channels, 256,
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(
+                256, 128,
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(
+                128, 64,
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(
+                64, output_shape[0],
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        # Project and reshape
+        x = self.fc(z)
+        x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
+        # Decode
+        x = self.decoder(x)
+        return x
 
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
-        self.num_classes = num_classes
-        self.current_epoch = 0
-        self.featurizer = networks.Featurizer(input_shape, self.hparams)
-        self.classifier = networks.Classifier(
-            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
+
+        self.input_shape = input_shape
+        self.latent_dim = hparams.get("latent_dim", 512)
+        self.beta = hparams.get("beta", 4.0)
+        self.mix_ratio = hparams.get("mix_ratio", 0.5)
+
+        # Calculate required spatial dimensions
+        self.h_dim = input_shape[1] // 16  # Spatial dimension after encoder
+        self.w_dim = input_shape[2] // 16
+
+        # VAE Components
+        self.encoder = VAEEncoder(
+            input_shape=input_shape,
+            latent_dim=self.latent_dim
         )
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.network = nn.Sequential(self.featurizer, self.classifier).to(device)
-        self.cyclemixLayer = networks.CycleMixLayer(hparams, device)
 
-        # Parameters
-        self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
-        self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
-        self.base_lr = hparams.get("lr", 1e-4)  # Base learning rate
-        self.max_lr = self.base_lr * 10  # Peak learning rate typically 10x base_lr
+        self.decoder = VAEDecoder(
+            latent_dim=self.latent_dim,
+            output_shape=input_shape,
+            h_dim=self.h_dim,
+            w_dim=self.w_dim
+        )
 
-        steps_per_epoch = hparams["steps_per_epoch"]
-        num_epochs = hparams["num_epochs"]
-        total_steps = int(steps_per_epoch * num_epochs)
-        print(f"Total steps: {total_steps}")
-        print(f"steps_per_epoch: {steps_per_epoch}")
-        print(f"num_epochs: {num_epochs}")
+        # Domain-specific components
+        self.domain_embeddings = nn.Parameter(
+            torch.randn(num_domains, self.latent_dim)
+        )
+
+        # Classifier on latent space
+        self.classifier = nn.Sequential(
+            nn.Linear(self.latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
 
         self.optimizer = torch.optim.Adam(
-            list(self.network.parameters()),
-            lr=self.hparams["lr"],
-            weight_decay=self.hparams["weight_decay"],
+            list(self.encoder.parameters()) +
+            list(self.decoder.parameters()) +
+            list(self.classifier.parameters()) +
+            [self.domain_embeddings],
+            lr=hparams["lr"],
+            weight_decay=hparams["weight_decay"]
         )
 
-        self.glo_optimizer = torch.optim.Adam(
-            self.cyclemixLayer.glo.parameters(),
-            lr=self.hparams["lr"],
-            weight_decay=self.hparams["weight_decay"]
-        )
-
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=self.max_lr,
-            total_steps=total_steps,
-            pct_start=0.3,  # Warm-up phase is 30% of training
-            div_factor=25,  # Initial lr = max_lr/25
-            final_div_factor=1e4,  # Min lr = initial_lr/10000
-            three_phase=False,  # Use two-phase policy
-            verbose=False,
-        )
-
-        self.scheduler_glo = torch.optim.lr_scheduler.OneCycleLR(
-            self.glo_optimizer,
-            max_lr=self.max_lr,
-            total_steps=total_steps,
-            pct_start=0.3,  # Warm-up phase is 30% of training
-            div_factor=25,  # Initial lr = max_lr/25
-            final_div_factor=1e4,  # Min lr = initial_lr/10000
-            three_phase=False,  # Use two-phase policy
-            verbose=False,
-        )
-
-        self.clustering_lambda = hparams.get("clustering_lambda", 0.1)
+        self.current_epoch = 0
 
     def save_images(self, x, x_generated):
         """
@@ -274,8 +388,8 @@ class CYCLEMIX(Algorithm):
         """
         if self.current_epoch % 100 == 0:
             os.makedirs("generated_images", exist_ok=True)
-            print(f'Image shape: {x.shape}')
-            print(f'Generated image shape: {x_generated.shape}')
+            print(f"Image shape: {x.shape}")
+            print(f"Generated image shape: {x_generated.shape}")
 
             # Ensure images are in RGB format
             if x.shape[1] == 1:  # If grayscale, convert to RGB
@@ -297,70 +411,80 @@ class CYCLEMIX(Algorithm):
             save_image(images, generated_img_path, nrow=8, normalize=True)
             print(f"Generated images saved to {generated_img_path}")
 
-    def compute_glo_loss(self, original, generated, latent):
-        reconstruction_loss = F.mse_loss(generated, original)
-        latent_reg = torch.mean(torch.norm(latent, dim=-1))
-        return (
-            self.reconstruction_lambda * reconstruction_loss
-            + self.latent_reg_lambda * latent_reg
-        )
+    def compute_vae_loss(self, x, recon_x, mu, logvar):
+        """Compute VAE loss with KL divergence"""
+        # Reconstruction loss (pixel-wise MSE)
+        recon_loss = F.mse_loss(recon_x, x)
+
+        # KL divergence
+        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+        return recon_loss + self.beta * kl_loss
+
+    def mix_latents(self, z, domain_idx):
+        """Mix latent vectors with domain embeddings"""
+        domain_emb = self.domain_embeddings[domain_idx]
+        mixed_z = (1 - self.mix_ratio) * z + self.mix_ratio * domain_emb.unsqueeze(0)
+        return mixed_z
 
     def update(self, minibatches, unlabeled=None):
         self.current_epoch += 1
-        minibatches_aug = self.cyclemixLayer(minibatches)
+        all_x = torch.cat([x for x, y in minibatches])
+        all_y = torch.cat([y for x, y in minibatches])
 
-        # Separate original and augmented samples
-        orig_samples = minibatches_aug[:len(minibatches)]
-        aug_samples = minibatches_aug[len(minibatches):]
+        # Create domain labels tensor
+        domain_labels = torch.cat([
+            torch.full((x.shape[0],), i, device=all_x.device)
+            for i, (x, y) in enumerate(minibatches)
+        ])
 
-        # Concatenate all samples for classification
-        all_x = torch.cat([x for x, y in aug_samples])
-        all_y = torch.cat([y for x, y in aug_samples])
+        # Encode
+        mu, logvar = self.encoder(all_x)
+        z = self.reparameterize(mu, logvar)
 
-        save_image(all_x, 'all_x.png', nrow=8, normalize=True)
+        # Mix with domain embeddings
+        mixed_z = []
+        for i in range(len(minibatches)):
+            domain_mask = (domain_labels == i)
+            if domain_mask.any():
+                domain_z = self.mix_latents(z[domain_mask], i)
+                mixed_z.append(domain_z)
 
-        # Classification loss
-        class_loss = F.cross_entropy(self.predict(all_x), all_y)
+        mixed_z = torch.cat(mixed_z)
+        self.save_images(all_x, self.decoder(mixed_z))
 
-        # GLO loss computation
-        glo_loss = 0
-        cluster_loss = 0
-        for domain_idx, ((x_orig, _), (x_aug, _)) in enumerate(
-            zip(orig_samples, aug_samples)
-        ):
-            x_generated, z = self.cyclemixLayer.glo(x_orig, 0)
+        # Decode
+        recon_x = self.decoder(mixed_z)
 
-            self.save_images(x_orig, x_generated)
+        # Ensure tensors have matching dimensions
+        assert recon_x.shape == all_x.shape, f"Shape mismatch: recon_x {recon_x.shape} != all_x {all_x.shape}"
 
-            glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
-            cluster_loss += self.cyclemixLayer.glo.compute_clustering_loss(
-                z, domain_idx
-            )
+        # Compute losses
+        vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
+        class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
 
-        # Optimization steps
+        total_loss = vae_loss + class_loss
+
         self.optimizer.zero_grad()
-        self.glo_optimizer.zero_grad()
-
-        class_loss.backward(retain_graph=True)
-        (glo_loss + self.clustering_lambda * cluster_loss).backward()
-
+        total_loss.backward()
         self.optimizer.step()
-        self.glo_optimizer.step()
-
-        # Learning rate scheduling
-        self.scheduler.step()
-        self.scheduler_glo.step()
 
         return {
-            "loss": (class_loss + glo_loss + self.clustering_lambda * cluster_loss).item(),
+            "loss": total_loss.item(),
+            "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
-            "glo_loss": glo_loss.item(),
-            "cluster_loss": cluster_loss.item(),
-            "lr": self.scheduler.get_last_lr()[0],
         }
 
     def predict(self, x):
-        return self.classifier(self.featurizer(x))
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        return self.classifier(z)
+
+    @staticmethod
+    def reparameterize(mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
 
 class Fish(Algorithm):

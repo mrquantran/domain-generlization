@@ -218,7 +218,7 @@ if __name__ == "__main__":
     hparams["n_steps"] = n_steps
     hparams["steps_per_epoch"] = steps_per_epoch
     hparams["num_epochs"] = n_steps / steps_per_epoch
-    
+
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
     algorithm = algorithm_class(
         dataset.input_shape,
@@ -310,23 +310,9 @@ if __name__ == "__main__":
 
             misc.print_row(["out_acc"] + [results[key] for key in out_acc_keys], colwidth=12)
 
-            loss = results["loss"]
-            class_loss = results["class_loss"]
-            glo_loss = results["glo_loss"]
-            cluster_loss = results["cluster_loss"]
-            misc.print_row(
-                [
-                    "loss",
-                    loss,
-                    "class_loss",
-                    class_loss,
-                    "glo_loss",
-                    glo_loss,
-                    "cluster_loss",
-                    cluster_loss,
-                ],
-                colwidth=12,
-            )
+            out_acc_keys = [key for key in results_keys if key.endswith("loss")]
+            misc.print_row(["name"] + out_acc_keys, colwidth=12)
+            misc.print_row(["loss"] + [results[key] for key in out_acc_keys], colwidth=12)
             misc.print_row(["mean_out_acc", mean_out_acc], colwidth=12)
 
             results.update({"hparams": hparams, "args": vars(args)})

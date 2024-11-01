@@ -27,32 +27,32 @@ import numpy as np
 from sklearn.decomposition import PCA
 
 class GLOGenerator(nn.Module):
-    """Generator network following GLO paper architecture"""
+    def __init__(self, latent_dim, output_shape):
+        super().__init__()
 
-    def __init__(self, latent_dim=1024, output_dim=3):
-        super(GLOGenerator, self).__init__()
+        self.output_shape = output_shape
+        init_channels = 512
 
-        # Following GLO paper architecture
-        self.fc = nn.Linear(latent_dim, 14 * 14 * 256)
+        self.fc = nn.Linear(latent_dim, init_channels * 4 * 4)
 
-        self.deconv = nn.Sequential(
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(init_channels, 256, 4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
-            nn.ReLU(True),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), # size 56x56
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1), # size 112x112
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, output_shape[0], 4, stride=2, padding=1),
             nn.Tanh(),
         )
 
     def forward(self, z):
         x = self.fc(z)
-        x = x.view(-1, 256, 14, 14)
-        x = self.deconv(x)
-        return x
+        x = x.view(x.size(0), -1, 4, 4)
+        return self.decoder(x)
 
 class GLOModule(nn.Module):
 
@@ -70,95 +70,33 @@ class GLOModule(nn.Module):
         # Learnable latent codes for each domain - key difference from original GLO
         # We maintain separate latent codes for each domain
         self.encoder = Encoder(latent_dim)
+        self.domain_mu = nn.Parameter(torch.randn(num_domains, latent_dim))
+        self.domain_logvar = nn.Parameter(torch.randn(num_domains, latent_dim))
+        self.domain_latents = nn.Parameter(torch.randn(num_domains, batch_size, latent_dim))
 
         # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
-        # Projection head for clustering
-        self.projection_head = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim // 2, latent_dim // 4),
-        )
-
-    def get_projected_latents(self, z):
-        """Project latents to lower-dimensional space for clustering"""
-        return self.projection_head(z)
-
-    def compute_clustering_loss(self, z, domain_labels, temperature=None):
-        """
-        Công thức Contrastive Loss chuẩn theo paper:
-        L = -log[ exp(sim(z_i, z_j)/temperature) / Σ_k exp(sim(z_i, z_k)/temperature) ]
+    def forward(self, x, domain_idx):
+        """Forward pass of the GLO module.
 
         Args:
-            features: Tensor của projected features [N, D]
-            domain_labels: Tensor của domain labels [N]
-            temperature: Scalar cho temperature scaling
+            x: Input tensor of shape [batch_size, channels, height, width]
+            domain_idx: Index of the current domain
+
+        Returns:
+            tuple: (generated images, latent vectors)
         """
-        # Convert domain_labels to tensor and ensure it's 1-dimensional
-        if not isinstance(domain_labels, torch.Tensor):
-            domain_labels = torch.tensor(domain_labels, device=z.device)
-
-        if domain_labels.dim() == 0:
-            domain_labels = domain_labels.unsqueeze(0)
-
-        features = self.get_projected_latents(z)
-
-        if temperature is None:
-            temperature = self.temperature
-
-        # Normalize features
-        features = F.normalize(features, dim=1)
-
-        # Compute similarity matrix
-        sim_matrix = torch.matmul(features, features.T)  # [N, N]
-
-        # Mask for positive pairs (same domain)
-        pos_mask = (domain_labels.unsqueeze(0) == domain_labels.unsqueeze(1)).float()
-        # Remove self-contrast
-        pos_mask = pos_mask - torch.eye(pos_mask.shape[0], device=pos_mask.device)
-
-        # Mask for valid positive pairs
-        valid_pos_mask = (pos_mask.sum(dim=1) > 0).float()
-
-        # Compute exp(sim/temp) for all pairs
-        exp_sim = torch.exp(sim_matrix / temperature)
-
-        # Zero out self-contrast
-        exp_sim = exp_sim * (1 - torch.eye(exp_sim.shape[0], device=exp_sim.device))
-
-        # Compute positive pairs loss
-        pos_pairs = exp_sim * pos_mask
-        pos_pairs = pos_pairs.sum(dim=1)  # [N]
-
-        # Compute denominator (all possible pairs except self)
-        denominator = exp_sim.sum(dim=1)  # [N]
-
-        # Compute log ratios for valid samples
-        log_ratios = -torch.log(pos_pairs / denominator + 1e-8) * valid_pos_mask
-
-        # Normalize by number of valid positive samples
-        loss = log_ratios.sum() / (valid_pos_mask.sum() + 1e-8)
-
-        return loss # if loss = 0, it means that all the samples are in the same domain
-
-    def sample_latents(self, domain_idx, batch_size):
-        if self.training:
-            mean = self.domain_latents.mean[domain_idx]
-            std = self.domain_latents.std[domain_idx]
-            z = torch.normal(mean, std, size=(batch_size, self.latent_dim))
-        else:
-            z = self.domain_latents[domain_idx, :batch_size]
-        return z
-
-    def forward(self, x, domain_idx):
         batch_size = x.size(0)
 
         # Encode input images
         mu, logvar = self.encoder(x)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
 
-        # Get corresponding latent codes for the domain
-        z = self.sample_latents(domain_idx, batch_size)
+        # Create new domain latents tensor
+        new_domain_latents = self.domain_latents.clone()
+        new_domain_latents.data[domain_idx, :batch_size] = z.data
+        self.domain_latents = nn.Parameter(new_domain_latents)
 
         # Generate images
         generated = self.generator(z)
@@ -166,27 +104,24 @@ class GLOModule(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, latent_dim):
-        super(Encoder, self).__init__()
+        super().__init__()
+        # Use EfficientNet as backbone
+        self.backbone = torchvision.models.efficientnet_b1(
+            weights=torchvision.models.EfficientNet_B1_Weights.DEFAULT
+        )
+        backbone_out_features = self.backbone.classifier[1].in_features
 
-        # Khởi tạo mô hình EfficientNet-B1 mà không sử dụng pretrained weights
-        self.efficientnet = torchvision.models.efficientnet_b1(pretrained=torchvision.models.EfficientNet_B1_Weights.DEFAULT)
+        # Remove classifier
+        self.backbone.classifier = nn.Identity()
 
-        # Lấy số features từ lớp cuối cùng của EfficientNet-B1
-        in_features = self.efficientnet.classifier[1].in_features
-
-        # Mean (mu) and log-variance (logvar) layers
-        self.fc_mu = nn.Linear(in_features, latent_dim)
-        self.fc_logvar = nn.Linear(in_features, latent_dim)
+        # VAE heads
+        self.fc_mu = nn.Linear(backbone_out_features, latent_dim)
+        self.fc_logvar = nn.Linear(backbone_out_features, latent_dim)
 
     def forward(self, x):
-        features = self.efficientnet.features(x)
-        x = self.efficientnet.avgpool(features)
-        x = torch.flatten(x, 1)
+        features = self.backbone(x)
+        return self.fc_mu(features), self.fc_logvar(features)
 
-        # Compute mu and logvar
-        mu = self.fc_mu(x)
-        logvar = self.fc_logvar(x)
-        return mu, logvar
 
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
@@ -203,17 +138,6 @@ class CycleMixLayer(nn.Module):
             batch_size=hparams["batch_size"],
         ).to(device)
 
-        # Image normalization
-        self.norm = transforms.Compose(
-            [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-        )
-
-        num_interpolation_points = 5
-        self.num_points = num_interpolation_points
-        self.register_buffer(
-            "interpolation_weights", torch.linspace(0, 1, num_interpolation_points)
-        )
-
     def process_domain(self, batch, domain_idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process single domain data"""
         x, y = batch
@@ -221,41 +145,7 @@ class CycleMixLayer(nn.Module):
         # Generate domain-mixed samples
         x_hat, z = self.glo(x, domain_idx)
 
-        # Normalize generated samples
-        x_hat = self.norm(x_hat)
-
-        return (x, y), (x_hat, y), z
-
-    @torch.amp.autocast("cuda")
-    def interpolate(
-        self, z1: torch.Tensor, z2: torch.Tensor, weights: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Interpolate between two latent vectors using provided weights
-        """
-        weights = weights.to(z1.device)
-
-        return torch.lerp(z1, z2, weights)
-
-    def linear_interpolate(self, z1: torch.Tensor, z2: torch.Tensor, num_points: int):
-        """
-        Perform linear interpolation between two latent vectors
-        z = α * z1 + (1-α) * z2
-        """
-        if num_points is None:
-            num_points = self.num_points
-
-        # Generate interpolation weights
-        weights = self.interpolation_weights.view(-1, 1, 1)  # [num_points, 1, 1]
-
-        # Reshape inputs for broadcasting
-        z1 = z1.unsqueeze(0)  # [1, batch_size, latent_dim]
-        z2 = z2.unsqueeze(0)  # [1, batch_size, latent_dim]
-
-        # Linear interpolation: z = α * z1 + (1-α) * z2
-        interpolated = self.interpolate(z1=z1, z2=z2, weights=weights)
-
-        return interpolated
+        return (x, y), (x_hat, y), (z, y)
 
     def forward(self, x: list):
         """
@@ -272,32 +162,11 @@ class CycleMixLayer(nn.Module):
             self.process_domain(batch, idx) for idx, batch in enumerate(x)
         ]
 
-        generated_interpolated_samples = []
-        for i in range(num_domains):
-            for j in range(i+1, num_domains):
-                if i == j:
-                    continue
-
-                # Get latent codes for each domain
-                _, _, z1 = processed_domains[i]
-                _, _, z2 = processed_domains[j]
-
-                # Linear interpolation
-                interpolated = self.linear_interpolate(z1, z2, num_points=5)
-
-                # Generate samples
-                generated_interpolated = self.glo.generator(interpolated)
-
-                generated_interpolated_samples.append(generated_interpolated)
-
         # Unzip results
         original_samples, generated_samples, z_samples = zip(*processed_domains)
 
-        # Combine original and generated samples
-        all_samples = list(original_samples) + list(generated_samples)
-
         # Return in required format
-        return all_samples
+        return original_samples, generated_samples, z_samples
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
