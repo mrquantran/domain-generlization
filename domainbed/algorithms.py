@@ -6,14 +6,15 @@ import torch.nn.functional as F
 import torch.autograd as autograd
 from torchvision import transforms
 from torchvision.transforms import v2
-
+from torchvision.utils import save_image
 import copy
 import numpy as np
 from collections import OrderedDict
+import os
 
 try:
     from backpack import backpack, extend  # type: ignore
-    from backpack.extensions import BatchGrad # type: ignore
+    from backpack.extensions import BatchGrad  # type: ignore
 except:
     backpack = None
 
@@ -221,7 +222,6 @@ class CYCLEMIX(Algorithm):
         # Parameters
         self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
         self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
-        
         self.base_lr = hparams.get("lr", 1e-4)  # Base learning rate
         self.max_lr = self.base_lr * 10  # Peak learning rate typically 10x base_lr
 
@@ -229,8 +229,8 @@ class CYCLEMIX(Algorithm):
         num_epochs = hparams["num_epochs"]
         total_steps = int(steps_per_epoch * num_epochs)
         print(f"Total steps: {total_steps}")
-        print(f'steps_per_epoch: {steps_per_epoch}')
-        print(f'num_epochs: {num_epochs}')
+        print(f"steps_per_epoch: {steps_per_epoch}")
+        print(f"num_epochs: {num_epochs}")
 
         self.optimizer = torch.optim.Adam(
             list(self.network.parameters()),
@@ -248,22 +248,64 @@ class CYCLEMIX(Algorithm):
             self.optimizer,
             max_lr=self.max_lr,
             total_steps=total_steps,
-            pct_start=0.3,  # Warm-up phase is 30% of training
+            pct_start=0.2,  # Warm-up phase is 30% of training
+            div_factor=25,  # Initial lr = max_lr/25
+            final_div_factor=1e4,  # Min lr = initial_lr/10000
+            three_phase=False,  # Use two-phase policy
+            verbose=False,
+        )
+        self.clustering_lambda = hparams.get("clustering_lambda", 0.1)
+
+        self.glo_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.glo_optimizer,
+            max_lr=self.max_lr,
+            total_steps=total_steps,
+            pct_start=0.2,  # Warm-up phase is 30% of training
             div_factor=25,  # Initial lr = max_lr/25
             final_div_factor=1e4,  # Min lr = initial_lr/10000
             three_phase=False,  # Use two-phase policy
             verbose=False,
         )
 
+    def save_images(self, x, x_generated):
+        """
+        Save the original and generated images to file path.
+        """
+        if self.current_epoch % 100 == 0:
+            os.makedirs("generated_images", exist_ok=True)
+            print(f'Image shape: {x.shape}')
+            print(f'Generated image shape: {x_generated.shape}')
+
+            # Ensure images are in RGB format
+            if x.shape[1] == 1:  # If grayscale, convert to RGB
+                x = x.repeat(1, 3, 1, 1)
+
+            if x_generated.shape[1] == 1:  # If grayscale, convert to RGB
+                x_generated = x_generated.repeat(1, 3, 1, 1)
+
+            # Save original images
+            original_img_path = f"generated_images/original_{self.current_epoch}.png"
+            save_image(x, original_img_path, nrow=8, normalize=True)
+            print(f"Original images saved to {original_img_path}")
+
+            # Scale generated images from [-1, 1] to [0, 1]
+            images = (x_generated.detach().cpu() + 1) / 2
+
+            # Save generated images
+            generated_img_path = f"generated_images/generated_{self.current_epoch}.png"
+            save_image(images, generated_img_path, nrow=8, normalize=True)
+            print(f"Generated images saved to {generated_img_path}")
+
     def compute_glo_loss(self, original, generated, latent):
         reconstruction_loss = F.mse_loss(generated, original)
-        latent_reg = torch.mean(torch.norm(latent, dim=1))
+        latent_reg = torch.mean(torch.norm(latent, dim=-1))
         return (
             self.reconstruction_lambda * reconstruction_loss
             + self.latent_reg_lambda * latent_reg
         )
 
     def update(self, minibatches, unlabeled=None):
+        self.current_epoch += 1
         minibatches_aug = self.cyclemixLayer(minibatches)
 
         # Separate original and augmented samples
@@ -279,12 +321,21 @@ class CYCLEMIX(Algorithm):
 
         # GLO loss computation
         glo_loss = 0
-        for (x_orig, _), (x_aug, _) in zip(orig_samples, aug_samples):
-            _, z = self.cyclemixLayer.glo(x_orig, 0)
+        cluster_loss = 0
+        for domain_idx, ((x_orig, _), (x_aug, _)) in enumerate(
+            zip(orig_samples, aug_samples)
+        ):
+            x_generated, z = self.cyclemixLayer.glo(x_orig, 0)
+
+            self.save_images(x_orig, x_generated)
+
             glo_loss += self.compute_glo_loss(x_orig, x_aug, z)
+            cluster_loss += self.cyclemixLayer.glo.compute_clustering_loss(
+                z, domain_idx
+            )
 
         # Total loss
-        total_loss = class_loss + glo_loss
+        total_loss = class_loss + glo_loss + cluster_loss * self.clustering_lambda
 
         # Optimization steps
         self.optimizer.zero_grad()
@@ -292,12 +343,17 @@ class CYCLEMIX(Algorithm):
         total_loss.backward()
         self.optimizer.step()
         self.glo_optimizer.step()
+
+        # Learning rate scheduling
         self.scheduler.step()
+        self.glo_scheduler.step()
 
         return {
             "loss": total_loss.item(),
             "class_loss": class_loss.item(),
-            "glo_loss": glo_loss.item()
+            "glo_loss": glo_loss.item(),
+            "cluster_loss": cluster_loss.item(),
+            "lr": self.scheduler.get_last_lr()[0],
         }
 
     def predict(self, x):
