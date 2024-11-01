@@ -218,19 +218,27 @@ class CYCLEMIX(Algorithm):
         self.current_epoch = 0
 
         # Network components
-        self.featurizer = networks.Featurizer(input_shape, self.hparams)
-        self.classifier = networks.Classifier(
-            self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
-        )
-
+        # self.featurizer = networks.Featurizer(input_shape, self.hparams)
+        # self.classifier = networks.Classifier(
+        #     self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
+        # )
         # Move to device
+        self.input_shape = input_shape
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
-        self.network = nn.Sequential(self.featurizer, self.classifier).to(device)
         self.cyclemixLayer = networks.CycleMixLayer(
             hparams, device
         )
-
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Conv2d(input_shape[0], 64, kernel_size=3, stride=1, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(128, num_classes, kernel_size=3, stride=1, padding=1),
+            torch.nn.AdaptiveAvgPool2d((1, 1)),
+            torch.nn.Flatten()
+        ).to("cuda")
+        self.network = self.classifier
         # Loss weights
         self.reconstruction_lambda = hparams.get("reconstruction_lambda", 0.1)
         self.latent_reg_lambda = hparams.get("latent_reg_lambda", 0.01)
@@ -308,8 +316,8 @@ class CYCLEMIX(Algorithm):
             print(f"Original images saved to {original_img_path}")
 
             x_generated = x_generated.cpu().detach()
-            # change to range 0-1
-            x_generated = (x_generated - x_generated.min()) / (x_generated.max() - x_generated.min())
+            # change tensor from tanh [-1, 1] to [0, 1]
+            x_generated = (x_generated + 1) / 2
             # Save generated images
             generated_img_path = f"generated_images/generated_{self.current_epoch}.png"
             save_image(x_generated, generated_img_path, nrow=10, normalize=True)
@@ -441,7 +449,6 @@ class CYCLEMIX(Algorithm):
 
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
-
 
 class Fish(Algorithm):
     """
