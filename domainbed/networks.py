@@ -25,8 +25,8 @@ class LatentInterpolator(nn.Module):
         num_domains,
         latent_dim,
         num_interpolation_points=5,
+        smoothness_lambda=0.1,
         consistency_lambda=0.1,
-        cycle_lambda=0.1,
         diversity_lambda=0.05,
         momentum_beta=0.9,
         temperature=0.1,
@@ -35,8 +35,8 @@ class LatentInterpolator(nn.Module):
         self.num_domains = num_domains
         self.latent_dim = latent_dim
         self.num_points = num_interpolation_points
+        self.smoothness_lambda = smoothness_lambda
         self.consistency_lambda = consistency_lambda
-        self.cycle_lambda = cycle_lambda
         self.diversity_lambda = diversity_lambda
         self.momentum_beta = momentum_beta
         self.temperature = temperature
@@ -128,19 +128,6 @@ class LatentInterpolator(nn.Module):
         return -torch.mean(distances[distances > 0])
 
     @torch.amp.autocast("cuda")
-    def compute_cycle_consistency_loss(self, z1, z2):
-        """
-        Formula for cycle consistency loss:
-        L_cycle = ||z1 - z_interp||₂² + ||z2 - z_interp||₂²
-        Ensure cycle consistency in interpolation
-        """
-        forward_interp = self.interpolate(z1, z2, self.interpolation_weights)
-        backward_interp = self.interpolate(z2, z1, 1-self.interpolation_weights)
-
-        cycle_loss = F.mse_loss(forward_interp, backward_interp)
-        return cycle_loss
-
-    @torch.amp.autocast("cuda")
     def compute_domain_weights(
         self, z1: torch.Tensor, z2: torch.Tensor
     ) -> torch.Tensor:
@@ -149,11 +136,15 @@ class LatentInterpolator(nn.Module):
         """
         # Add L2 distance
         l2_dist = torch.norm(z1 - z2, dim=-1)
-        cosine_sim = nn.CosineSimilarity(dim=-1)(z1, z2)
+        cosine_sim = F.cosine_similarity(z1, z2, dim=-1)
+        feature_dist = torch.cdist(z1, z2, p=2).mean()
 
-        # Combine multiple similarity metrics
-        similarity = (cosine_sim + 1.0) / 2.0 - l2_dist.tanh()
-        weights = torch.sigmoid(similarity / self.temperature)
+        # Combine multiple metrics
+        similarity = (cosine_sim + 1.0) / 2.0 - l2_dist.tanh() - feature_dist.tanh()
+
+        # Adaptive temperature
+        temp = self.compute_adaptive_temperature(z1, z2)
+        weights = torch.sigmoid(similarity / temp)
 
         return weights.unsqueeze(-1)
 
@@ -232,12 +223,10 @@ class LatentInterpolator(nn.Module):
             # smoothness_loss = self.compute_smoothness_loss(interpolated)
             consistency_loss = self.compute_consistency_loss(z1, z2, interpolated)
             diversity_loss = self.compute_diversity_loss(interpolated)
-            cycle_loss = self.compute_cycle_consistency_loss(z1, z2)
             total_loss = (
                 # self.smoothness_lambda * smoothness_loss
-                self.consistency_lambda * consistency_loss
+                + self.consistency_lambda * consistency_loss
                 + self.diversity_lambda * diversity_loss
-                + self.cycle_lambda * cycle_loss
             )
             return interpolated, total_loss
 
@@ -262,12 +251,11 @@ class LatentInterpolator(nn.Module):
                 if self.training:
                     consistency_loss = self.compute_consistency_loss(z1[b], z2[b], interpolated)
                     diversity_loss = self.compute_diversity_loss(interpolated)
-                    cycle_loss = self.compute_cycle_consistency_loss(z1[b], z2[b])
+
                     loss = (
                         # self.smoothness_lambda * smoothness_loss +
-                        self.consistency_lambda * consistency_loss
-                        + self.diversity_lambda * diversity_loss
-                        + self.cycle_lambda * cycle_loss
+                        self.consistency_lambda * consistency_loss +
+                        self.diversity_lambda * diversity_loss
                     )
                     return interpolated, loss
                 return interpolated, torch.tensor(0.0, device=z1.device)
@@ -333,7 +321,7 @@ class GLOModule(nn.Module):
         num_domains=3,
         batch_size=32,
         temperature=0.07,
-        cycle_lambda=0.1,
+        smoothness_lambda=0.1,
         consistency_lambda=0.1,
         diversity_lambda=0.05,
     ):
@@ -354,9 +342,9 @@ class GLOModule(nn.Module):
         self.interpolator = LatentInterpolator(
             num_domains,
             latent_dim,
+            smoothness_lambda=smoothness_lambda,
             consistency_lambda=consistency_lambda,
             diversity_lambda=diversity_lambda,
-            cycle_lambda=cycle_lambda,
         )
 
         # Projection and discrimination
