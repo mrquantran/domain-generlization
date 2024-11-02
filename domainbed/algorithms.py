@@ -279,6 +279,82 @@ class VAEEncoder(nn.Module):
         super().train(mode)
         self._freeze_bn()
 
+class MultiDomainVAEEncoder(nn.Module):
+    def __init__(self, input_shape, latent_dim, num_domains):
+        super(MultiDomainVAEEncoder, self).__init__()
+
+        self.num_domains = num_domains
+        self.latent_dim = latent_dim
+
+        # Create separate encoders for each domain
+        self.domain_encoders = nn.ModuleList([
+            VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)
+        ])
+
+        # Domain attention mechanism
+        self.domain_attention = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_domains),
+            nn.Softmax(dim=1)
+        )
+
+        # Domain mixing network
+        self.mixing_network = nn.Sequential(
+            nn.Linear(latent_dim * (num_domains + 1), 512),
+            nn.ReLU(),
+            nn.Linear(512, latent_dim)
+        )
+
+    def forward(self, x, domain_idx=None):
+        batch_size = x.shape[0]
+
+        # Get encodings from all domain encoders
+        all_mus = []
+        all_logvars = []
+
+        for encoder in self.domain_encoders:
+            mu, logvar = encoder(x)
+            all_mus.append(mu)
+            all_logvars.append(logvar)
+
+        # Stack all encodings
+        all_mus = torch.stack(all_mus, dim=1)  # [batch_size, num_domains, latent_dim]
+        all_logvars = torch.stack(all_logvars, dim=1)
+
+        # Calculate attention weights
+        if domain_idx is not None:
+            # During training, use the known domain
+            attention_weights = torch.zeros(batch_size, self.num_domains, device=x.device)
+            attention_weights[:, domain_idx] = 1.0
+        else:
+            # During inference, use learned attention
+            base_mu = all_mus.mean(dim=1)  # [batch_size, latent_dim]
+            attention_weights = self.domain_attention(base_mu)
+
+        # Weight the encodings
+        weighted_mus = (all_mus * attention_weights.unsqueeze(-1)).sum(dim=1)
+        weighted_logvars = (all_logvars * attention_weights.unsqueeze(-1)).sum(dim=1)
+
+        # Sample latent vectors using reparametrization trick
+        std = torch.exp(0.5 * weighted_logvars)
+        eps = torch.randn_like(std)
+        z = weighted_mus + eps * std
+
+        # Concatenate all domain encodings for mixing
+        all_z = [z]
+        for i in range(self.num_domains):
+            domain_mu = all_mus[:, i, :]
+            domain_logvar = all_logvars[:, i, :]
+            domain_std = torch.exp(0.5 * domain_logvar)
+            domain_z = domain_mu + eps * domain_std
+            all_z.append(domain_z)
+
+        # Concatenate and mix
+        combined_z = torch.cat(all_z, dim=1)
+        mixed_z = self.mixing_network(combined_z)
+
+        return mixed_z, weighted_mus, weighted_logvars, attention_weights
 
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
@@ -347,9 +423,10 @@ class CYCLEMIX(Algorithm):
         self.w_dim = input_shape[2] // 16
 
         # VAE Components
-        self.encoder = VAEEncoder(
+        self.encoder = MultiDomainVAEEncoder(
             input_shape=input_shape,
-            latent_dim=self.latent_dim
+            latent_dim=self.latent_dim,
+            num_domains=num_domains
         )
 
         self.decoder = VAEDecoder(
@@ -428,63 +505,48 @@ class CYCLEMIX(Algorithm):
         return mixed_z
 
     def update(self, minibatches, unlabeled=None):
-        self.current_epoch += 1
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
-        # Create domain labels tensor
         domain_labels = torch.cat([
             torch.full((x.shape[0],), i, device=all_x.device)
             for i, (x, y) in enumerate(minibatches)
         ])
 
-        # Encode
-        mu, logvar = self.encoder(all_x)
-        z = self.reparameterize(mu, logvar)
+        # Get mixed latent representation and VAE outputs
+        mixed_z, mu, logvar, attention_weights = self.encoder(all_x, domain_labels)
 
-        # Mix with domain embeddings
-        mixed_z = []
-        for i in range(len(minibatches)):
-            domain_mask = (domain_labels == i)
-            if domain_mask.any():
-                domain_z = self.mix_latents(z[domain_mask], i)
-                mixed_z.append(domain_z)
-
-        mixed_z = torch.cat(mixed_z)
         self.save_images(all_x, self.decoder(mixed_z))
 
         # Decode
         recon_x = self.decoder(mixed_z)
 
-        # Ensure tensors have matching dimensions
-        assert recon_x.shape == all_x.shape, f"Shape mismatch: recon_x {recon_x.shape} != all_x {all_x.shape}"
-
         # Compute losses
         vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
         class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
 
-        total_loss = vae_loss + class_loss
+        # Add attention diversity loss to encourage using multiple domains
+        attention_diversity = -(attention_weights.mean(dim=0) *
+                              torch.log(attention_weights.mean(dim=0) + 1e-6)).sum()
+
+        total_loss = class_loss + 0.1 * attention_diversity
 
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
+        self.current_epoch += 1
 
         return {
             "loss": total_loss.item(),
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
+            "attention_diversity_loss": attention_diversity.item()
         }
 
     def predict(self, x):
-        mu, logvar = self.encoder(x)
-        z = self.reparameterize(mu, logvar)
-        return self.classifier(z)
-
-    @staticmethod
-    def reparameterize(mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        # During inference, use attention mechanism to weight domain encodings
+        mixed_z, _, _, _ = self.encoder(x)
+        return self.classifier(mixed_z)
 
 
 class Fish(Algorithm):
