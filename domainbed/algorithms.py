@@ -207,13 +207,16 @@ class CUTMIX(Algorithm):
     def predict(self, x):
         return self.network(x)
 
+
 class Identity(nn.Module):
     """Identity layer"""
+
     def __init__(self):
         super(Identity, self).__init__()
 
     def forward(self, x):
         return x
+
 
 def save_images(x, x_generated, current_epoch):
     """
@@ -243,12 +246,71 @@ def save_images(x, x_generated, current_epoch):
     save_image(images, generated_img_path, nrow=8, normalize=True)
     print(f"Generated images saved to {generated_img_path}")
 
+
+class InfoNCELoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+        self.criterion = nn.CrossEntropyLoss(reduction="sum")
+
+    def forward(self, features, labels, domain_labels):
+        device = features.device
+        batch_size = features.shape[0]
+
+        # Normalize features với epsilon để tránh collapse
+        features = F.normalize(features + 1e-8, dim=1)
+
+        # Compute similarity matrix với scaling factor
+        sim_matrix = torch.matmul(features, features.T) / self.temperature
+
+        # Cải thiện positive/negative sampling
+        labels_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
+        domain_matrix = domain_labels.unsqueeze(0) != domain_labels.unsqueeze(1)
+
+        # Positive pairs: same class, different domains với weight
+        pos_mask = labels_matrix & domain_matrix
+
+        # Negative pairs: different classes hoặc same domain
+        neg_mask = ~labels_matrix | (domain_labels.unsqueeze(0) == domain_labels.unsqueeze(1))
+
+        # Remove self-comparisons
+        mask = torch.eye(batch_size, device=device)
+        pos_mask.masked_fill_(mask.bool(), False)
+        neg_mask.masked_fill_(mask.bool(), False)
+
+        # Weighted loss calculation
+        loss = 0
+        n_pos_pairs = pos_mask.sum().item()
+
+        if n_pos_pairs == 0:
+            return torch.tensor(0., device=device)
+
+        for i in range(batch_size):
+            pos_idx = pos_mask[i]
+            if not pos_idx.any():
+                continue
+
+            pos_logits = sim_matrix[i][pos_idx]
+            neg_logits = sim_matrix[i][neg_mask[i]]
+
+            # Add temperature scaling for stability
+            logits = torch.cat([pos_logits, neg_logits])
+
+            # Create labels that indicate positive pairs are the first examples
+            labels = torch.zeros(1, device=device)
+
+            loss += self.criterion(logits.unsqueeze(0), labels.long())
+
+        return loss / batch_size  # Normalize by batch size
+
+
 class GradientReversal(torch.autograd.Function):
     """
     Gradient Reversal Layer từ:
     Ganin et al., Domain-Adversarial Training of Neural Networks (2015)
     https://arxiv.org/abs/1505.07818
     """
+
     @staticmethod
     def forward(ctx, x, alpha):
         ctx.alpha = alpha
@@ -259,6 +321,7 @@ class GradientReversal(torch.autograd.Function):
         output = grad_output.neg() * ctx.alpha
         return output, None
 
+
 class GRL(nn.Module):
     def __init__(self, alpha=1.0):
         super(GRL, self).__init__()
@@ -266,6 +329,7 @@ class GRL(nn.Module):
 
     def forward(self, x):
         return GradientReversal.apply(x, self.alpha)
+
 
 class DomainDiscriminator(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
@@ -275,14 +339,16 @@ class DomainDiscriminator(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
         )
 
     def forward(self, x):
         return self.network(x)
 
+
 class VAEEncoder(nn.Module):
     """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+
     def __init__(self, input_shape, latent_dim):
         super(VAEEncoder, self).__init__()
 
@@ -321,7 +387,7 @@ class VAEEncoder(nn.Module):
 
             for k in list(state_dict.keys()):
                 if k.startswith("module.encoder_q."):
-                    new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+                    new_state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
 
             msg = self.backbone.load_state_dict(new_state_dict, strict=False)
             print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
@@ -344,6 +410,24 @@ class VAEEncoder(nn.Module):
         """Override train mode to keep BN frozen"""
         super().train(mode)
         self._freeze_bn()
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, input_dim, hidden_dim=2048, output_dim=128):
+        super(ProjectionHead, self).__init__()
+
+        # Adjust hidden dimension based on input
+        adjusted_hidden_dim = min(hidden_dim, input_dim * 2)
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, adjusted_hidden_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(adjusted_hidden_dim),
+            nn.Linear(adjusted_hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
@@ -379,22 +463,33 @@ class MultiDomainVAEEncoder(nn.Module):
             nn.Linear(512, latent_dim),
         )
 
-    def forward(self, x, domain_idx=None, alpha=1.0):
+        self.projection_head = ProjectionHead(
+            latent_dim, hidden_dim=256, output_dim=128
+        )
+
+    def forward(self, x, domain_idx=None, alpha=1.0, return_contrastive=False):
         batch_size = x.shape[0]
 
         # Get encodings from all domain encoders
         all_mus = []
         all_logvars = []
+        all_features = []  # Store features for contrastive learning
 
         for encoder in self.domain_encoders:
             mu, logvar = encoder(x)
             all_mus.append(mu)
             all_logvars.append(logvar)
+            # Get contrastive features through projection head
+            if return_contrastive:
+                all_features.append(self.projection_head(mu))
 
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Calculate attention weights
+        if return_contrastive:
+            all_features = torch.stack(all_features, dim=1)
+
+        # Rest of the forward pass remains the same
         if domain_idx is not None:
             attention_weights = torch.zeros(
                 batch_size, self.num_domains, device=x.device
@@ -404,20 +499,16 @@ class MultiDomainVAEEncoder(nn.Module):
             base_mu = all_mus.mean(dim=1)
             attention_weights = self.domain_attention(base_mu)
 
-        # Weight the encodings
         weighted_mus = (all_mus * attention_weights.unsqueeze(-1)).sum(dim=1)
         weighted_logvars = (all_logvars * attention_weights.unsqueeze(-1)).sum(dim=1)
 
-        # Sample latent vectors
         std = torch.exp(0.5 * weighted_logvars)
         eps = torch.randn_like(std)
         z = weighted_mus + eps * std
 
-        # Apply GRL and domain discrimination
         grl_z = self.grl(z)
         domain_pred = self.domain_discriminator(grl_z)
 
-        # Mix latent vectors as before
         all_z = [z]
         for i in range(self.num_domains):
             domain_mu = all_mus[:, i, :]
@@ -429,6 +520,15 @@ class MultiDomainVAEEncoder(nn.Module):
         combined_z = torch.cat(all_z, dim=1)
         mixed_z = self.mixing_network(combined_z)
 
+        if return_contrastive:
+            return (
+                mixed_z,
+                weighted_mus,
+                weighted_logvars,
+                attention_weights,
+                domain_pred,
+                all_features,
+            )
         return mixed_z, weighted_mus, weighted_logvars, attention_weights, domain_pred
 
 
@@ -450,31 +550,18 @@ class VAEDecoder(nn.Module):
         # Decoder layers - careful to match input dimensions
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(
-                self.start_channels, 256,
-                kernel_size=4, stride=2, padding=1
+                self.start_channels, 256, kernel_size=4, stride=2, padding=1
             ),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                256, 128,
-                kernel_size=4, stride=2, padding=1
-            ),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                128, 64,
-                kernel_size=4, stride=2, padding=1
-            ),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                64, output_shape[0],
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.Tanh()
+            nn.ConvTranspose2d(64, output_shape[0], kernel_size=4, stride=2, padding=1),
+            nn.Tanh(),
         )
 
     def forward(self, z):
@@ -485,15 +572,23 @@ class VAEDecoder(nn.Module):
         x = self.decoder(x)
         return x
 
+
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
 
         self.input_shape = input_shape
         self.latent_dim = hparams.get("latent_dim", 512)
-        self.beta = hparams.get("beta", 4.0)
+        self.beta = hparams.get("beta", 1.0)
         self.mix_ratio = hparams.get("mix_ratio", 0.5)
-        self.grl_weight = hparams.get("grl_weight", 1.0)
+        self.grl_weight = hparams.get("grl_weight", 0.1)
+        self.contrastive_weight = hparams.get("contrastive_weight", 0.5)
+        self.temperature = hparams.get("temperature", 0.07)
+
+        # Initialize InfoNCE loss
+        self.contrastive_criterion = InfoNCELoss(
+            temperature=self.temperature
+        )
 
         # Spatial dimensions
         self.h_dim = input_shape[1] // 16
@@ -501,9 +596,7 @@ class CYCLEMIX(Algorithm):
 
         # Modified VAE Components
         self.encoder = MultiDomainVAEEncoder(
-            input_shape=input_shape,
-            latent_dim=self.latent_dim,
-            num_domains=num_domains
+            input_shape=input_shape, latent_dim=self.latent_dim, num_domains=num_domains
         )
 
         # Decoder remains the same
@@ -511,28 +604,24 @@ class CYCLEMIX(Algorithm):
             latent_dim=self.latent_dim,
             output_shape=input_shape,
             h_dim=self.h_dim,
-            w_dim=self.w_dim
+            w_dim=self.w_dim,
         )
 
         # Domain embeddings and classifier remain the same
-        self.domain_embeddings = nn.Parameter(
-            torch.randn(num_domains, self.latent_dim)
-        )
+        self.domain_embeddings = nn.Parameter(torch.randn(num_domains, self.latent_dim))
 
         self.classifier = nn.Sequential(
-            nn.Linear(self.latent_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, num_classes)
+            nn.Linear(self.latent_dim, 256), nn.ReLU(), nn.Linear(256, num_classes)
         )
 
         # Optimizer with all components
         self.optimizer = torch.optim.Adam(
-            list(self.encoder.parameters()) +
-            list(self.decoder.parameters()) +
-            list(self.classifier.parameters()) +
-            [self.domain_embeddings],
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.classifier.parameters())
+            + [self.domain_embeddings],
             lr=hparams["lr"],
-            weight_decay=hparams["weight_decay"]
+            weight_decay=hparams["weight_decay"],
         )
 
         self.current_epoch = 0
@@ -540,8 +629,7 @@ class CYCLEMIX(Algorithm):
     def compute_domain_adversarial_loss(self, domain_pred, domain_labels):
         """Compute adversarial loss for domain prediction"""
         return F.binary_cross_entropy_with_logits(
-            domain_pred.squeeze(),
-            domain_labels.float()
+            domain_pred.squeeze(), domain_labels.float()
         )
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
@@ -558,25 +646,46 @@ class CYCLEMIX(Algorithm):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
-        domain_labels = torch.cat([
-            torch.full((x.shape[0],), i, device=all_x.device)
-            for i, (x, y) in enumerate(minibatches)
-        ])
+        domain_labels = torch.cat(
+            [
+                torch.full((x.shape[0],), i, device=all_x.device)
+                for i, (x, y) in enumerate(minibatches)
+            ]
+        )
 
         # Calculate dynamic GRL weight
         p = float(self.current_epoch) / 100
-        grl_weight = 2. / (1. + np.exp(-10 * p)) - 1
+        grl_weight = 2.0 / (1.0 + np.exp(-10 * p)) - 1
 
-        # Get mixed latent representation and VAE outputs with domain prediction
-        mixed_z, mu, logvar, attention_weights, domain_pred = self.encoder(
-            all_x, domain_labels, alpha=grl_weight
+        # Get outputs including contrastive features
+        outputs = self.encoder(
+            all_x, domain_labels, alpha=grl_weight, return_contrastive=True
+        )
+        mixed_z, mu, logvar, attention_weights, domain_pred, contrastive_features = (
+            outputs
+        )
+
+        # Reshape contrastive features for loss calculation
+        # [batch_size * num_domains, feature_dim]
+        contrastive_features = contrastive_features.view(
+            -1, contrastive_features.size(-1)
+        )
+
+        # Repeat labels and domain_labels for each domain's features
+        repeated_labels = all_y.repeat(self.encoder.num_domains)
+        repeated_domains = torch.arange(
+            self.encoder.num_domains, device=all_x.device
+        ).repeat_interleave(len(all_x))
+
+        # Calculate contrastive loss
+        contrastive_loss = self.contrastive_criterion(
+            contrastive_features, repeated_labels, repeated_domains
         )
 
         # Decode
         recon_x = self.decoder(mixed_z)
 
-        # Save images periodically
-        if self.current_epoch % 100 == 0:
+        if self.current_epoch % 200 == 0:
             save_images(all_x, recon_x, self.current_epoch)
 
         # Compute all losses
@@ -585,15 +694,18 @@ class CYCLEMIX(Algorithm):
         domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
 
         # Attention diversity loss
-        attention_diversity = -(attention_weights.mean(dim=0) *
-                              torch.log(attention_weights.mean(dim=0) + 1e-6)).sum()
+        attention_diversity = -(
+            attention_weights.mean(dim=0)
+            * torch.log(attention_weights.mean(dim=0) + 1e-6)
+        ).sum()
 
-        # Total loss with GRL component
+        # Total loss with contrastive component
         total_loss = (
-            vae_loss +
-            class_loss +
-            self.grl_weight * domain_loss +
-            0.1 * attention_diversity
+            vae_loss
+            + 2.0 * class_loss
+            + self.grl_weight * domain_loss
+            + 0.1 * attention_diversity
+            + self.contrastive_weight * contrastive_loss
         )
 
         self.optimizer.zero_grad()
@@ -606,7 +718,8 @@ class CYCLEMIX(Algorithm):
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
             "domain_loss": domain_loss.item(),
-            "attention_diversity": attention_diversity.item()
+            "attention_diversity": attention_diversity.item(),
+            "contrastive_loss": contrastive_loss.item(),
         }
 
     def predict(self, x):
