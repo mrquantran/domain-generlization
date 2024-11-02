@@ -13,7 +13,7 @@ import numpy as np
 from collections import OrderedDict
 import os
 from torch.utils.model_zoo import load_url
-
+import math
 try:
     from backpack import backpack, extend  # type: ignore
     from backpack.extensions import BatchGrad  # type: ignore
@@ -231,7 +231,7 @@ def save_images(x, x_generated, current_epoch):
         x_generated = x_generated.repeat(1, 3, 1, 1)
 
     # Save original images
-    original_img_path = f"generated_images/original_{current_epoch}.png"
+    original_img_path = f"generated_images/{current_epoch}_original.png"
     save_image(x, original_img_path, nrow=8, normalize=True)
     print(f"Original images saved to {original_img_path}")
 
@@ -239,9 +239,191 @@ def save_images(x, x_generated, current_epoch):
     images = (x_generated.detach().cpu() + 1) / 2
 
     # Save generated images
-    generated_img_path = f"generated_images/generated_{current_epoch}.png"
+    generated_img_path = f"generated_images/{current_epoch}_generated.png"
     save_image(images, generated_img_path, nrow=8, normalize=True)
     print(f"Generated images saved to {generated_img_path}")
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+        """
+        x = x + self.pe[: x.size(0)]
+        return self.dropout(x)
+
+class WeightScheduler:
+    def __init__(self, warmup_steps=1000, max_steps=10000):
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.current_step = 0
+
+    def step(self):
+        self.current_step += 1
+        if self.current_step < self.warmup_steps:
+            return self.current_step / self.warmup_steps
+        return max(0.1, 1.0 - (self.current_step - self.warmup_steps) / (self.max_steps - self.warmup_steps))
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.dim = dim
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        # Multi-head attention layers
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim)
+
+        # Normalization layers
+        self.layer_norm1 = nn.LayerNorm(dim)
+        self.layer_norm2 = nn.LayerNorm(dim)
+        self.instance_norm = nn.InstanceNorm1d(dim)
+
+        # Position encoding
+        self.pos_encoder = PositionalEncoding(dim, dropout)
+
+        # Add relative position embedding
+        self.rel_pos_embedding = nn.Embedding(2 * dim - 1, dim)
+
+        # Dropouts
+        self.attention_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+
+        # Gradient checkpointing flag
+        self.use_checkpointing = True
+
+        # Thêm temperature parameter
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+
+        # Thêm gate mechanism
+        self.gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.Sigmoid()
+        )
+
+        # Initialize weights
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        # Xavier initialization for attention layers
+        nn.init.xavier_uniform_(self.q.weight)
+        nn.init.xavier_uniform_(self.k.weight)
+        nn.init.xavier_uniform_(self.v.weight)
+        nn.init.xavier_uniform_(self.proj.weight)
+
+        # Zero initialization for biases
+        nn.init.constant_(self.q.bias, 0.)
+        nn.init.constant_(self.k.bias, 0.)
+        nn.init.constant_(self.v.bias, 0.)
+        nn.init.constant_(self.proj.bias, 0.)
+
+    def _attention_forward(self, q, k, v, mask=None):
+        # Scale attention scores with learnable temperature
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.temperature
+
+        # Get shapes
+        batch_size = q.size(0)
+        seq_len = q.size(1)
+
+        # Add relative position encoding that matches the attention shape
+        rel_pos = self._get_relative_positions(q)  # This should return [seq_len, seq_len, dim]
+
+        # Reshape relative positions to match attention weights
+        rel_pos = rel_pos.unsqueeze(0)  # [1, seq_len, seq_len, dim]
+        rel_pos = rel_pos.expand(batch_size, -1, -1, -1)  # [batch_size, seq_len, seq_len, dim]
+
+        # Project relative positions to attention space
+        rel_pos_attn = torch.mean(rel_pos, dim=-1)  # [batch_size, seq_len, seq_len]
+        attn_weights = attn_weights + rel_pos_attn
+
+        if mask is not None:
+            attn_weights = attn_weights.masked_fill(mask == 0, float("-inf"))
+
+        # Apply softmax first
+        attn_weights = F.softmax(attn_weights, dim=-1)
+
+        # Gated attention mechanism - ensure gate_weights match the shape
+        gate_weights = self.gate(q)  # [batch_size, seq_len, dim]
+        # Reshape gate weights to match attention weights
+        gate_weights = gate_weights.mean(-1).unsqueeze(-1)  # [batch_size, seq_len, 1]
+        attn_weights = attn_weights * gate_weights
+
+        return torch.matmul(attn_weights, v), attn_weights
+
+    def _get_relative_positions(self, x):
+        # Implement relative position encoding
+        seq_length = x.size(1)
+        positions = torch.arange(seq_length, device=x.device)
+        rel_pos = positions.unsqueeze(0) - positions.unsqueeze(1)
+        rel_pos = self.rel_pos_embedding(rel_pos + seq_length - 1)
+        return rel_pos
+
+    def forward(self, query, key, value, mask=None):
+        batch_size = query.shape[0]
+
+        # Apply layer normalization
+        query = self.layer_norm1(query)
+        key = self.layer_norm2(key)
+        value = self.layer_norm2(value)
+
+        # Apply positional encoding
+        if len(query.shape) == 3:  # [batch_size, seq_len, dim]
+            query = query.transpose(0, 1)
+            key = key.transpose(0, 1)
+            value = value.transpose(0, 1)
+
+            query = self.pos_encoder(query).transpose(0, 1)
+            key = self.pos_encoder(key).transpose(0, 1)
+            value = self.pos_encoder(value).transpose(0, 1)
+
+        # Linear projections
+        q = self.q(query)
+        k = self.k(key)
+        v = self.v(value)
+
+        # Apply attention with gradient checkpointing if enabled
+        if self.use_checkpointing and self.training:
+            out, attn_weights = torch.utils.checkpoint.checkpoint(
+                self._attention_forward, q, k, v, mask
+            )
+        else:
+            out, attn_weights = self._attention_forward(q, k, v, mask)
+
+        # Final projection with residual connection
+        out = query + self.proj_dropout(self.proj(out))
+
+        # Apply layer normalization instead of instance normalization
+        out = self.layer_norm1(out)
+
+        return out, attn_weights
+
+
+class DomainSpecificBatchNorm(nn.Module):
+    def __init__(self, num_features, num_domains):
+        super().__init__()
+        self.bns = nn.ModuleList([nn.BatchNorm1d(num_features) for _ in range(num_domains)])
+
+    def forward(self, x, domain_idx):
+        return self.bns[domain_idx](x)
 
 class GradientReversal(torch.autograd.Function):
     """
@@ -267,6 +449,7 @@ class GRL(nn.Module):
     def forward(self, x):
         return GradientReversal.apply(x, self.alpha)
 
+
 class DomainDiscriminator(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
         super(DomainDiscriminator, self).__init__()
@@ -275,11 +458,12 @@ class DomainDiscriminator(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
         )
 
     def forward(self, x):
         return self.network(x)
+
 
 class VAEEncoder(nn.Module):
     """VAE Encoder using ResNet with MoCo-v2 pretraining"""
@@ -347,36 +531,51 @@ class VAEEncoder(nn.Module):
 
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
-        super(MultiDomainVAEEncoder, self).__init__()
-
+        super().__init__()
         self.num_domains = num_domains
         self.latent_dim = latent_dim
 
-        # Base encoders remain the same
-        self.domain_encoders = nn.ModuleList(
-            [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
-        )
+        # Domain encoders (VAE encoders)
+        self.domain_encoders = nn.ModuleList([
+            VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)
+        ])
 
-        # Domain attention mechanism
+        # Improved cross-attention
+        self.cross_attention = CrossAttention(latent_dim)
+
+        # Domain-specific batch normalization
+        self.domain_bn = DomainSpecificBatchNorm(latent_dim, num_domains)
+
+        # Weight scheduler for dynamic balancing
+        self.weight_scheduler = WeightScheduler()
+
+        # Domain attention network
         self.domain_attention = nn.Sequential(
-            nn.Linear(latent_dim, 256),
+            nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
             nn.ReLU(),
             nn.Linear(256, num_domains),
-            nn.Softmax(dim=1),
+            nn.Softmax(dim=1)
         )
 
-        # GRL layer
+        # GRL and discriminator
         self.grl = GRL(alpha=1.0)
-
-        # Domain discriminator
         self.domain_discriminator = DomainDiscriminator(latent_dim)
 
-        # Enhanced mixing network with domain-invariant features
+        # Domain mixing network with residual connections
         self.mixing_network = nn.Sequential(
-            nn.Linear(latent_dim * (num_domains + 1), 512),
+            nn.Linear(latent_dim * (num_domains + 1), 1024),
             nn.ReLU(),
-            nn.BatchNorm1d(512),  # Added BatchNorm for better stability
-            nn.Linear(512, latent_dim),
+            nn.Dropout(0.1),
+            nn.BatchNorm1d(1024),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Linear(512, latent_dim)
         )
 
     def forward(self, x, domain_idx=None, alpha=1.0):
@@ -386,15 +585,37 @@ class MultiDomainVAEEncoder(nn.Module):
         all_mus = []
         all_logvars = []
 
-        for encoder in self.domain_encoders:
+        for i, encoder in enumerate(self.domain_encoders):
             mu, logvar = encoder(x)
+            mu = self.domain_bn(mu, i)
             all_mus.append(mu)
             all_logvars.append(logvar)
 
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Calculate attention weights
+        # Apply improved cross-attention between domains
+        cross_domain_features = []
+        attention_weights_list = []
+
+        for i in range(self.num_domains):
+            query = all_mus[:, i, :].unsqueeze(1)
+            keys = torch.cat([
+                all_mus[:, j, :].unsqueeze(1)
+                for j in range(self.num_domains)
+                if j != i
+            ], dim=1)
+            values = keys
+
+            attended_features, attention_weights = self.cross_attention(
+                query, keys, values
+            )
+            cross_domain_features.append(attended_features.squeeze(1))
+            attention_weights_list.append(attention_weights)
+
+        cross_domain_features = torch.stack(cross_domain_features, dim=1)
+
+        # Calculate domain attention weights
         if domain_idx is not None:
             attention_weights = torch.zeros(
                 batch_size, self.num_domains, device=x.device
@@ -404,23 +625,24 @@ class MultiDomainVAEEncoder(nn.Module):
             base_mu = all_mus.mean(dim=1)
             attention_weights = self.domain_attention(base_mu)
 
-        # Weight the encodings
-        weighted_mus = (all_mus * attention_weights.unsqueeze(-1)).sum(dim=1)
-        weighted_logvars = (all_logvars * attention_weights.unsqueeze(-1)).sum(dim=1)
+        # Weight the encodings with dynamic scheduling
+        weight_factor = self.weight_scheduler.step()
+        weighted_mus = (all_mus * (attention_weights * weight_factor).unsqueeze(-1)).sum(dim=1)
+        weighted_logvars = (all_logvars * (attention_weights * weight_factor).unsqueeze(-1)).sum(dim=1)
 
-        # Sample latent vectors
+        # Sample latent vectors with reparameterization trick
         std = torch.exp(0.5 * weighted_logvars)
         eps = torch.randn_like(std)
         z = weighted_mus + eps * std
 
-        # Apply GRL and domain discrimination
+        # Apply GRL for domain adversarial training
         grl_z = self.grl(z)
         domain_pred = self.domain_discriminator(grl_z)
 
-        # Mix latent vectors as before
+        # Enhanced mixing with cross-attention features
         all_z = [z]
         for i in range(self.num_domains):
-            domain_mu = all_mus[:, i, :]
+            domain_mu = all_mus[:, i, :] + cross_domain_features[:, i, :]
             domain_logvar = all_logvars[:, i, :]
             domain_std = torch.exp(0.5 * domain_logvar)
             domain_z = domain_mu + eps * domain_std
@@ -429,8 +651,17 @@ class MultiDomainVAEEncoder(nn.Module):
         combined_z = torch.cat(all_z, dim=1)
         mixed_z = self.mixing_network(combined_z)
 
-        return mixed_z, weighted_mus, weighted_logvars, attention_weights, domain_pred
+        # Add residual connection
+        mixed_z = mixed_z + z
 
+        return (
+            mixed_z,
+            weighted_mus,
+            weighted_logvars,
+            attention_weights,
+            attention_weights_list,
+            domain_pred,
+        )
 
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
@@ -488,12 +719,38 @@ class VAEDecoder(nn.Module):
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
-
         self.input_shape = input_shape
         self.latent_dim = hparams.get("latent_dim", 512)
         self.beta = hparams.get("beta", 4.0)
         self.mix_ratio = hparams.get("mix_ratio", 0.5)
         self.grl_weight = hparams.get("grl_weight", 1.0)
+
+        # Initialize moving averages
+        self.moving_avg_entropy = MovingAverage(0.99)
+        self.moving_avg_diversity = MovingAverage(0.99)
+        self.moving_avg_sparsity = MovingAverage(0.99)
+
+        # Base weights
+        self.entropy_weight = 1.0
+        self.diversity_weight = 1.0
+        self.sparsity_weight = 0.1
+
+        # Temperature parameter
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+
+        # Add gradient clipping
+        self.grad_clip = hparams.get("grad_clip", 1.0)
+        self.cross_attention_weight = hparams.get("cross_attention_weight", 0.01)
+
+        steps_per_epoch = hparams["steps_per_epoch"]
+        num_epochs = hparams["num_epochs"]
+        total_steps = int(steps_per_epoch * num_epochs)
+        print(f"Total steps: {total_steps}")
+        print(f'steps_per_epoch: {steps_per_epoch}')
+        print(f'num_epochs: {num_epochs}')
+
+        self.base_lr = hparams["lr"]
+        self.max_lr = self.base_lr * 10
 
         # Spatial dimensions
         self.h_dim = input_shape[1] // 16
@@ -520,29 +777,129 @@ class CYCLEMIX(Algorithm):
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(self.latent_dim, 256),
+            # Reshape input to match Conv1d requirements
+            nn.Unflatten(1, (self.latent_dim, 1)),
+            # Start with input channels = latent_dim
+            nn.Conv1d(self.latent_dim, 512, kernel_size=1),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Linear(256, num_classes)
+            nn.Conv1d(512, 256, kernel_size=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Conv1d(256, num_classes, kernel_size=1),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten()
         )
 
         # Optimizer with all components
-        self.optimizer = torch.optim.Adam(
-            list(self.encoder.parameters()) +
-            list(self.decoder.parameters()) +
-            list(self.classifier.parameters()) +
-            [self.domain_embeddings],
-            lr=hparams["lr"],
+        # Separate optimizers for better control
+        self.encoder_optimizer = torch.optim.Adam(
+            self.encoder.parameters(),
+            lr=self.base_lr,
             weight_decay=hparams["weight_decay"]
+        )
+
+        self.decoder_optimizer = torch.optim.Adam(
+            self.decoder.parameters(),
+            lr=self.base_lr,
+            weight_decay=hparams["weight_decay"]
+        )
+
+        self.classifier_optimizer = torch.optim.Adam(
+            list(self.classifier.parameters()) + [self.domain_embeddings],
+            lr=self.base_lr,
+            weight_decay=hparams["weight_decay"]
+        )
+
+        self.cross_attention_optimizer = torch.optim.Adam(
+            self.encoder.cross_attention.parameters(),
+            lr=self.base_lr,
+            weight_decay=hparams["weight_decay"]
+        )
+
+        # Learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.cross_attention_optimizer,
+            max_lr=self.max_lr,
+            total_steps=total_steps,
+            pct_start=0.3,  # Warm-up phase is 30% of training
+            div_factor=25,  # Initial lr = max_lr/25
+            final_div_factor=1e4,  # Min lr = initial_lr/10000
+            three_phase=False,  # Use two-phase policy
+            verbose=False,
         )
 
         self.current_epoch = 0
 
     def compute_domain_adversarial_loss(self, domain_pred, domain_labels):
-        """Compute adversarial loss for domain prediction"""
-        return F.binary_cross_entropy_with_logits(
-            domain_pred.squeeze(),
-            domain_labels.float()
-        )
+        """Compute the domain adversarial loss."""
+        domain_pred = domain_pred.squeeze()
+        domain_labels = domain_labels.float()  # Ensure domain_labels is of floating point type
+
+        # Cross entropy loss for domain classification
+        domain_cls_loss = F.cross_entropy(domain_pred, domain_labels)
+
+        # Domain confusion loss
+        uniform_dist = torch.ones_like(domain_pred) / domain_pred.size(0)
+        confusion_loss = -torch.mean(torch.sum(F.softmax(
+            domain_pred, dim=0) * torch.log(uniform_dist), dim=0))
+
+        return domain_cls_loss + 0.1 * confusion_loss
+        # + 0.01 * alignment_loss
+
+    def compute_cross_attention_loss(self, attention_weights_list):
+        loss = 0
+        batch_size = attention_weights_list[0].size(0)
+
+        for weights in attention_weights_list:
+            # Normalize attention weights with temperature scaling
+            self.temperature = nn.Parameter(torch.ones(1, device=weights.device) * 0.07)
+            weights = F.softmax(weights / self.temperature, dim=-1)
+
+            # 1. Entropy loss to encourage information flow
+            entropy = -(weights * torch.log(weights + 1e-8)).sum(dim=-1).mean()
+            entropy_scaled = self.moving_avg_entropy.update({'value': torch.tensor([entropy.item()])})['value']
+
+            # 2. Improved diversity loss with cosine similarity
+            similarity = torch.matmul(weights, weights.transpose(-2, -1))
+            identity = torch.eye(weights.size(-1), device=weights.device)
+            diversity_loss = torch.norm(similarity - identity)
+            diversity_scaled = self.moving_avg_entropy.update({'value': torch.tensor([diversity_loss.item()])})['value']
+
+            # 3. Sparsity loss for focused attention
+            sparsity = torch.norm(weights, p=1, dim=-1).mean()
+            sparsity_scaled = self.moving_avg_entropy.update(
+                {"value": torch.tensor([sparsity.item()])}
+            )["value"]
+
+            # Compute adaptive weights based on relative magnitudes
+            total_magnitude = entropy_scaled + diversity_scaled + sparsity_scaled
+            if total_magnitude > 0:
+                entropy_weight = self.entropy_weight * (1 - entropy_scaled/total_magnitude)
+                diversity_weight = self.diversity_weight * (1 - diversity_scaled/total_magnitude)
+                sparsity_weight = self.sparsity_weight * (1 - sparsity_scaled/total_magnitude)
+            else:
+                entropy_weight = self.entropy_weight
+                diversity_weight = self.diversity_weight
+                sparsity_weight = self.sparsity_weight
+
+            device = weights.device
+            weighted_loss = (
+                entropy_weight.to(device) * entropy +
+                diversity_weight.to(device) * diversity_loss +
+                sparsity_weight.to(device) * sparsity
+            )
+
+            # Add regularization to prevent weight collapse
+            reg_term = 0.01 * (
+                torch.abs(entropy_weight - self.entropy_weight) +
+                torch.abs(diversity_weight - self.diversity_weight) +
+                torch.abs(sparsity_weight - self.sparsity_weight)
+            )
+
+            loss += weighted_loss + reg_term.to(weights.device)
+
+        return loss / len(attention_weights_list)
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
         """Compute VAE loss with KL divergence"""
@@ -557,60 +914,109 @@ class CYCLEMIX(Algorithm):
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
-
         domain_labels = torch.cat([
             torch.full((x.shape[0],), i, device=all_x.device)
             for i, (x, y) in enumerate(minibatches)
         ])
 
-        # Calculate dynamic GRL weight
-        p = float(self.current_epoch) / 100
-        grl_weight = 2. / (1. + np.exp(-10 * p)) - 1
-
-        # Get mixed latent representation and VAE outputs with domain prediction
-        mixed_z, mu, logvar, attention_weights, domain_pred = self.encoder(
-            all_x, domain_labels, alpha=grl_weight
+        # Forward pass
+        mixed_z, mu, logvar, attention_weights, cross_attention_weights, domain_pred = (
+            self.encoder(all_x, domain_labels)
         )
 
-        # Decode
-        recon_x = self.decoder(mixed_z)
-
-        # Save images periodically
-        if self.current_epoch % 100 == 0:
-            save_images(all_x, recon_x, self.current_epoch)
-
-        # Compute all losses
-        vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
+        # Compute losses
+        vae_loss = self.compute_vae_loss(all_x, self.decoder(mixed_z), mu, logvar)
         class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
+        cross_attention_loss = self.compute_cross_attention_loss(cross_attention_weights)
+
+        # First pass: Optimize cross-attention
+        self.cross_attention_optimizer.zero_grad()
+        cross_attention_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.encoder.cross_attention.parameters(),
+            self.grad_clip
+        )
+        self.cross_attention_optimizer.step()
+
+        # Update learning rate
+        self.scheduler.step()
+
+        # Second pass: Compute new forward pass for main optimization
+        self.encoder_optimizer.zero_grad()
+        self.decoder_optimizer.zero_grad()
+        self.classifier_optimizer.zero_grad()
+
+        mixed_z, mu, logvar, attention_weights, cross_attention_weights, domain_pred = (
+            self.encoder(all_x, domain_labels)
+        )
+
+        reconstruction = self.decoder(mixed_z)
+        classifications = self.classifier(mixed_z)
+
+        if self.current_epoch % 100 == 0:
+            save_images(all_x, reconstruction, self.current_epoch)
+
+        # Recompute losses with updated parameters
+        vae_loss = self.compute_vae_loss(all_x, reconstruction, mu, logvar)
+        class_loss = F.cross_entropy(classifications, all_y)
         domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
 
-        # Attention diversity loss
-        attention_diversity = -(attention_weights.mean(dim=0) *
-                              torch.log(attention_weights.mean(dim=0) + 1e-6)).sum()
+        # Dynamic loss weighting
+        loss_weights = self.compute_dynamic_loss_weights(
+            vae_loss, class_loss, domain_loss)
 
-        # Total loss with GRL component
         total_loss = (
-            vae_loss +
-            class_loss +
-            self.grl_weight * domain_loss +
-            0.1 * attention_diversity
+            loss_weights['vae'] * vae_loss +
+            loss_weights['class'] * class_loss +
+            loss_weights['domain'] * domain_loss
         )
 
-        self.optimizer.zero_grad()
+        # Main optimization
+        self.encoder_optimizer.zero_grad()
+        self.decoder_optimizer.zero_grad()
+        self.classifier_optimizer.zero_grad()
+
         total_loss.backward()
-        self.optimizer.step()
+
+        # Gradient clipping
+        self.clip_gradients()
+
+        # Optimizer steps
+        self.encoder_optimizer.step()
+        self.decoder_optimizer.step()
+        self.classifier_optimizer.step()
+
         self.current_epoch += 1
 
         return {
             "loss": total_loss.item(),
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
-            "domain_loss": domain_loss.item(),
-            "attention_diversity": attention_diversity.item()
+            "cross_attention_loss": cross_attention_loss.item(),
+            "attention_weights_loss": attention_weights.mean().item(),
+            "domain_loss": domain_loss.item()
         }
 
+    def compute_dynamic_loss_weights(self, vae_loss, class_loss, domain_loss):
+        # Implementation of dynamic loss weighting based on loss magnitudes
+        losses = torch.stack([vae_loss, class_loss, domain_loss])
+        weights = F.softmax(1.0 / (losses + 1e-8), dim=0)
+
+        return {
+            'vae': weights[0],
+            'class': weights[1],
+            'domain': weights[2]
+        }
+
+    def clip_gradients(self):
+        for net in [self.encoder, self.decoder, self.classifier]:
+            torch.nn.utils.clip_grad_norm_(
+                net.parameters(),
+                self.grad_clip
+            )
+
     def predict(self, x):
-        mixed_z, _, _, _, _ = self.encoder(x)
+        mixed_z, _, _, _, _, _ = self.encoder(x)
         return self.classifier(mixed_z)
 
 
