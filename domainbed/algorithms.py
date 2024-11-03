@@ -14,6 +14,7 @@ from collections import OrderedDict
 import os
 from torch.utils.model_zoo import load_url
 import ot
+import math
 
 try:
     from backpack import backpack, extend  # type: ignore
@@ -232,29 +233,27 @@ def save_images(x, x_generated, current_epoch):
         x_generated = x_generated.repeat(1, 3, 1, 1)
 
     # Save original images
-    original_img_path = f"generated_images/original_{current_epoch}.png"
+    original_img_path = f"generated_images/{current_epoch}_original.png"
     save_image(x, original_img_path, nrow=8, normalize=True)
-    print(f"Original images saved to {original_img_path}")
 
     # Scale generated images from [-1, 1] to [0, 1]
     images = (x_generated.detach().cpu() + 1) / 2
 
     # Save generated images
-    generated_img_path = f"generated_images/generated_{current_epoch}.png"
+    generated_img_path = f"generated_images/{current_epoch}_generated.png"
     save_image(images, generated_img_path, nrow=8, normalize=True)
-    print(f"Generated images saved to {generated_img_path}")
 
 # class VAEEncoder(nn.Module):
-#     """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+#     """VAE Encoder using ResNet50 with ImageNet pretraining"""
+
 #     def __init__(self, input_shape, latent_dim):
 #         super(VAEEncoder, self).__init__()
 
-#         # MoCo v2 checkpoint URL
-#         self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
-
-#         self.backbone = torchvision.models.resnet50(pretrained=False)
+#         # Load pretrained ResNet50
+#         self.backbone = torchvision.models.resnet50(
+#             weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
+#         )
 #         backbone_dim = 2048
-#         self._load_moco_weights()
 
 #         # Handle input channels
 #         nc = input_shape[0]
@@ -275,24 +274,6 @@ def save_images(x, x_generated, current_epoch):
 
 #         self._freeze_bn()
 
-#     def _load_moco_weights(self):
-#         """Load MoCo v2 pretrained weights"""
-#         try:
-#             checkpoint = load_url(self.moco_v2_path, progress=True)
-#             state_dict = checkpoint["state_dict"]
-#             new_state_dict = {}
-
-#             for k in list(state_dict.keys()):
-#                 if k.startswith("module.encoder_q."):
-#                     new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
-
-#             msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-#             print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
-
-#         except Exception as e:
-#             print(f"Error loading MoCo v2 weights: {str(e)}")
-#             print("Falling back to random initialization")
-
 #     def _freeze_bn(self):
 #         """Freeze BatchNorm layers"""
 #         for m in self.backbone.modules():
@@ -307,64 +288,21 @@ def save_images(x, x_generated, current_epoch):
 #         """Override train mode to keep BN frozen"""
 #         super().train(mode)
 #         self._freeze_bn()
+#         return self
 
-
-class GradientReversal(torch.autograd.Function):
-    """
-    Gradient Reversal Layer từ:
-    Ganin et al., Domain-Adversarial Training of Neural Networks (2015)
-    https://arxiv.org/abs/1505.07818
-    """
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        output = grad_output.neg() * ctx.alpha
-        return output, None
-
-class GRL(nn.Module):
-    def __init__(self, alpha=1.0):
-        super(GRL, self).__init__()
-        self.alpha = alpha
-
-    def forward(self, x):
-        return GradientReversal.apply(x, self.alpha)
-
-class DomainSpecificBatchNorm(nn.Module):
-    def __init__(self, num_features, num_domains):
-        super().__init__()
-        self.bns = nn.ModuleList([nn.BatchNorm1d(num_features) for _ in range(num_domains)])
-    def forward(self, x, domain_idx):
-        return self.bns[domain_idx](x)
-
-class DomainDiscriminator(nn.Module):
-    def __init__(self, input_dim, hidden_dim=256):
-        super(DomainDiscriminator, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-
-    def forward(self, x):
-        return self.network(x)
 
 class VAEEncoder(nn.Module):
-    """VAE Encoder using ResNet50 with ImageNet pretraining"""
+    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
 
     def __init__(self, input_shape, latent_dim):
         super(VAEEncoder, self).__init__()
 
-        # Load pretrained ResNet50
-        self.backbone = torchvision.models.resnet50(
-            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
-        )
+        # MoCo v2 checkpoint URL
+        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+
+        self.backbone = torchvision.models.resnet50(pretrained=False)
         backbone_dim = 2048
+        self._load_moco_weights()
 
         # Handle input channels
         nc = input_shape[0]
@@ -385,6 +323,24 @@ class VAEEncoder(nn.Module):
 
         self._freeze_bn()
 
+    def _load_moco_weights(self):
+        """Load MoCo v2 pretrained weights"""
+        try:
+            checkpoint = load_url(self.moco_v2_path, progress=True)
+            state_dict = checkpoint["state_dict"]
+            new_state_dict = {}
+
+            for k in list(state_dict.keys()):
+                if k.startswith("module.encoder_q."):
+                    new_state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
+
+            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
+
+        except Exception as e:
+            print(f"Error loading MoCo v2 weights: {str(e)}")
+            print("Falling back to random initialization")
+
     def _freeze_bn(self):
         """Freeze BatchNorm layers"""
         for m in self.backbone.modules():
@@ -399,7 +355,60 @@ class VAEEncoder(nn.Module):
         """Override train mode to keep BN frozen"""
         super().train(mode)
         self._freeze_bn()
-        return self
+
+
+class GradientReversal(torch.autograd.Function):
+    """
+    Gradient Reversal Layer từ:
+    Ganin et al., Domain-Adversarial Training of Neural Networks (2015)
+    https://arxiv.org/abs/1505.07818
+    """
+
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+        return output, None
+
+
+class GRL(nn.Module):
+    def __init__(self, alpha=1.0):
+        super(GRL, self).__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversal.apply(x, self.alpha)
+
+
+class DomainSpecificBatchNorm(nn.Module):
+    def __init__(self, num_features, num_domains):
+        super().__init__()
+        self.bns = nn.ModuleList(
+            [nn.BatchNorm1d(num_features) for _ in range(num_domains)]
+        )
+
+    def forward(self, x, domain_idx):
+        return self.bns[domain_idx](x)
+
+
+class DomainDiscriminator(nn.Module):
+    def __init__(self, input_dim, hidden_dim=256):
+        super(DomainDiscriminator, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
 
 class OTLoss(nn.Module):
     """
@@ -473,6 +482,14 @@ class MultiDomainVAEEncoder(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
+        self.style_mapping = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(latent_dim * 2, latent_dim)
+        )
+        self.style_mixing_prob = 0.9
+
         # Keep existing mixing network
         self.mixing_network = nn.Sequential(
             nn.Linear(latent_dim * (num_domains + 1), 1024),
@@ -499,35 +516,55 @@ class MultiDomainVAEEncoder(nn.Module):
 
         return total_ot_loss / n_pairs if n_pairs > 0 else 0
 
+    def mix_styles(self, styles):
+        if not self.training or torch.rand(1) > self.style_mixing_prob:
+            return styles
+
+        batch_size = styles.size(0)
+        perm = torch.randperm(batch_size)
+        mixing_cutoff = torch.randint(1, self.num_domains, (1,)).item()
+
+        mixed_styles = styles.clone()
+        mixed_styles[:, mixing_cutoff:] = styles[perm, mixing_cutoff:]
+        return mixed_styles
+
     def forward(self, x, domain_idx=None, alpha=1.0):
         batch_size = x.shape[0]
 
         # Get encodings from all domain encoders
         all_mus = []
         all_logvars = []
+        all_styles = []
 
         for i, encoder in enumerate(self.domain_encoders):
             mu, logvar = encoder(x)
             mu = self.domain_bn(mu, i)
+
+            # Generate style codes
+            style = self.style_mapping(mu)
+
             all_mus.append(mu)
             all_logvars.append(logvar)
+            all_styles.append(style)
 
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
+        all_styles = torch.stack(all_styles, dim=1)
 
-        # Calculate attention weights
+        # Apply style mixing regularization
+        mixed_styles = self.mix_styles(all_styles)
+
+        # Rest of the original forward pass
         if domain_idx is not None:
-            attention_weights = torch.zeros(
-                batch_size, self.num_domains, device=x.device
-            )
+            attention_weights = torch.zeros(batch_size, self.num_domains, device=x.device)
             attention_weights[:, domain_idx] = 1.0
         else:
             base_mu = all_mus.mean(dim=1)
             attention_weights = self.domain_attention(base_mu)
 
-        # Weight the encodings
         weighted_mus = (all_mus * attention_weights.unsqueeze(-1)).sum(dim=1)
         weighted_logvars = (all_logvars * attention_weights.unsqueeze(-1)).sum(dim=1)
+        weighted_styles = (mixed_styles * attention_weights.unsqueeze(-1)).sum(dim=1)
 
         # Sample latent vectors
         std = torch.exp(0.5 * weighted_logvars)
@@ -538,7 +575,7 @@ class MultiDomainVAEEncoder(nn.Module):
         grl_z = self.grl(z)
         domain_pred = self.domain_discriminator(grl_z)
 
-        # Mix latent vectors
+        # Mix latent vectors with style information
         all_z = [z]
         for i in range(self.num_domains):
             domain_mu = all_mus[:, i, :]
@@ -553,60 +590,206 @@ class MultiDomainVAEEncoder(nn.Module):
         # Compute OT loss
         ot_loss = self.compute_ot_loss(all_mus)
 
-        return mixed_z, weighted_mus, weighted_logvars, attention_weights, domain_pred, ot_loss
+        return mixed_z, weighted_mus, weighted_logvars, weighted_styles, attention_weights, domain_pred, ot_loss
 
-class VAEDecoder(nn.Module):
+
+class StyleGAN2Decoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
         super().__init__()
-
         self.latent_dim = latent_dim
         self.output_shape = output_shape
-
-        # Calculate starting dimensions
         self.h_dim = h_dim
         self.w_dim = w_dim
         self.start_channels = 512
 
-        # Project and reshape
+        # Initial projection
         self.fc = nn.Linear(latent_dim, self.start_channels * self.h_dim * self.w_dim)
 
-        # Decoder layers - careful to match input dimensions
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(
-                self.start_channels, 256,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
+        # Style blocks with progressive upsampling
+        self.style_blocks = nn.ModuleList([
+            StyleBlock(self.start_channels, 256, latent_dim),
+            StyleBlock(256, 128, latent_dim),
+            StyleBlock(128, 64, latent_dim),
+            StyleBlock(64, output_shape[0], latent_dim)
+        ])
 
-            nn.ConvTranspose2d(
-                256, 128,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.to_rgb = nn.Conv2d(output_shape[0], output_shape[0], 1)
 
-            nn.ConvTranspose2d(
-                128, 64,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
+    def forward(self, z, styles=None):
+        if styles is None:
+            styles = z
 
-            nn.ConvTranspose2d(
-                64, output_shape[0],
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.Tanh()
-        )
-
-    def forward(self, z):
         # Project and reshape
         x = self.fc(z)
         x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
-        # Decode
-        x = self.decoder(x)
+
+        # Apply style blocks with progressive upsampling
+        for style_block in self.style_blocks:
+            x = self.up(x)
+            x = style_block(x, styles)
+
+        return torch.tanh(self.to_rgb(x))
+
+class StyleModulation(nn.Module):
+    def __init__(self, latent_dim, channels):
+        super().__init__()
+        self.modulation = nn.Sequential(
+            nn.Linear(latent_dim, channels * 2),  # For scale and bias
+            nn.LayerNorm(channels * 2)
+        )
+
+    def forward(self, x, style):
+        batch, channels, height, width = x.shape
+        style = self.modulation(style)
+        scale, bias = style.chunk(2, dim=1)
+        scale = scale.view(batch, channels, 1, 1)
+        bias = bias.view(batch, channels, 1, 1)
+        return x * (1 + scale) + bias
+
+class ModulatedConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, style_dim, demodulate=True):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.demodulate = demodulate
+
+        # Tạo weight và style modulation
+        self.scale = 1 / math.sqrt(in_channels * kernel_size ** 2)
+        self.weight = nn.Parameter(torch.randn(1, out_channels, in_channels, kernel_size, kernel_size))
+        self.modulation = nn.Linear(style_dim, in_channels)
+
+    def forward(self, x, style):
+        batch, in_channels, height, width = x.shape
+
+        # Style modulation
+        style = self.modulation(style).view(batch, 1, in_channels, 1, 1)
+        weight = self.scale * self.weight * style
+
+        # Demodulation
+        if self.demodulate:
+            demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
+            weight = weight * demod.view(batch, self.out_channels, 1, 1, 1)
+
+        weight = weight.view(batch * self.out_channels, in_channels,
+                           self.kernel_size, self.kernel_size)
+
+        x = x.reshape(1, batch * in_channels, height, width)
+        x = F.conv2d(x, weight, padding=self.kernel_size//2, groups=batch)
+        x = x.reshape(batch, self.out_channels, height, width)
+
         return x
+
+def path_length_regularization(fake_images, w_styles, mean_path_length=0.0):
+    """Calculate path length regularization penalty.
+
+    Args:
+        fake_images: Generated images tensor
+        w_styles: Style vectors used to generate images
+        mean_path_length: Running average of path lengths
+
+    Returns:
+        tuple: (path_penalty, updated_mean_path_length)
+    """
+    # Calculate normalized noise
+    noise = torch.randn_like(fake_images)
+    noise = noise / torch.sqrt(noise.pow(2).mean([1,2,3], keepdim=True))
+
+    # Get gradients
+    grad, = torch.autograd.grad(
+        (fake_images * noise).sum(), w_styles, create_graph=True
+    )
+
+    # Calculate path lengths
+    path_lengths = grad.pow(2).mean(1).sqrt()
+
+    # Update mean path length
+    path_mean = mean_path_length + 0.01 * (path_lengths.mean() - mean_path_length)
+
+    # Calculate penalty
+    path_penalty = (path_lengths - path_mean).pow(2).mean()
+
+    return path_penalty, path_mean.detach()
+
+class StyleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, style_dim):
+        super().__init__()
+        self.conv1 = ModulatedConv2d(in_channels, out_channels, 3, style_dim)
+        self.conv2 = ModulatedConv2d(out_channels, out_channels, 3, style_dim)
+        self.noise1 = NoiseInjection()
+        self.noise2 = NoiseInjection()
+        self.activation = nn.LeakyReLU(0.2)
+
+    def forward(self, x, style):
+        x = self.conv1(x, style)
+        x = self.noise1(x)
+        x = self.activation(x)
+        x = self.conv2(x, style)
+        x = self.noise2(x)
+        return self.activation(x)
+
+class NoiseInjection(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        noise = torch.randn(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device)
+        return x + self.weight * noise
+
+# class VAEDecoder(nn.Module):
+#     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
+#         super().__init__()
+
+#         self.latent_dim = latent_dim
+#         self.output_shape = output_shape
+
+#         # Calculate starting dimensions
+#         self.h_dim = h_dim
+#         self.w_dim = w_dim
+#         self.start_channels = 512
+
+#         # Project and reshape
+#         self.fc = nn.Linear(latent_dim, self.start_channels * self.h_dim * self.w_dim)
+
+#         # Decoder layers - careful to match input dimensions
+#         self.decoder = nn.Sequential(
+#             nn.ConvTranspose2d(
+#                 self.start_channels, 256,
+#                 kernel_size=4, stride=2, padding=1
+#             ),
+#             nn.BatchNorm2d(256),
+#             nn.ReLU(),
+
+#             nn.ConvTranspose2d(
+#                 256, 128,
+#                 kernel_size=4, stride=2, padding=1
+#             ),
+#             nn.BatchNorm2d(128),
+#             nn.ReLU(),
+
+#             nn.ConvTranspose2d(
+#                 128, 64,
+#                 kernel_size=4, stride=2, padding=1
+#             ),
+#             nn.BatchNorm2d(64),
+#             nn.ReLU(),
+
+#             nn.ConvTranspose2d(
+#                 64, output_shape[0],
+#                 kernel_size=4, stride=2, padding=1
+#             ),
+#             nn.Tanh()
+#         )
+
+#     def forward(self, z):
+#         # Project and reshape
+#         x = self.fc(z)
+#         x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
+#         # Decode
+#         x = self.decoder(x)
+#         return x
 
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -618,6 +801,8 @@ class CYCLEMIX(Algorithm):
         self.mix_ratio = hparams.get("mix_ratio", 0.5)
         self.grl_weight = hparams.get("grl_weight", 1.0)
         self.ot_weight = hparams.get("ot_weight", 0.1)
+        self.style_weight = hparams.get("style_weight", 0.5)
+        self.path_penalty_weight = hparams.get("path_penalty_weight", 0.1)
 
         # Spatial dimensions
         self.h_dim = input_shape[1] // 16
@@ -640,11 +825,11 @@ class CYCLEMIX(Algorithm):
         self.grad_clip = hparams.get("grad_clip", 1.0)
 
         # Decoder remains the same
-        self.decoder = VAEDecoder(
+        self.decoder = StyleGAN2Decoder(
             latent_dim=self.latent_dim,
             output_shape=input_shape,
             h_dim=self.h_dim,
-            w_dim=self.w_dim
+            w_dim=self.w_dim,
         )
 
         # Domain embeddings and classifier remain the same
@@ -680,7 +865,7 @@ class CYCLEMIX(Algorithm):
             self.optimizer,
             max_lr=hparams["lr"] * 10,
             total_steps=total_steps,
-            pct_start=0.15, # warm-up reduces
+            pct_start=0.3, # warm-up reduces
             div_factor=25,
             three_phase=False,
             final_div_factor=1e4,
@@ -704,6 +889,10 @@ class CYCLEMIX(Algorithm):
 
         return recon_loss + self.beta * kl_loss
 
+    def compute_style_consistency_loss(self, style1, style2):
+        """Compute consistency loss between styles"""
+        return F.mse_loss(style1, style2)
+
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
@@ -717,27 +906,39 @@ class CYCLEMIX(Algorithm):
         p = float(self.current_epoch) / 100
         grl_weight = 2. / (1. + np.exp(-10 * p)) - 1
 
-        # Get outputs including OT loss
-        mixed_z, mu, logvar, attention_weights, domain_pred, ot_loss = self.encoder(
+        # Get outputs including styles
+        mixed_z, mu, logvar, styles, attention_weights, domain_pred, ot_loss = self.encoder(
             all_x, domain_labels, alpha=grl_weight
         )
 
-        # Decode
-        recon_x = self.decoder(mixed_z)
+        # Decode with style information
+        recon_x = self.decoder(mixed_z, styles)
 
-        # Original losses remain unchanged
+        if self.current_epoch % 300 == 0:
+            save_images(all_x, recon_x, self.current_epoch)
+
+        # Original losses
         vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
         class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
         domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
-        attention_diversity = -(attention_weights.mean(dim=0) *
-                              torch.log(attention_weights.mean(dim=0) + 1e-6)).sum()
 
-        # Add OT loss to total loss
+        # Style consistency loss
+        style_loss = self.compute_style_consistency_loss(
+            styles, self.encoder.style_mapping(mixed_z)
+        )
+
+        path_penalty, mean_path_length = path_length_regularization(
+            recon_x, styles
+        )
+
+        # Total loss with style component
         total_loss = (
             vae_loss +
             class_loss +
             self.grl_weight * domain_loss +
-            self.ot_weight * ot_loss
+            self.ot_weight * ot_loss +
+            self.style_weight * style_loss +
+            self.path_penalty_weight * path_penalty
         )
 
         self.optimizer.zero_grad()
@@ -757,12 +958,13 @@ class CYCLEMIX(Algorithm):
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
             "domain_loss": domain_loss.item(),
-            "attention_diversity_loss": attention_diversity.item(),
+            "attention_weights_loss": attention_weights.mean().item(),
+            "style_loss": style_loss.item(),
             "ot_loss": ot_loss.item()
         }
 
     def predict(self, x):
-        mixed_z, _, _, _, _, _ = self.encoder(x)
+        mixed_z, _, _, _, _, _, _ = self.encoder(x)
         return self.classifier(mixed_z)
 
 
