@@ -1,6 +1,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from sklearn.metrics import silhouette_score
 import torch
+import torch.amp
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
@@ -244,66 +245,17 @@ def save_images(x, x_generated, current_epoch):
     save_image(images, generated_img_path, nrow=8, normalize=True)
     print(f"Generated images saved to {generated_img_path}")
 
-
-class VAEEncoder(nn.Module):
-    """VAE Encoder using ResNet50 with ImageNet pretraining"""
-
-    def __init__(self, input_shape, latent_dim):
-        super(VAEEncoder, self).__init__()
-
-        # Load pretrained ResNet50
-        self.backbone = torchvision.models.resnet50(
-            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
-        )
-        backbone_dim = 2048
-
-        # Handle input channels
-        nc = input_shape[0]
-        if nc != 3:
-            tmp = self.backbone.conv1.weight.data.clone()
-            self.backbone.conv1 = nn.Conv2d(
-                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
-            )
-            for i in range(nc):
-                self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
-
-        # Remove FC layer
-        self.backbone.fc = Identity()
-
-        # VAE heads
-        self.fc_mu = nn.Linear(backbone_dim, latent_dim)
-        self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
-
-        self._freeze_bn()
-
-    def _freeze_bn(self):
-        """Freeze BatchNorm layers"""
-        for m in self.backbone.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-    def forward(self, x):
-        features = self.backbone(x)
-        return self.fc_mu(features), self.fc_logvar(features)
-
-    def train(self, mode=True):
-        """Override train mode to keep BN frozen"""
-        super().train(mode)
-        self._freeze_bn()
-        return self
-
-
 # class VAEEncoder(nn.Module):
-#     """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+#     """VAE Encoder using ResNet50 with ImageNet pretraining"""
+
 #     def __init__(self, input_shape, latent_dim):
 #         super(VAEEncoder, self).__init__()
 
-#         # MoCo v2 checkpoint URL
-#         self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
-
-#         self.backbone = torchvision.models.resnet50(pretrained=False)
+#         # Load pretrained ResNet50
+#         self.backbone = torchvision.models.resnet50(
+#             weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
+#         )
 #         backbone_dim = 2048
-#         self._load_moco_weights()
 
 #         # Handle input channels
 #         nc = input_shape[0]
@@ -324,24 +276,6 @@ class VAEEncoder(nn.Module):
 
 #         self._freeze_bn()
 
-#     def _load_moco_weights(self):
-#         """Load MoCo v2 pretrained weights"""
-#         try:
-#             checkpoint = load_url(self.moco_v2_path, progress=True)
-#             state_dict = checkpoint["state_dict"]
-#             new_state_dict = {}
-
-#             for k in list(state_dict.keys()):
-#                 if k.startswith("module.encoder_q."):
-#                     new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
-
-#             msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-#             print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
-
-#         except Exception as e:
-#             print(f"Error loading MoCo v2 weights: {str(e)}")
-#             print("Falling back to random initialization")
-
 #     def _freeze_bn(self):
 #         """Freeze BatchNorm layers"""
 #         for m in self.backbone.modules():
@@ -356,6 +290,74 @@ class VAEEncoder(nn.Module):
 #         """Override train mode to keep BN frozen"""
 #         super().train(mode)
 #         self._freeze_bn()
+#         return self
+
+
+class VAEEncoder(nn.Module):
+    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+
+    def __init__(self, input_shape, latent_dim):
+        super(VAEEncoder, self).__init__()
+
+        # MoCo v2 checkpoint URL
+        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+
+        self.backbone = torchvision.models.resnet50(pretrained=False)
+        backbone_dim = 2048
+        self._load_moco_weights()
+
+        # Handle input channels
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.backbone.conv1.weight.data.clone()
+            self.backbone.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+            )
+            for i in range(nc):
+                self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # Remove FC layer
+        self.backbone.fc = Identity()
+
+        # VAE heads
+        self.fc_mu = nn.Linear(backbone_dim, latent_dim)
+        self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
+
+        self._freeze_bn()
+
+    def _load_moco_weights(self):
+        """Load MoCo v2 pretrained weights"""
+        try:
+            checkpoint = load_url(self.moco_v2_path, progress=True)
+            state_dict = checkpoint["state_dict"]
+            new_state_dict = {}
+
+            for k in list(state_dict.keys()):
+                if k.startswith("module.encoder_q."):
+                    new_state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
+
+            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
+
+        except Exception as e:
+            print(f"Error loading MoCo v2 weights: {str(e)}")
+            print("Falling back to random initialization")
+
+    def _freeze_bn(self):
+        """Freeze BatchNorm layers"""
+        for m in self.backbone.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.fc_mu(features), self.fc_logvar(features)
+
+    def train(self, mode=True):
+        """Override train mode to keep BN frozen"""
+        super().train(mode)
+        self._freeze_bn()
+
 
 class GradientReversal(torch.autograd.Function):
     """
@@ -382,29 +384,76 @@ class GRL(nn.Module):
         return GradientReversal.apply(x, self.alpha)
 
 class AdaptiveDomainNorm(nn.Module):
-    """Enhanced normalization with adaptive domain-specific parameters"""
-    def __init__(self, num_features, num_domains):
+    """Enhanced normalization with batch statistics and domain-specific parameters"""
+    def __init__(self, num_features, num_domains, eps=1e-5, momentum=0.1):
         super().__init__()
-        self.norm = nn.ModuleList([
-            nn.LayerNorm(num_features) for _ in range(num_domains)
-        ])
-        # Learnable domain mixing weights
+        self.num_features = num_features
+        self.num_domains = num_domains
+        self.eps = eps
+        self.momentum = momentum
+
+        # Domain-specific layers
+        self.norm = nn.ModuleList(
+            [nn.LayerNorm(num_features) for _ in range(num_domains)]
+        )
+
+        # Running statistics for each domain
+        self.register_buffer("running_mean", torch.zeros(num_domains, num_features))
+        self.register_buffer("running_var", torch.ones(num_domains, num_features))
+        self.register_buffer("num_batches_tracked", torch.zeros(num_domains))
+
+        # Learnable parameters
         self.domain_gates = nn.Parameter(torch.ones(num_domains) / num_domains)
-        # Domain-specific scale and bias
         self.scale = nn.Parameter(torch.ones(num_domains, num_features))
         self.bias = nn.Parameter(torch.zeros(num_domains, num_features))
 
+        # Instance normalization for unknown domains
+        self.instance_norm = nn.InstanceNorm1d(num_features, affine=False)
+
+    def _update_stats(self, x, domain_idx):
+        if self.training:
+            with torch.no_grad():
+                batch_mean = x.mean(0)
+                batch_var = x.var(0, unbiased=False)
+
+                # Update running stats
+                if self.num_batches_tracked[domain_idx] == 0:
+                    self.running_mean[domain_idx] = batch_mean
+                    self.running_var[domain_idx] = batch_var
+                else:
+                    self.running_mean[domain_idx] = (
+                        1 - self.momentum
+                    ) * self.running_mean[domain_idx] + self.momentum * batch_mean
+                    self.running_var[domain_idx] = (
+                        1 - self.momentum
+                    ) * self.running_var[domain_idx] + self.momentum * batch_var
+                self.num_batches_tracked[domain_idx] += 1
+
     def forward(self, x, domain_idx=None):
         if domain_idx is not None:
-            normalized = self.norm[domain_idx](x)
+            # Update statistics
+            self._update_stats(x, domain_idx)
+
+            # Normalize with domain-specific stats
+            if self.training:
+                mean = x.mean(0)
+                var = x.var(0, unbiased=False)
+            else:
+                mean = self.running_mean[domain_idx]
+                var = self.running_var[domain_idx]
+
+            normalized = (x - mean) / torch.sqrt(var + self.eps)
+            normalized = self.norm[domain_idx](normalized)
             return self.scale[domain_idx] * normalized + self.bias[domain_idx]
 
-        # Soft combination for unknown domain
+        # Unknown domain: combine instance norm with domain mixing
+        inst_norm = self.instance_norm(x.unsqueeze(1)).squeeze(1)
         gates = F.softmax(self.domain_gates, dim=0)
+
         out = 0
-        for i in range(len(self.norm)):
-            normalized = self.norm[i](x)
-            out += gates[i] * (self.scale[i] * normalized + self.bias[i])
+        for i in range(self.num_domains):
+            domain_norm = self.norm[i](inst_norm)
+            out += gates[i] * (self.scale[i] * domain_norm + self.bias[i])
         return out
 
 class DomainDiscriminator(nn.Module):
@@ -453,118 +502,21 @@ class OTLoss(nn.Module):
         cost = torch.mean(pi * torch.cdist(source_features, target_features))
         return cost
 
-class HierarchicalMixingNetwork(nn.Module):
-    def __init__(self, latent_dim, num_domains):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.num_domains = num_domains
-
-        # Hierarchical mixing layers
-        self.level1_mixing = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(latent_dim * 2, latent_dim),
-                nn.LayerNorm(latent_dim),
-                nn.ReLU(),
-                nn.Linear(latent_dim, latent_dim)
-            ) for _ in range(num_domains)
-        ])
-
-        self.level2_mixing = nn.Sequential(
-            nn.Linear(latent_dim * num_domains, latent_dim * 2),
-            nn.LayerNorm(latent_dim * 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim * 2, latent_dim)
-        )
-
-        # MI estimator network
-        self.mi_estimator = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-
-    def forward(self, domain_features):
-        """
-        Args:
-            domain_features: List of tensors of shape [batch_size, latent_dim]
-        Returns:
-            mixed_features: Tensor of shape [batch_size, latent_dim]
-            mi_loss: Mutual information loss
-        """
-        batch_size = domain_features[0].shape[0]
-
-        # Level 1: Pairwise mixing
-        level1_outputs = []
-        for i in range(self.num_domains):
-            # Mix with neighborhood domains
-            left_idx = (i - 1) % self.num_domains
-            right_idx = (i + 1) % self.num_domains
-
-            # Concatenate neighboring features
-            neighbor_features = torch.cat([
-                domain_features[left_idx],
-                domain_features[right_idx]
-            ], dim=1)
-
-            # Apply level 1 mixing
-            mixed = self.level1_mixing[i](neighbor_features)
-            level1_outputs.append(mixed)
-
-        # Level 2: Global mixing
-        level1_concat = torch.cat(level1_outputs, dim=1)
-        mixed_features = self.level2_mixing(level1_concat)
-
-        # Calculate MI loss
-        mi_loss = self.compute_mi_loss(mixed_features, domain_features)
-
-        return mixed_features, mi_loss
-
-    def compute_mi_loss(self, mixed_features, domain_features):
-        """Compute mutual information loss between mixed and domain features"""
-        mi_loss = 0
-
-        for domain_feat in domain_features:
-            # Positive samples
-            pos_score = self.mi_estimator(
-                torch.cat([mixed_features, domain_feat], dim=1)
-            )
-
-            # Negative samples (shuffle batch)
-            idx = torch.randperm(domain_feat.shape[0])
-            neg_score = self.mi_estimator(
-                torch.cat([mixed_features, domain_feat[idx]], dim=1)
-            )
-
-            # InfoNCE loss
-            mi_loss += F.softplus(neg_score - pos_score).mean()
-
-        return mi_loss / len(domain_features)
-
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
         super(MultiDomainVAEEncoder, self).__init__()
 
         self.num_domains = num_domains
         self.latent_dim = latent_dim
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+        self.domain_gates = nn.Parameter(torch.ones(num_domains) / num_domains)
+        self.feature_norm = nn.LayerNorm(latent_dim)
 
         # Giữ nguyên các components hiện tại
         self.domain_encoders = nn.ModuleList(
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
         self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
-        self.domain_attention = nn.Sequential(
-            nn.Linear(latent_dim, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.LayerNorm(256),
-            nn.ReLU(),
-            nn.Linear(256, num_domains),
-            nn.Softmax(dim=1),
-        )
         self.grl = GRL(alpha=1.0)
         self.domain_discriminator = DomainDiscriminator(latent_dim)
         self.ot_loss = OTLoss(reg_e=0.1)
@@ -585,18 +537,6 @@ class MultiDomainVAEEncoder(nn.Module):
             ) for _ in range(num_domains)
         ])
 
-        # Thay thế mixing_network hiện tại bằng hierarchical level 2
-        self.mixing_network = nn.Sequential(
-            nn.Linear(latent_dim * (num_domains + 1), 1024),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.BatchNorm1d(1024),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.BatchNorm1d(512),
-            nn.Linear(512, latent_dim),
-        )
-
         # MI Estimator cho regularization
         self.mi_estimator = nn.Sequential(
             nn.Linear(latent_dim * 2, 512),
@@ -610,12 +550,30 @@ class MultiDomainVAEEncoder(nn.Module):
         total_ot_loss = 0
         n_pairs = 0
 
-        # Calculate OT loss between all domain pairs
+        # Get current temperature with numerical stability
+        temperature = torch.nn.functional.softplus(self.temperature) + 1e-3
+
         for i in range(self.num_domains):
             for j in range(i + 1, self.num_domains):
+                # Transform and normalize features
                 source = self.feature_transform(all_mus[:, i, :])
+                source = self.feature_norm(source) / temperature
+
                 target = self.feature_transform(all_mus[:, j, :])
-                total_ot_loss += self.ot_loss(source, target)
+                target = self.feature_norm(target) / temperature
+
+                # Compute cosine similarity with torch function
+                cos_sim = torch.nn.functional.cosine_similarity(source, target, dim=1).mean()
+
+                try:
+                    # Compute OT loss with increased iterations/regularization
+                    domain_ot_loss = self.ot_loss(source, target)
+                except Exception as e:
+                    print(f"Warning: OT computation failed: {str(e)}")
+                    # Fallback to cosine distance if OT fails
+                    domain_ot_loss = 1 - cos_sim
+
+                total_ot_loss += domain_ot_loss + 0.1 * (1 - cos_sim)
                 n_pairs += 1
 
         return total_ot_loss / n_pairs if n_pairs > 0 else 0
@@ -638,7 +596,7 @@ class MultiDomainVAEEncoder(nn.Module):
     def forward(self, x, domain_idx=None, alpha=1.0):
         batch_size = x.shape[0]
 
-        # Giữ nguyên phần encode từ domain encoders
+        # Encode từ domain encoders như cũ
         all_mus = []
         all_logvars = []
         for i, encoder in enumerate(self.domain_encoders):
@@ -650,28 +608,7 @@ class MultiDomainVAEEncoder(nn.Module):
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Domain attention weights
-        if domain_idx is not None:
-            attention_weights = torch.zeros(batch_size, self.num_domains, device=x.device)
-            attention_weights[:, domain_idx] = 1.0
-        else:
-            base_mu = all_mus.mean(dim=1)
-            attention_weights = self.domain_attention(base_mu)
-
-        # Weighted encodings
-        weighted_mus = (all_mus * attention_weights.unsqueeze(-1)).sum(dim=1)
-        weighted_logvars = (all_logvars * attention_weights.unsqueeze(-1)).sum(dim=1)
-
-        # Sample latent vectors
-        std = torch.exp(0.5 * weighted_logvars)
-        eps = torch.randn_like(std)
-        z = weighted_mus + eps * std
-
-        # GRL và domain discrimination giữ nguyên
-        grl_z = self.grl(z)
-        domain_pred = self.domain_discriminator(grl_z)
-
-        # Hierarchical mixing level 1
+        # Level 1 mixing với residual connection
         level1_features = []
         for i in range(self.num_domains):
             left_idx = (i - 1) % self.num_domains
@@ -683,12 +620,20 @@ class MultiDomainVAEEncoder(nn.Module):
             ], dim=1)
 
             level1_mixed = self.hierarchical_level1[i](neighbor_features)
+            # Add residual connection
+            level1_mixed = level1_mixed + neighbor_features[:, :self.latent_dim]
             level1_features.append(level1_mixed)
 
-        # Kết hợp tất cả features cho level 2 mixing
-        all_z = [z] + level1_features
-        combined_z = torch.cat(all_z, dim=1)
-        mixed_z = self.mixing_network(combined_z)
+        # Global mixing với dynamic gating
+        gates = F.softmax(self.domain_gates / self.temperature, dim=0)
+        mixed_features = []
+        for i, feat in enumerate(level1_features):
+            mixed_features.append(feat * gates[i])
+        mixed_z = sum(mixed_features)
+
+        # GRL và domain discrimination giữ nguyên
+        grl_z = self.grl(mixed_z)
+        domain_pred = self.domain_discriminator(grl_z)
 
         # Compute OT loss giữ nguyên
         ot_loss = self.compute_ot_loss(all_mus)
@@ -696,7 +641,7 @@ class MultiDomainVAEEncoder(nn.Module):
         # Compute MI loss
         mi_loss = self.compute_mi_loss(mixed_z, level1_features)
 
-        return mixed_z, weighted_mus, weighted_logvars, attention_weights, domain_pred, ot_loss, mi_loss
+        return mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss
 
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
@@ -815,19 +760,21 @@ class CYCLEMIX(Algorithm):
         num_epochs = hparams["num_epochs"]
         total_steps = int(steps_per_epoch * num_epochs)
 
+        self.total_steps = total_steps
+
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=hparams["lr"] * 10,
             total_steps=total_steps,
-            pct_start=0.15,
+            pct_start=0.2,
             div_factor=25,
             three_phase=False,
             final_div_factor=1e4,
             base_momentum=0.85,
         )
 
-
         self.current_epoch = 0
+        self.grad_scaler = torch.amp.GradScaler('cuda')
 
     def compute_domain_adversarial_loss(self, domain_pred, domain_labels):
         return F.binary_cross_entropy_with_logits(
@@ -848,49 +795,56 @@ class CYCLEMIX(Algorithm):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
-        domain_labels = torch.cat([
-            torch.full((x.shape[0],), i, device=all_x.device)
-            for i, (x, y) in enumerate(minibatches)
-        ])
-
-        # Calculate dynamic GRL weight
-        p = float(self.current_epoch) / 100
-        grl_weight = 2. / (1. + np.exp(-10 * p)) - 1
-
-        # Forward pass với MI loss
-        mixed_z, mu, logvar, attention_weights, domain_pred, ot_loss, mi_loss = self.encoder(
-            all_x, domain_labels, alpha=grl_weight
+        domain_labels = torch.cat(
+            [
+                torch.full((x.shape[0],), i, device=all_x.device)
+                for i, (x, y) in enumerate(minibatches)
+            ]
         )
 
-        # Decode
-        recon_x = self.decoder(mixed_z)
+        # Curriculum learning progress
+        p = self.current_epoch / self.total_steps
+        mix_ratio = min(self.mix_ratio * (2. / (1. + np.exp(-10 * p))), 1.0)
 
-        if self.current_epoch % 100 == 0:
-            save_images(all_x, recon_x, self.current_epoch)
+        # Dynamic loss weights
+        domain_weight = self.grl_weight * (2. / (1. + np.exp(-10 * p)))
+        ot_weight = self.ot_weight * p
+        mi_weight = self.mi_weight * p
 
-        # Các losses hiện tại
-        vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
-        class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-        domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
+        # Forward pass
+        with torch.amp.autocast('cuda'):
+            mixed_z, mu, logvar, domain_pred, ot_loss, mi_loss = \
+                self.encoder(all_x, domain_labels, alpha=mix_ratio)
 
-        # Thêm MI loss vào total loss
-        total_loss = (
-            class_loss +
-            vae_loss +
-            self.grl_weight * domain_loss +
-            self.ot_weight * ot_loss +
-            self.mi_weight * mi_loss
-        )
+            recon_x = self.decoder(mixed_z)
+
+            if self.current_epoch % 100 == 0:
+                save_images(all_x, recon_x, self.current_epoch)
+
+            # Compute losses
+            vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
+            class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
+            domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
+
+            # Combined loss với dynamic weighting
+            total_loss = (
+                class_loss +
+                vae_loss +
+                domain_weight * domain_loss +
+                ot_weight * ot_loss +
+                mi_weight * mi_loss
+            )
 
         self.optimizer.zero_grad()
-        total_loss.backward()
+        self.grad_scaler.scale(total_loss).backward()
 
         # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.grad_clip)
-        torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), self.grad_clip)
-        torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), self.grad_clip)
+        self.grad_scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
 
-        self.optimizer.step()
+        # Optimizer step with gradient scaling
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
         self.scheduler.step()
         self.current_epoch += 1
 
@@ -900,11 +854,13 @@ class CYCLEMIX(Algorithm):
             "class_loss": class_loss.item(),
             "domain_loss": domain_loss.item(),
             "ot_loss": ot_loss.item(),
-            "mi_loss": mi_loss.item()
+            "mi_loss": mi_loss.item(),
+            "mix_ratio_loss": mix_ratio,
+            "temperature_loss": self.encoder.temperature.item()
         }
 
     def predict(self, x):
-        mixed_z, _, _, _, _, _, _ = self.encoder(x)
+        mixed_z, _, _, _, _, _ = self.encoder(x)
         return self.classifier(mixed_z)
 
 
