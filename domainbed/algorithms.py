@@ -267,6 +267,13 @@ class GRL(nn.Module):
     def forward(self, x):
         return GradientReversal.apply(x, self.alpha)
 
+class DomainSpecificBatchNorm(nn.Module):
+    def __init__(self, num_features, num_domains):
+        super().__init__()
+        self.bns = nn.ModuleList([nn.BatchNorm1d(num_features) for _ in range(num_domains)])
+    def forward(self, x, domain_idx):
+        return self.bns[domain_idx](x)
+
 class DomainDiscriminator(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
         super(DomainDiscriminator, self).__init__()
@@ -357,11 +364,14 @@ class MultiDomainVAEEncoder(nn.Module):
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
 
+        self.domain_bn = DomainSpecificBatchNorm(latent_dim, num_domains)
+
         # Domain attention mechanism
         self.domain_attention = nn.Sequential(
-            nn.Linear(latent_dim, 256),
+            nn.Conv1d(latent_dim, 256, kernel_size=1),
             nn.ReLU(),
-            nn.Linear(256, num_domains),
+            nn.Conv1d(256, num_domains, kernel_size=1),
+            nn.Flatten(),
             nn.Softmax(dim=1),
         )
 
@@ -373,10 +383,10 @@ class MultiDomainVAEEncoder(nn.Module):
 
         # Enhanced mixing network with domain-invariant features
         self.mixing_network = nn.Sequential(
-            nn.Linear(latent_dim * (num_domains + 1), 512),
+            nn.Conv1d(latent_dim * (num_domains + 1), 512, kernel_size=1),
             nn.ReLU(),
             nn.BatchNorm1d(512),  # Added BatchNorm for better stability
-            nn.Linear(512, latent_dim),
+            nn.Conv1d(512, latent_dim, kernel_size=1),
         )
 
     def forward(self, x, domain_idx=None, alpha=1.0):
@@ -386,8 +396,9 @@ class MultiDomainVAEEncoder(nn.Module):
         all_mus = []
         all_logvars = []
 
-        for encoder in self.domain_encoders:
+        for i, encoder in enumerate(self.domain_encoders):
             mu, logvar = encoder(x)
+            mu = self.domain_bn(mu, i)
             all_mus.append(mu)
             all_logvars.append(logvar)
 
@@ -506,6 +517,15 @@ class CYCLEMIX(Algorithm):
             num_domains=num_domains
         )
 
+        steps_per_epoch = hparams["steps_per_epoch"]
+        num_epochs = hparams["num_epochs"]
+        total_steps = int(steps_per_epoch * num_epochs)
+        print(f"Total steps: {total_steps}")
+        print(f'steps_per_epoch: {steps_per_epoch}')
+        print(f'num_epochs: {num_epochs}')
+
+        self.grad_clip = hparams.get("grad_clip", 1.0)
+
         # Decoder remains the same
         self.decoder = VAEDecoder(
             latent_dim=self.latent_dim,
@@ -520,9 +540,17 @@ class CYCLEMIX(Algorithm):
         )
 
         self.classifier = nn.Sequential(
-            nn.Linear(self.latent_dim, 256),
+            # Reshape input to match Conv1d dimensions
+            nn.Unflatten(1, (self.latent_dim, 1)),
+            nn.Conv1d(self.latent_dim, 512, kernel_size=1),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Linear(256, num_classes)
+            nn.Conv1d(512, 256, kernel_size=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Conv1d(256, num_classes, kernel_size=1),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
         )
 
         # Optimizer with all components
@@ -535,14 +563,28 @@ class CYCLEMIX(Algorithm):
             weight_decay=hparams["weight_decay"]
         )
 
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=hparams["lr"] * 19,
+            total_steps=total_steps,
+        )
+
         self.current_epoch = 0
 
     def compute_domain_adversarial_loss(self, domain_pred, domain_labels):
         """Compute adversarial loss for domain prediction"""
-        return F.binary_cross_entropy_with_logits(
-            domain_pred.squeeze(),
-            domain_labels.float()
-        )
+        domain_pred = domain_pred.squeeze()
+        domain_labels = domain_labels.float()  # Ensure domain_labels is of floating point type
+
+        # Cross entropy loss for domain classification
+        domain_cls_loss = F.cross_entropy(domain_pred, domain_labels)
+
+        # Domain confusion loss
+        uniform_dist = torch.ones_like(domain_pred) / domain_pred.size(0)
+        confusion_loss = -torch.mean(torch.sum(F.softmax(
+            domain_pred, dim=0) * torch.log(uniform_dist), dim=0))
+
+        return domain_cls_loss + 0.1 * confusion_loss
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
         """Compute VAE loss with KL divergence"""
@@ -598,7 +640,13 @@ class CYCLEMIX(Algorithm):
 
         self.optimizer.zero_grad()
         total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.grad_clip)
+        torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), self.grad_clip)
+        torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), self.grad_clip)
+
         self.optimizer.step()
+        self.scheduler.step()
         self.current_epoch += 1
 
         return {
@@ -606,7 +654,7 @@ class CYCLEMIX(Algorithm):
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
             "domain_loss": domain_loss.item(),
-            "attention_diversity": attention_diversity.item()
+            "attention_diversity_loss": attention_diversity.item()
         }
 
     def predict(self, x):
