@@ -608,163 +608,256 @@ class VAEDecoder(nn.Module):
         x = self.decoder(x)
         return x
 
+class StyleContentEncoder(nn.Module):
+    """Enhanced encoder with style-content disentanglement"""
+    def __init__(self, input_shape, content_dim=256, style_dim=256):
+        super().__init__()
+
+        # Shared encoder backbone
+        self.backbone = torchvision.models.resnet50(
+            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
+        )
+        self.backbone.fc = nn.Identity()
+        backbone_dim = 2048
+
+        # Content branch
+        self.content_net = nn.Sequential(
+            nn.Linear(backbone_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Linear(512, content_dim * 2)  # For mu and logvar
+        )
+
+        # Style branch
+        self.style_net = nn.Sequential(
+            nn.Linear(backbone_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Linear(512, style_dim * 2)  # For mu and logvar
+        )
+
+        # Style classifier for domain prediction
+        self.style_classifier = nn.Sequential(
+            nn.Linear(style_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)  # Binary domain prediction
+        )
+
+    def encode_content(self, x):
+        features = self.backbone(x)
+        content = self.content_net(features)
+        mu_c = content[:, :content.shape[1]//2]
+        logvar_c = content[:, content.shape[1]//2:]
+        return mu_c, logvar_c
+
+    def encode_style(self, x):
+        features = self.backbone(x)
+        style = self.style_net(features)
+        mu_s = style[:, :style.shape[1]//2]
+        logvar_s = style[:, style.shape[1]//2:]
+        return mu_s, logvar_s
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x):
+        # Encode content
+        mu_c, logvar_c = self.encode_content(x)
+        z_c = self.reparameterize(mu_c, logvar_c)
+
+        # Encode style
+        mu_s, logvar_s = self.encode_style(x)
+        z_s = self.reparameterize(mu_s, logvar_s)
+
+        # Domain prediction from style
+        domain_pred = self.style_classifier(z_s)
+
+        return z_c, z_s, mu_c, logvar_c, mu_s, logvar_s, domain_pred
+
+class EnhancedVAEDecoder(nn.Module):
+    """Enhanced decoder that combines content and style"""
+    def __init__(self, content_dim, style_dim, output_shape, h_dim, w_dim):
+        super().__init__()
+
+        self.content_dim = content_dim
+        self.style_dim = style_dim
+        self.output_shape = output_shape
+
+        combined_dim = content_dim + style_dim
+        self.h_dim = h_dim
+        self.w_dim = w_dim
+        self.start_channels = 512
+
+        # AdaIN layers for style injection
+        self.adain1 = AdaptiveInstanceNorm(512)
+        self.adain2 = AdaptiveInstanceNorm(256)
+        self.adain3 = AdaptiveInstanceNorm(128)
+
+        # Project and reshape
+        self.fc = nn.Linear(combined_dim, self.start_channels * h_dim * w_dim)
+
+        # Decoder with style injection
+        self.decoder = nn.ModuleList([
+            nn.ConvTranspose2d(self.start_channels, 256, 4, 2, 1),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),
+            nn.ConvTranspose2d(64, output_shape[0], 4, 2, 1)
+        ])
+
+        # Style MLP
+        self.style_mlp = nn.Sequential(
+            nn.Linear(style_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512 * 2)  # For scale and bias
+        )
+
+    def forward(self, z_content, z_style):
+        # Combine content and style
+        z = torch.cat([z_content, z_style], dim=1)
+
+        # Initial projection
+        x = self.fc(z)
+        x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
+
+        # Get style parameters
+        style_params = self.style_mlp(z_style)
+
+        # Decode with style injection
+        # First conv+adain block
+        x = self.decoder[0](x)  # 512 -> 256 channels
+        style_1 = style_params[:, :512]  # First 512 params for first AdaIN
+        x = self.adain1(x, style_1)
+        x = F.relu(x)
+
+        # Second conv+adain block
+        x = self.decoder[1](x)  # 256 -> 128 channels
+        style_2 = style_params[:, 512:768]  # Next 256 params for second AdaIN
+        x = self.adain2(x, style_2)
+        x = F.relu(x)
+
+        # Third conv+adain block
+        x = self.decoder[2](x)  # 128 -> 64 channels
+        style_3 = style_params[:, 768:896]  # Next 128 params for third AdaIN
+        x = self.adain3(x, style_3)
+        x = F.relu(x)
+
+        # Final conv to output channels
+        x = self.decoder[3](x)
+        x = torch.tanh(x)
+
+        return x
+
+class AdaptiveInstanceNorm(nn.Module):
+    """Adaptive Instance Normalization layer"""
+    def __init__(self, num_features):
+        super().__init__()
+        self.norm = nn.InstanceNorm2d(num_features, affine=False)
+
+    def forward(self, x, style_params):
+        # Split style params into scale and bias
+        scale = style_params[:, :style_params.shape[1]//2].unsqueeze(-1).unsqueeze(-1)
+        bias = style_params[:, style_params.shape[1]//2:].unsqueeze(-1).unsqueeze(-1)
+
+        normalized = self.norm(x)
+        return normalized * scale + bias
+
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
 
-        self.input_shape = input_shape
-        self.latent_dim = hparams.get("latent_dim", 512)
-        self.beta = hparams.get("beta", 4.0)
-        self.mix_ratio = hparams.get("mix_ratio", 0.5)
-        self.grl_weight = hparams.get("grl_weight", 1.0)
-        self.ot_weight = hparams.get("ot_weight", 0.1)
+        self.content_dim = hparams.get("content_dim", 256)
+        self.style_dim = hparams.get("style_dim", 256)
+        self.lambda_content = hparams.get("lambda_content", 1.0)
+        self.lambda_style = hparams.get("lambda_style", 1.0)
+        self.lambda_cycle = hparams.get("lambda_cycle", 1.0)
 
-        # Spatial dimensions
-        self.h_dim = input_shape[1] // 16
-        self.w_dim = input_shape[2] // 16
-
-        # Modified VAE Components
-        self.encoder = MultiDomainVAEEncoder(
+        # Enhanced encoder and decoder
+        self.encoder = StyleContentEncoder(
             input_shape=input_shape,
-            latent_dim=self.latent_dim,
-            num_domains=num_domains
+            content_dim=self.content_dim,
+            style_dim=self.style_dim
         )
 
-        steps_per_epoch = hparams["steps_per_epoch"]
-        num_epochs = hparams["num_epochs"]
-        total_steps = int(steps_per_epoch * num_epochs)
-        print(f"Total steps: {total_steps}")
-        print(f'steps_per_epoch: {steps_per_epoch}')
-        print(f'num_epochs: {num_epochs}')
-
-        self.grad_clip = hparams.get("grad_clip", 1.0)
-
-        # Decoder remains the same
-        self.decoder = VAEDecoder(
-            latent_dim=self.latent_dim,
+        self.decoder = EnhancedVAEDecoder(
+            content_dim=self.content_dim,
+            style_dim=self.style_dim,
             output_shape=input_shape,
-            h_dim=self.h_dim,
-            w_dim=self.w_dim
+            h_dim=input_shape[1] // 16,
+            w_dim=input_shape[2] // 16
         )
 
-        # Domain embeddings and classifier remain the same
-        self.domain_embeddings = nn.Parameter(
-            torch.randn(num_domains, self.latent_dim)
-        )
-
+        # Classifier remains unchanged
         self.classifier = nn.Sequential(
-            # Reshape input to match Conv1d dimensions
-            nn.Unflatten(1, (self.latent_dim, 1)),
-            nn.Conv1d(self.latent_dim, 512, kernel_size=1),
-            nn.BatchNorm1d(512),
+            nn.Linear(self.content_dim + self.style_dim, 512),
             nn.ReLU(),
-            nn.Conv1d(512, 256, kernel_size=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Conv1d(256, num_classes, kernel_size=1),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
+            nn.Linear(512, num_classes)
         )
 
-        # Optimizer with all components
+        # Optimizer setup
         self.optimizer = torch.optim.Adam(
             list(self.encoder.parameters()) +
             list(self.decoder.parameters()) +
-            list(self.classifier.parameters()) +
-            [self.domain_embeddings],
+            list(self.classifier.parameters()),
             lr=hparams["lr"],
             weight_decay=hparams["weight_decay"]
         )
 
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=hparams["lr"] * 10,
-            total_steps=total_steps,
-            pct_start=0.15, # warm-up reduces
-            div_factor=25,
-            three_phase=False,
-            final_div_factor=1e4,
-            base_momentum=0.85,
-        )
+    def compute_content_consistency_loss(self, z_c1, z_c2):
+        """Content consistency loss between two content encodings"""
+        return F.mse_loss(z_c1, z_c2)
 
-        self.current_epoch = 0
+    def compute_style_diversity_loss(self, z_s1, z_s2, same_domain):
+        """Style diversity loss to encourage different styles across domains"""
+        if same_domain:
+            return F.mse_loss(z_s1, z_s2)  # Similar styles for same domain
+        return -F.mse_loss(z_s1, z_s2)  # Different styles for different domains
 
-    def compute_domain_adversarial_loss(self, domain_pred, domain_labels):
-        return F.binary_cross_entropy_with_logits(
-            domain_pred.squeeze(), domain_labels.float()
-        )
-
-    def compute_vae_loss(self, x, recon_x, mu, logvar):
-        """Compute VAE loss with KL divergence"""
-        # Reconstruction loss (pixel-wise MSE)
-        recon_loss = F.mse_loss(recon_x, x)
-
-        # KL divergence
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-        return recon_loss + self.beta * kl_loss
+    def compute_cycle_consistency_loss(self, x, z_c, z_s):
+        """Cycle consistency loss for style transfer"""
+        # Reconstruct with original content and style
+        recon = self.decoder(z_c, z_s)
+        return F.mse_loss(x, recon)
 
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
-        domain_labels = torch.cat([
-            torch.full((x.shape[0],), i, device=all_x.device)
-            for i, (x, y) in enumerate(minibatches)
-        ])
+        # Get encodings
+        z_c, z_s, mu_c, logvar_c, mu_s, logvar_s, domain_pred = self.encoder(all_x)
 
-        # Calculate dynamic GRL weight
-        p = float(self.current_epoch) / 100
-        grl_weight = 2. / (1. + np.exp(-10 * p)) - 1
+        # Reconstruction
+        recon_x = self.decoder(z_c, z_s)
 
-        # Get outputs including OT loss
-        mixed_z, mu, logvar, attention_weights, domain_pred, ot_loss = self.encoder(
-            all_x, domain_labels, alpha=grl_weight
+        # Get the minimum batch size to ensure equal tensor sizes
+        min_batch_size = min(len(minibatches[0][0]), len(z_c) - len(minibatches[0][0]))
+        content_loss = self.compute_content_consistency_loss(
+            z_c[:min_batch_size],
+            z_c[len(minibatches[0][0]):len(minibatches[0][0])+min_batch_size]
         )
 
-        # Decode
-        recon_x = self.decoder(mixed_z)
+        # Style diversity loss
+        style_loss = self.compute_style_diversity_loss(
+            z_s[:len(minibatches[0][0])],
+            z_s[len(minibatches[0][0]):],
+            same_domain=False
+        )
 
-        # Original losses remain unchanged
-        vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
-        class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-        domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
-        attention_diversity = -(attention_weights.mean(dim=0) *
-                              torch.log(attention_weights.mean(dim=0) + 1e-6)).sum()
+        # Cycle consistency loss
+        cycle_loss = self.compute_cycle_consistency_loss(all_x, z_c, z_s)
 
-        # Add OT loss to total loss
+        # Classification loss
+        class_pred = self.classifier(torch.cat([z_c, z_s], dim=1))
+        class_loss = F.cross_entropy(class_pred, all_y)
+
+        # Total loss
         total_loss = (
-            vae_loss +
             class_loss +
-            self.grl_weight * domain_loss +
-            self.ot_weight * ot_loss
+            self.lambda_content * content_loss +
+            self.lambda_style * style_loss +
+            self.lambda_cycle * cycle_loss
         )
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.grad_clip)
-        torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), self.grad_clip)
-        torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), self.grad_clip)
-
-        self.optimizer.step()
-        self.scheduler.step()
-        self.current_epoch += 1
-
-        return {
-            "loss": total_loss.item(),
-            "vae_loss": vae_loss.item(),
-            "class_loss": class_loss.item(),
-            "domain_loss": domain_loss.item(),
-            "attention_diversity_loss": attention_diversity.item(),
-            "ot_loss": ot_loss.item()
-        }
-
-    def predict(self, x):
-        mixed_z, _, _, _, _, _ = self.encoder(x)
-        return self.classifier(mixed_z)
-
 
 class Fish(Algorithm):
     """
