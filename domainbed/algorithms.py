@@ -920,26 +920,26 @@ class CYCLEMIX(Algorithm):
         ])
 
         # Forward pass
-        mixed_z, mu, logvar, attention_weights, cross_attention_weights, domain_pred = (
-            self.encoder(all_x, domain_labels)
-        )
+        # mixed_z, mu, logvar, attention_weights, cross_attention_weights, domain_pred = (
+        #     self.encoder(all_x, domain_labels)
+        # )
 
         # Compute losses
-        vae_loss = self.compute_vae_loss(all_x, self.decoder(mixed_z), mu, logvar)
-        class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-        cross_attention_loss = self.compute_cross_attention_loss(cross_attention_weights)
+        # vae_loss = self.compute_vae_loss(all_x, self.decoder(mixed_z), mu, logvar)
+        # class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
+        # cross_attention_loss = self.compute_cross_attention_loss(cross_attention_weights)
 
         # First pass: Optimize cross-attention
-        self.cross_attention_optimizer.zero_grad()
-        cross_attention_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.encoder.cross_attention.parameters(),
-            self.grad_clip
-        )
-        self.cross_attention_optimizer.step()
+        # self.cross_attention_optimizer.zero_grad()
+        # cross_attention_loss.backward()
+        # torch.nn.utils.clip_grad_norm_(
+        #     self.encoder.cross_attention.parameters(),
+        #     self.grad_clip
+        # )
+        # self.cross_attention_optimizer.step()
 
         # Update learning rate
-        self.scheduler.step()
+        # self.scheduler.step()
 
         # Second pass: Compute new forward pass for main optimization
         self.encoder_optimizer.zero_grad()
@@ -962,13 +962,14 @@ class CYCLEMIX(Algorithm):
         domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
 
         # Dynamic loss weighting
-        loss_weights = self.compute_dynamic_loss_weights(
-            vae_loss, class_loss, domain_loss)
+        # loss_weights = self.compute_dynamic_loss_weights(
+        #     vae_loss, class_loss, domain_loss)
 
         total_loss = (
-            loss_weights['vae'] * vae_loss +
-            loss_weights['class'] * class_loss +
-            loss_weights['domain'] * domain_loss
+            # loss_weights['vae'] * vae_loss +
+            # loss_weights['class'] * class_loss +
+            # loss_weights['domain'] * domain_loss
+            class_loss + 0.1 * domain_loss
         )
 
         # Main optimization
@@ -992,7 +993,7 @@ class CYCLEMIX(Algorithm):
             "loss": total_loss.item(),
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
-            "cross_attention_loss": cross_attention_loss.item(),
+            # "cross_attention_loss": cross_attention_loss.item(),
             "attention_weights_loss": attention_weights.mean().item(),
             "domain_loss": domain_loss.item()
         }
