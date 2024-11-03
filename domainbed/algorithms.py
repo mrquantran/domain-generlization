@@ -590,7 +590,7 @@ class CYCLEMIX(Algorithm):
 
         # Total loss with GRL component
         total_loss = (
-            vae_loss +
+            # vae_loss +
             class_loss +
             self.grl_weight * domain_loss +
             0.1 * attention_diversity
