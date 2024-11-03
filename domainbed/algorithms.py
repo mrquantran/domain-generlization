@@ -288,17 +288,82 @@ class DomainDiscriminator(nn.Module):
     def forward(self, x):
         return self.network(x)
 
+# class VAEEncoder(nn.Module):
+#     """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+#     def __init__(self, input_shape, latent_dim):
+#         super(VAEEncoder, self).__init__()
+
+#         # MoCo v2 checkpoint URL
+#         self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+
+#         self.backbone = torchvision.models.resnet50(pretrained=False)
+#         backbone_dim = 2048
+#         self._load_moco_weights()
+
+#         # Handle input channels
+#         nc = input_shape[0]
+#         if nc != 3:
+#             tmp = self.backbone.conv1.weight.data.clone()
+#             self.backbone.conv1 = nn.Conv2d(
+#                 nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+#             )
+#             for i in range(nc):
+#                 self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+#         # Remove FC layer
+#         self.backbone.fc = Identity()
+
+#         # VAE heads
+#         self.fc_mu = nn.Linear(backbone_dim, latent_dim)
+#         self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
+
+#         self._freeze_bn()
+
+#     def _load_moco_weights(self):
+#         """Load MoCo v2 pretrained weights"""
+#         try:
+#             checkpoint = load_url(self.moco_v2_path, progress=True)
+#             state_dict = checkpoint["state_dict"]
+#             new_state_dict = {}
+
+#             for k in list(state_dict.keys()):
+#                 if k.startswith("module.encoder_q."):
+#                     new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+
+#             msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+#             print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
+
+#         except Exception as e:
+#             print(f"Error loading MoCo v2 weights: {str(e)}")
+#             print("Falling back to random initialization")
+
+#     def _freeze_bn(self):
+#         """Freeze BatchNorm layers"""
+#         for m in self.backbone.modules():
+#             if isinstance(m, nn.BatchNorm2d):
+#                 m.eval()
+
+#     def forward(self, x):
+#         features = self.backbone(x)
+#         return self.fc_mu(features), self.fc_logvar(features)
+
+#     def train(self, mode=True):
+#         """Override train mode to keep BN frozen"""
+#         super().train(mode)
+#         self._freeze_bn()
+
+
 class VAEEncoder(nn.Module):
-    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+    """VAE Encoder using ResNet50 with ImageNet pretraining"""
+
     def __init__(self, input_shape, latent_dim):
         super(VAEEncoder, self).__init__()
 
-        # MoCo v2 checkpoint URL
-        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
-
-        self.backbone = torchvision.models.resnet50(pretrained=False)
+        # Load pretrained ResNet50
+        self.backbone = torchvision.models.resnet50(
+            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
+        )
         backbone_dim = 2048
-        self._load_moco_weights()
 
         # Handle input channels
         nc = input_shape[0]
@@ -319,24 +384,6 @@ class VAEEncoder(nn.Module):
 
         self._freeze_bn()
 
-    def _load_moco_weights(self):
-        """Load MoCo v2 pretrained weights"""
-        try:
-            checkpoint = load_url(self.moco_v2_path, progress=True)
-            state_dict = checkpoint["state_dict"]
-            new_state_dict = {}
-
-            for k in list(state_dict.keys()):
-                if k.startswith("module.encoder_q."):
-                    new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
-
-            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
-
-        except Exception as e:
-            print(f"Error loading MoCo v2 weights: {str(e)}")
-            print("Falling back to random initialization")
-
     def _freeze_bn(self):
         """Freeze BatchNorm layers"""
         for m in self.backbone.modules():
@@ -351,6 +398,7 @@ class VAEEncoder(nn.Module):
         """Override train mode to keep BN frozen"""
         super().train(mode)
         self._freeze_bn()
+        return self
 
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
@@ -368,10 +416,14 @@ class MultiDomainVAEEncoder(nn.Module):
 
         # Domain attention mechanism
         self.domain_attention = nn.Sequential(
-            nn.Conv1d(latent_dim, 256, kernel_size=1),
+            nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
             nn.ReLU(),
-            nn.Conv1d(256, num_domains, kernel_size=1),
-            nn.Flatten(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.ReLU(),
+            nn.Linear(256, num_domains),
             nn.Softmax(dim=1),
         )
 
@@ -383,10 +435,14 @@ class MultiDomainVAEEncoder(nn.Module):
 
         # Enhanced mixing network with domain-invariant features
         self.mixing_network = nn.Sequential(
-            nn.Conv1d(latent_dim * (num_domains + 1), 512, kernel_size=1),
+            nn.Linear(latent_dim * (num_domains + 1), 1024),
             nn.ReLU(),
-            nn.BatchNorm1d(512),  # Added BatchNorm for better stability
-            nn.Conv1d(512, latent_dim, kernel_size=1),
+            nn.Dropout(0.1),
+            nn.BatchNorm1d(1024),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Linear(512, latent_dim),
         )
 
     def forward(self, x, domain_idx=None, alpha=1.0):
@@ -565,26 +621,21 @@ class CYCLEMIX(Algorithm):
 
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=hparams["lr"] * 19,
+            max_lr=hparams["lr"] * 10,
             total_steps=total_steps,
+            pct_start=0.15, # warm-up reduces
+            div_factor=25,
+            three_phase=False,
+            final_div_factor=1e4,
+            base_momentum=0.85,
         )
 
         self.current_epoch = 0
 
     def compute_domain_adversarial_loss(self, domain_pred, domain_labels):
-        """Compute adversarial loss for domain prediction"""
-        domain_pred = domain_pred.squeeze()
-        domain_labels = domain_labels.float()  # Ensure domain_labels is of floating point type
-
-        # Cross entropy loss for domain classification
-        domain_cls_loss = F.cross_entropy(domain_pred, domain_labels)
-
-        # Domain confusion loss
-        uniform_dist = torch.ones_like(domain_pred) / domain_pred.size(0)
-        confusion_loss = -torch.mean(torch.sum(F.softmax(
-            domain_pred, dim=0) * torch.log(uniform_dist), dim=0))
-
-        return domain_cls_loss + 0.1 * confusion_loss
+        return F.binary_cross_entropy_with_logits(
+            domain_pred.squeeze(), domain_labels.float()
+        )
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
         """Compute VAE loss with KL divergence"""
