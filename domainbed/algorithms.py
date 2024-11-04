@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import datetime
 from sklearn.metrics import silhouette_score
 import torch
 import torch.amp
@@ -14,7 +15,16 @@ import numpy as np
 from collections import OrderedDict
 import os
 from torch.utils.model_zoo import load_url
+import torch.distributed as dist
+
+if dist.is_available() and not dist.is_initialized():
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        dist.init_process_group(backend='nccl')
+    else:
+        print("Distributed training environment variables are not set. Skipping initialization.")
+
 import ot
+import torch.distributed as dist
 
 try:
     from backpack import backpack, extend  # type: ignore
@@ -32,6 +42,36 @@ from domainbed.lib.misc import (
     proj,
     Nonparametric,
 )
+
+# Initialize distributed environment
+def initialize_distributed():
+    if dist.is_available():
+        # Check if environment variables are set
+        if ('RANK' in os.environ and 'WORLD_SIZE' in os.environ and
+            'LOCAL_RANK' in os.environ and 'LOCAL_WORLD_SIZE' in os.environ):
+
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                timeout=datetime.timedelta(seconds=300)
+            )
+
+            # Set cuda device for local rank
+            torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+
+            print(f"Initialized distributed training with:"
+                    f"\nRank: {dist.get_rank()}"
+                    f"\nWorld Size: {dist.get_world_size()}")
+
+            return True
+
+    return False
+
+initialized = initialize_distributed()
+
+# Default to non-distributed if initialization fails
+if not initialized:
+    print("Running in non-distributed mode")
 
 ALGORITHMS = [
     "ERM",
@@ -209,13 +249,16 @@ class CUTMIX(Algorithm):
     def predict(self, x):
         return self.network(x)
 
+
 class Identity(nn.Module):
     """Identity layer"""
+
     def __init__(self):
         super(Identity, self).__init__()
 
     def forward(self, x):
         return x
+
 
 def save_images(x, x_generated, current_epoch):
     """
@@ -245,69 +288,6 @@ def save_images(x, x_generated, current_epoch):
     save_image(images, generated_img_path, nrow=8, normalize=True)
     print(f"Generated images saved to {generated_img_path}")
 
-class VAEEncoder(nn.Module):
-    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
-    def __init__(self, input_shape, latent_dim):
-        super(VAEEncoder, self).__init__()
-
-        # MoCo v2 checkpoint URL
-        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
-
-        self.backbone = torchvision.models.resnet50(pretrained=False)
-        backbone_dim = 2048
-        self._load_moco_weights()
-
-        # Handle input channels
-        nc = input_shape[0]
-        if nc != 3:
-            tmp = self.backbone.conv1.weight.data.clone()
-            self.backbone.conv1 = nn.Conv2d(
-                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
-            )
-            for i in range(nc):
-                self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
-
-        # Remove FC layer
-        self.backbone.fc = Identity()
-
-        # VAE heads
-        self.fc_mu = nn.Linear(backbone_dim, latent_dim)
-        self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
-
-        self._freeze_bn()
-
-    def _load_moco_weights(self):
-        """Load MoCo v2 pretrained weights"""
-        try:
-            checkpoint = load_url(self.moco_v2_path, progress=True)
-            state_dict = checkpoint["state_dict"]
-            new_state_dict = {}
-
-            for k in list(state_dict.keys()):
-                if k.startswith("module.encoder_q."):
-                    new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
-
-            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
-
-        except Exception as e:
-            print(f"Error loading MoCo v2 weights: {str(e)}")
-            print("Falling back to random initialization")
-
-    def _freeze_bn(self):
-        """Freeze BatchNorm layers"""
-        for m in self.backbone.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-    def forward(self, x):
-        features = self.backbone(x)
-        return self.fc_mu(features), self.fc_logvar(features)
-
-    def train(self, mode=True):
-        """Override train mode to keep BN frozen"""
-        super().train(mode)
-        self._freeze_bn()
 
 # class VAEEncoder(nn.Module):
 #     """VAE Encoder using ResNet50 with ImageNet pretraining"""
@@ -356,12 +336,154 @@ class VAEEncoder(nn.Module):
 #         self._freeze_bn()
 #         return self
 
+
+class VAEEncoder(nn.Module):
+    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+
+    def __init__(self, input_shape, latent_dim):
+        super(VAEEncoder, self).__init__()
+
+        # MoCo v2 checkpoint URL
+        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+
+        self.backbone = torchvision.models.resnet50(pretrained=False)
+        backbone_dim = 2048
+        self._load_moco_weights()
+
+        # Handle input channels
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.backbone.conv1.weight.data.clone()
+            self.backbone.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+            )
+            for i in range(nc):
+                self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # Remove FC layer
+        self.backbone.fc = Identity()
+
+        # VAE heads
+        self.fc_mu = nn.Linear(backbone_dim, latent_dim)
+        self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
+
+        self._freeze_bn()
+
+    def _load_moco_weights(self):
+        """Load MoCo v2 pretrained weights"""
+        try:
+            checkpoint = load_url(self.moco_v2_path, progress=True)
+            state_dict = checkpoint["state_dict"]
+            new_state_dict = {}
+
+            for k in list(state_dict.keys()):
+                if k.startswith("module.encoder_q."):
+                    new_state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
+
+            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
+
+        except Exception as e:
+            print(f"Error loading MoCo v2 weights: {str(e)}")
+            print("Falling back to random initialization")
+
+    def _freeze_bn(self):
+        """Freeze BatchNorm layers"""
+        for m in self.backbone.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.fc_mu(features), self.fc_logvar(features)
+
+    def train(self, mode=True):
+        """Override train mode to keep BN frozen"""
+        super().train(mode)
+        self._freeze_bn()
+
+
+class MoCoProjector(nn.Module):
+    """
+    MoCo-style projector network theo đúng bài báo
+    https://arxiv.org/abs/2003.04297
+    """
+
+    def __init__(self, input_dim, proj_dim=128, hidden_dim=2048):
+        super().__init__()
+        self.projector = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+
+        self.temperature = 0.07
+
+        # Initialize the MoCo queue
+        self.register_buffer("queue", torch.randn(proj_dim, 4096))  # K=4096 from MoCo
+        self.queue = F.normalize(self.queue, dim=0)
+        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+    def forward(self, x):
+        z = self.projector(x)
+        z = F.normalize(z, dim=1)
+        return z / self.temperature
+
+
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Learning implementation
+    Following https://arxiv.org/abs/2004.11362
+    """
+    def __init__(self, temperature=0.07, contrast_mode='all',
+                 base_temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        """
+        features: [N, D] normalized features
+        labels: [N] ground truth labels
+        """
+        device = features.device
+        batch_size = features.shape[0]
+
+        # Compute similarity matrix
+        features = F.normalize(features, dim=1)
+        similarity_matrix = torch.matmul(features, features.T)
+
+        # Mask for positive pairs
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(device)
+
+        # Remove self-contrast cases
+        # Create diagonal mask to remove self-contrast cases
+        logits_mask = torch.ones_like(mask)
+        logits_mask.fill_diagonal_(0)
+        mask = mask * logits_mask
+
+        # Compute log_prob
+        exp_logits = torch.exp(similarity_matrix / self.temperature)
+        # log_prob = similarity_matrix / self - torch.log(exp_logits.sum(1, keepdim=True))
+        log_prob = similarity_matrix / self.temperature - torch.log(exp_logits.sum(1, keepdim=True))
+        # Mean log-likelihood for positive pairs
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        return -mean_log_prob_pos.mean()
+
 class GradientReversal(torch.autograd.Function):
     """
     Gradient Reversal Layer từ:
     Ganin et al., Domain-Adversarial Training of Neural Networks (2015)
     https://arxiv.org/abs/1505.07818
     """
+
     @staticmethod
     def forward(ctx, x, alpha):
         ctx.alpha = alpha
@@ -372,6 +494,7 @@ class GradientReversal(torch.autograd.Function):
         output = grad_output.neg() * ctx.alpha
         return output, None
 
+
 class GRL(nn.Module):
     def __init__(self, alpha=1.0):
         super(GRL, self).__init__()
@@ -380,8 +503,10 @@ class GRL(nn.Module):
     def forward(self, x):
         return GradientReversal.apply(x, self.alpha)
 
+
 class AdaptiveDomainNorm(nn.Module):
     """Enhanced normalization with batch statistics and domain-specific parameters"""
+
     def __init__(self, num_features, num_domains, eps=1e-5, momentum=0.1):
         super().__init__()
         self.num_features = num_features
@@ -453,6 +578,7 @@ class AdaptiveDomainNorm(nn.Module):
             out += gates[i] * (self.scale[i] * domain_norm + self.bias[i])
         return out
 
+
 class DomainDiscriminator(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
         super(DomainDiscriminator, self).__init__()
@@ -461,17 +587,19 @@ class DomainDiscriminator(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Linear(hidden_dim // 2, 1),
         )
 
     def forward(self, x):
         return self.network(x)
+
 
 class OTLoss(nn.Module):
     """
     Optimal Transport Loss for additional domain alignment
     Complementary to existing GRL-based domain adversarial training
     """
+
     def __init__(self, reg_e=0.1):
         super().__init__()
         self.reg_e = reg_e
@@ -498,6 +626,119 @@ class OTLoss(nn.Module):
         # Calculate transport cost
         cost = torch.mean(pi * torch.cdist(source_features, target_features))
         return cost
+
+class FeatureExtractor(nn.Module):
+    def __init__(self, latent_dim, num_domains):
+        super().__init__()
+        self.shared_encoder = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.BatchNorm1d(latent_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(latent_dim, latent_dim//2)
+        )
+
+        self.private_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.BatchNorm1d(latent_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(latent_dim, latent_dim//2)
+            )
+            for _ in range(num_domains)
+        ])
+
+    def orthogonality_loss(self, shared, private):
+        shared = F.normalize(shared, dim=1)
+        private = F.normalize(private, dim=1)
+        return torch.abs(torch.matmul(shared, private.T)).mean()
+
+    def forward(self, x, domain_idx):
+        shared_feat = self.shared_encoder(x)
+        private_feat = self.private_encoders[domain_idx](x)
+
+        orth_loss = self.orthogonality_loss(shared_feat, private_feat)
+        combined_feat = torch.cat([shared_feat, private_feat], dim=1)
+
+        return combined_feat, orth_loss
+
+class PrototypeManager(nn.Module):
+    def __init__(self, dim, num_domains, K=4096, m=0.99, T=0.07):
+        super().__init__()
+        self.K = K
+        self.m = m
+        self.T = T
+
+        # Prototypes
+        self.register_buffer("prototypes", torch.zeros(num_domains, dim))
+
+        # Feature queue cho mỗi domain
+        self.register_buffer("queues", torch.randn(num_domains, dim, K))
+        self.queues = F.normalize(self.queues, dim=1)
+        self.register_buffer("queue_ptrs", torch.zeros(num_domains, dtype=torch.long))
+
+    @torch.no_grad()
+    def concat_all_gathers(self, tensor):
+        """
+        Performs all_gather operation on the provided tensors if in distributed mode,
+        otherwise returns the tensor as is.
+        """
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            if world_size > 1:
+                tensors_gather = [torch.ones_like(tensor) for _ in range(world_size)]
+                dist.all_gather(tensors_gather, tensor)
+                return torch.cat(tensors_gather, dim=0)
+        return tensor
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys, domain_idx):
+        """
+        Update the queue for a given domain.
+        Works in both distributed and non-distributed settings.
+        """
+        try:
+            keys = self.concat_all_gathers(keys)
+        except Exception as e:
+            print(f"Warning: gather failed: {str(e)}, using original keys")
+
+        batch_size = keys.shape[0]
+        ptr = int(self.queue_ptrs[domain_idx])
+
+        if ptr + batch_size > self.K:
+            batch_size = self.K - ptr  # Trim batch to fit remaining space
+            keys = keys[:batch_size]
+
+        # Replace keys
+        self.queues[domain_idx, :, ptr:ptr + batch_size] = keys.T
+        ptr = (ptr + batch_size) % self.K
+        self.queue_ptrs[domain_idx] = ptr
+
+    @torch.no_grad()
+    def update_prototypes(self, features, domain_idx):
+        # Update prototype
+        current_prototype = features.mean(0)
+        self.prototypes[domain_idx] = self.m * self.prototypes[domain_idx] + \
+                                    (1 - self.m) * current_prototype
+
+        # Update queue
+        self._dequeue_and_enqueue(features, domain_idx)
+
+    def get_domain_contrastive_loss(self, query, domain_idx):
+        # Positive: current prototype
+        pos = torch.einsum('nc,nc->n', [query, self.prototypes[domain_idx].unsqueeze(0).expand(query.size(0), -1)])
+
+        # Negative: queue entries
+        neg = torch.einsum('nc,nck->nk', [query, self.queues[domain_idx].permute(1, 0, 2)])
+
+        # Logits
+        logits = torch.cat([pos.unsqueeze(1), neg], dim=1)
+        logits /= self.T
+
+        # Labels: positive key at index 0
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+
+        return F.cross_entropy(logits, labels)
+
 
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
@@ -527,23 +768,39 @@ class MultiDomainVAEEncoder(nn.Module):
         )
         self.grl = GRL(alpha=1.0)
         self.domain_discriminator = DomainDiscriminator(latent_dim)
+
         self.ot_loss = OTLoss(reg_e=0.1)
         self.feature_transform = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim)
+            nn.Linear(latent_dim, latent_dim),
         )
 
+        # Constrative learning
+        self.projector = MoCoProjector(latent_dim)
+        self.supcon_loss = SupConLoss(temperature=0.07)
+
+        # Domain prototypes với momentum encoder
+        self.register_buffer("prototypes", torch.zeros(num_domains, latent_dim))
+        self.register_buffer("prototype_momentum", torch.tensor(0.99))
+
+        # Domain-specific feature extractors (corrected)
+        self.feature_extractor = FeatureExtractor(latent_dim, num_domains)
+        self.prototype_manager = PrototypeManager(latent_dim, num_domains)
+
         # Thêm hierarchical mixing components
-        self.hierarchical_level1 = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(latent_dim * 2, latent_dim),
-                nn.LayerNorm(latent_dim),
-                nn.ReLU(),
-                nn.Linear(latent_dim, latent_dim)
-            ) for _ in range(num_domains)
-        ])
+        self.hierarchical_level1 = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(latent_dim * 2, latent_dim),
+                    nn.LayerNorm(latent_dim),
+                    nn.ReLU(),
+                    nn.Linear(latent_dim, latent_dim),
+                )
+                for _ in range(num_domains)
+            ]
+        )
 
         # MI Estimator cho regularization
         self.mi_estimator = nn.Sequential(
@@ -551,8 +808,34 @@ class MultiDomainVAEEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, 1)
+            nn.Linear(256, 1),
         )
+
+    @torch.no_grad()
+    def _momentum_update_prototypes(self, features, domain_idx):
+        """
+        Update prototypes với exponential moving average như trong MoCo
+        """
+        momentum = self.prototype_momentum
+
+        # Compute current prototype
+        domain_features = features[domain_idx]
+        current_prototype = domain_features.mean(0)
+
+        # Update với momentum
+        self.prototypes[domain_idx] = (
+            momentum * self.prototypes[domain_idx] + (1 - momentum) * current_prototype
+        )
+
+    def compute_contrastive_loss(self, features, domain_labels):
+        """
+        Compute supervised contrastive loss theo đúng công thức SupCon
+        """
+        # Project features
+        proj_features = self.projector(features)
+
+        # Compute SupCon loss
+        return self.supcon(proj_features, domain_labels)
 
     def compute_ot_loss(self, all_mus):
         total_ot_loss = 0
@@ -571,7 +854,9 @@ class MultiDomainVAEEncoder(nn.Module):
                 target = self.feature_norm(target) / temperature
 
                 # Compute cosine similarity with torch function
-                cos_sim = torch.nn.functional.cosine_similarity(source, target, dim=1).mean()
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    source, target, dim=1
+                ).mean()
 
                 try:
                     # Compute OT loss with increased iterations/regularization
@@ -591,43 +876,81 @@ class MultiDomainVAEEncoder(nn.Module):
         batch_size = mixed_features.shape[0]
 
         for domain_feat in domain_features:
-            pos_score = self.mi_estimator(torch.cat([mixed_features, domain_feat], dim=1))
+            pos_score = self.mi_estimator(
+                torch.cat([mixed_features, domain_feat], dim=1)
+            )
 
             # Negative samples
             idx = torch.randperm(batch_size)
-            neg_score = self.mi_estimator(torch.cat([mixed_features, domain_feat[idx]], dim=1))
+            neg_score = self.mi_estimator(
+                torch.cat([mixed_features, domain_feat[idx]], dim=1)
+            )
 
             mi_loss += F.softplus(neg_score - pos_score).mean()
 
         return mi_loss / len(domain_features)
 
-    def forward(self, x, domain_idx=None, alpha=1.0):
+    def forward(self, x, domain_labels = None, alpha=1.0):
         batch_size = x.shape[0]
 
-        # Encode từ domain encoders như cũ
+        # Get features from domain encoders
         all_mus = []
         all_logvars = []
+        domain_features = []
+
+        contra_loss = torch.tensor(0.0, device=x.device)
+        proto_loss = torch.tensor(0.0, device=x.device)
+        orth_loss = torch.tensor(0.0, device=x.device)
+
         for i, encoder in enumerate(self.domain_encoders):
             mu, logvar = encoder(x)
             mu = self.domain_norm(mu, i)
+
+            # Extract domain-specific features
+            features, orth_loss = self.feature_extractor(mu, i)
+            domain_features.append(features)
+
             all_mus.append(mu)
             all_logvars.append(logvar)
 
+            # Update prototypes if training
+            if self.training and domain_labels is not None:
+                self.prototype_manager.update_prototypes(features, i)
+
+        if domain_labels is not None:
+            for domain_idx in domain_labels:
+                features = domain_features[domain_idx]
+                proj_features = self.projector(features)
+                contra_loss = self.supcon_loss(proj_features, domain_idx)
+                # proto_loss = self.prototype_manager.get_domain_contrastive_loss(
+                #     proj_features, domain_idx
+                # )
+                contra_loss += contra_loss
+                # proto_loss += proto_loss
+                orth_loss += orth_loss
+
+
+        # Compute attention weights với temperature
+        if domain_labels is not None:
+            attention_weights = torch.zeros(
+                batch_size, self.num_domains, device=x.device
+            )
+            attention_weights[:, domain_labels] = 1.0
+        else:
+            # Use averaged features for attention
+            base_feat = torch.stack(domain_features).mean(0)
+            attention_weights = self.domain_attention(base_feat)
+            attention_weights = F.dropout(
+                attention_weights, p=0.1, training=self.training
+            )
+
+        # Stack features
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Improved attention với dropout
-        if domain_idx is not None:
-            attention_weights = torch.zeros(batch_size, self.num_domains,
-                                         device=x.device)
-            attention_weights[:, domain_idx] = 1.0
-        else:
-            base_mu = all_mus.mean(dim=1)
-            attention_weights = self.domain_attention(base_mu)
-            # Thêm dropout cho attention
-            attention_weights = F.dropout(attention_weights,
-                                       p=0.1,
-                                       training=self.training)
+        # Temperature scaled attention
+        temperature = F.softplus(self.temperature) + 1e-3
+        attention_weights = F.softmax(attention_weights / temperature, dim=1)
 
         # Weights encoding
         weighted_mus = (all_mus * attention_weights.unsqueeze(-1)).sum(dim=1)
@@ -648,14 +971,13 @@ class MultiDomainVAEEncoder(nn.Module):
             left_idx = (i - 1) % self.num_domains
             right_idx = (i + 1) % self.num_domains
 
-            neighbor_features = torch.cat([
-                all_mus[:, left_idx, :],
-                all_mus[:, right_idx, :]
-            ], dim=1)
+            neighbor_features = torch.cat(
+                [all_mus[:, left_idx, :], all_mus[:, right_idx, :]], dim=1
+            )
 
             level1_mixed = self.hierarchical_level1[i](neighbor_features)
             # Add residual connection
-            level1_mixed = level1_mixed + neighbor_features[:, :self.latent_dim]
+            level1_mixed = level1_mixed + neighbor_features[:, : self.latent_dim]
             level1_features.append(level1_mixed)
 
         # Global mixing với dynamic gating
@@ -671,7 +993,19 @@ class MultiDomainVAEEncoder(nn.Module):
         # Compute MI loss
         mi_loss = self.compute_mi_loss(mixed_z, level1_features)
 
-        return mixed_z, all_mus, all_logvars, attention_weights, domain_pred, ot_loss, mi_loss
+        return (
+            mixed_z,
+            all_mus,
+            all_logvars,
+            attention_weights,
+            domain_pred,
+            ot_loss,
+            mi_loss,
+            contra_loss,
+            # proto_loss,
+            orth_loss,
+        )
+
 
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
@@ -691,31 +1025,18 @@ class VAEDecoder(nn.Module):
         # Decoder layers - careful to match input dimensions
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(
-                self.start_channels, 256,
-                kernel_size=4, stride=2, padding=1
+                self.start_channels, 256, kernel_size=4, stride=2, padding=1
             ),
             nn.BatchNorm2d(256),
             nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                256, 128,
-                kernel_size=4, stride=2, padding=1
-            ),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                128, 64,
-                kernel_size=4, stride=2, padding=1
-            ),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                64, output_shape[0],
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.Tanh()
+            nn.ConvTranspose2d(64, output_shape[0], kernel_size=4, stride=2, padding=1),
+            nn.Tanh(),
         )
 
     def forward(self, z):
@@ -725,6 +1046,7 @@ class VAEDecoder(nn.Module):
         # Decode
         x = self.decoder(x)
         return x
+
 
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -746,9 +1068,7 @@ class CYCLEMIX(Algorithm):
 
         # Encoder với hierarchical mixing
         self.encoder = MultiDomainVAEEncoder(
-            input_shape=input_shape,
-            latent_dim=self.latent_dim,
-            num_domains=num_domains
+            input_shape=input_shape, latent_dim=self.latent_dim, num_domains=num_domains
         )
 
         # Giữ nguyên các components khác
@@ -756,12 +1076,10 @@ class CYCLEMIX(Algorithm):
             latent_dim=self.latent_dim,
             output_shape=input_shape,
             h_dim=self.h_dim,
-            w_dim=self.w_dim
+            w_dim=self.w_dim,
         )
 
-        self.domain_embeddings = nn.Parameter(
-            torch.randn(num_domains, self.latent_dim)
-        )
+        self.domain_embeddings = nn.Parameter(torch.randn(num_domains, self.latent_dim))
 
         self.classifier = nn.Sequential(
             nn.Unflatten(1, (self.latent_dim, 1)),
@@ -778,12 +1096,12 @@ class CYCLEMIX(Algorithm):
 
         # Optimizer và scheduling giữ nguyên
         self.optimizer = torch.optim.Adam(
-            list(self.encoder.parameters()) +
-            list(self.decoder.parameters()) +
-            list(self.classifier.parameters()) +
-            [self.domain_embeddings],
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.classifier.parameters())
+            + [self.domain_embeddings],
             lr=hparams["lr"],
-            weight_decay=hparams["weight_decay"]
+            weight_decay=hparams["weight_decay"],
         )
 
         steps_per_epoch = hparams["steps_per_epoch"]
@@ -804,7 +1122,7 @@ class CYCLEMIX(Algorithm):
         )
 
         self.current_epoch = 0
-        self.grad_scaler = torch.amp.GradScaler('cuda')
+        self.grad_scaler = torch.amp.GradScaler("cuda")
 
     def compute_domain_adversarial_loss(self, domain_pred, domain_labels):
         return F.binary_cross_entropy_with_logits(
@@ -830,21 +1148,34 @@ class CYCLEMIX(Algorithm):
                 torch.full((x.shape[0],), i, device=all_x.device)
                 for i, (x, y) in enumerate(minibatches)
             ]
-        )
+        ) # Domain labels will be [batch_size * domain_1, batch_size * domain_2, ...]
 
         # Curriculum learning progress
         p = self.current_epoch / self.total_steps
-        mix_ratio = min(self.mix_ratio * (2. / (1. + np.exp(-10 * p))), 1.0)
+        mix_ratio = min(self.mix_ratio * (2.0 / (1.0 + np.exp(-10 * p))), 1.0)
 
         # Dynamic loss weights
-        domain_weight = self.grl_weight * (2. / (1. + np.exp(-10 * p)))
+        domain_weight = self.grl_weight * (2.0 / (1.0 + np.exp(-10 * p)))
         ot_weight = self.ot_weight * p
         mi_weight = self.mi_weight * p
+        contra_weight = 1.0 * (2.0 / (1.0 + np.exp(-10 * p)))
+        # proto_weight = 0.5 * (2.0 / (1.0 + np.exp(-10 * p)))
+        orth_weight = 0.1 * p
 
         # Forward pass
-        with torch.amp.autocast('cuda'):
-            mixed_z, mu, logvar, attention_weights, domain_pred, ot_loss, mi_loss = \
+        with torch.amp.autocast("cuda"):
+            (mixed_z,
+             mu,
+             logvar,
+             attention_weights,
+             domain_pred,
+             ot_loss,
+             mi_loss,
+             contra_loss,
+            #  proto_loss,
+             orth_loss) = (
                 self.encoder(all_x, domain_labels, alpha=mix_ratio)
+            )
 
             recon_x = self.decoder(mixed_z)
 
@@ -854,15 +1185,20 @@ class CYCLEMIX(Algorithm):
             # Compute losses
             vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
             class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-            domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
+            domain_loss = self.compute_domain_adversarial_loss(
+                domain_pred, domain_labels
+            )
 
             # Combined loss với dynamic weighting
             total_loss = (
-                class_loss +
-                vae_loss +
-                domain_weight * domain_loss +
-                ot_weight * ot_loss +
-                mi_weight * mi_loss
+                class_loss
+                + vae_loss
+                + domain_weight * domain_loss
+                + ot_weight * ot_loss
+                + mi_weight * mi_loss
+                + contra_weight * contra_loss
+                # + proto_weight * proto_loss
+                + orth_weight * orth_loss
             )
 
         self.optimizer.zero_grad()
@@ -880,17 +1216,18 @@ class CYCLEMIX(Algorithm):
 
         return {
             "loss": total_loss.item(),
-            # "vae_loss": vae_loss.item(),
+            "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
             "domain_loss": domain_loss.item(),
             "ot_loss": ot_loss.item(),
             "mi_loss": mi_loss.item(),
+            "contrastive_loss": contra_loss.item(),
             "mix_ratio_loss": mix_ratio,
-            "temperature_loss": self.encoder.temperature.item()
+            "temperature_loss": self.encoder.temperature.item(),
         }
 
     def predict(self, x):
-        mixed_z, _, _, _, _, _, _ = self.encoder(x)
+        mixed_z, _, _, _, _, _, _, _, _ = self.encoder(x)
         return self.classifier(mixed_z)
 
 
