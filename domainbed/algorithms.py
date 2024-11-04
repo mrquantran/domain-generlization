@@ -217,7 +217,7 @@ class Identity(nn.Module):
     def forward(self, x):
         return x
 
-def save_images(x, x_generated, current_epoch):
+def save_images(x, x_generated, current_epoch, nrow= 10):
     """
     Save the original and generated images to file path.
     """
@@ -234,7 +234,7 @@ def save_images(x, x_generated, current_epoch):
 
     # Save original images
     original_img_path = f"generated_images/original_{current_epoch}.png"
-    save_image(x, original_img_path, nrow=8, normalize=True)
+    save_image(x, original_img_path, nrow=nrow, normalize=True)
     print(f"Original images saved to {original_img_path}")
 
     # Scale generated images from [-1, 1] to [0, 1]
@@ -242,72 +242,8 @@ def save_images(x, x_generated, current_epoch):
 
     # Save generated images
     generated_img_path = f"generated_images/generated_{current_epoch}.png"
-    save_image(images, generated_img_path, nrow=8, normalize=True)
+    save_image(images, generated_img_path, nrow=nrow, normalize=True)
     print(f"Generated images saved to {generated_img_path}")
-
-class VAEEncoder(nn.Module):
-    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
-    def __init__(self, input_shape, latent_dim):
-        super(VAEEncoder, self).__init__()
-
-        # MoCo v2 checkpoint URL
-        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
-
-        self.backbone = torchvision.models.resnet50(pretrained=False)
-        backbone_dim = 2048
-        self._load_moco_weights()
-
-        # Handle input channels
-        nc = input_shape[0]
-        if nc != 3:
-            tmp = self.backbone.conv1.weight.data.clone()
-            self.backbone.conv1 = nn.Conv2d(
-                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
-            )
-            for i in range(nc):
-                self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
-
-        # Remove FC layer
-        self.backbone.fc = Identity()
-
-        # VAE heads
-        self.fc_mu = nn.Linear(backbone_dim, latent_dim)
-        self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
-
-        self._freeze_bn()
-
-    def _load_moco_weights(self):
-        """Load MoCo v2 pretrained weights"""
-        try:
-            checkpoint = load_url(self.moco_v2_path, progress=True)
-            state_dict = checkpoint["state_dict"]
-            new_state_dict = {}
-
-            for k in list(state_dict.keys()):
-                if k.startswith("module.encoder_q."):
-                    new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
-
-            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
-
-        except Exception as e:
-            print(f"Error loading MoCo v2 weights: {str(e)}")
-            print("Falling back to random initialization")
-
-    def _freeze_bn(self):
-        """Freeze BatchNorm layers"""
-        for m in self.backbone.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-    def forward(self, x):
-        features = self.backbone(x)
-        return self.fc_mu(features), self.fc_logvar(features)
-
-    def train(self, mode=True):
-        """Override train mode to keep BN frozen"""
-        super().train(mode)
-        self._freeze_bn()
 
 # class VAEEncoder(nn.Module):
 #     """VAE Encoder using ResNet50 with ImageNet pretraining"""
@@ -355,6 +291,136 @@ class VAEEncoder(nn.Module):
 #         super().train(mode)
 #         self._freeze_bn()
 #         return self
+
+# https://dl.fbaipublicfiles.com/moco-v3/vit-b-300ep/vit-b-300ep.pth.tar
+
+# class VAEEncoder(nn.Module):
+#     """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+#     def __init__(self, input_shape, latent_dim):
+#         super(VAEEncoder, self).__init__()
+
+#         # MoCo v2 checkpoint URL
+#         self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
+
+#         self.backbone = torchvision.models.resnet50(pretrained=False)
+#         backbone_dim = 2048
+#         self._load_moco_weights()
+
+#         # Handle input channels
+#         nc = input_shape[0]
+#         if nc != 3:
+#             tmp = self.backbone.conv1.weight.data.clone()
+#             self.backbone.conv1 = nn.Conv2d(
+#                 nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+#             )
+#             for i in range(nc):
+#                 self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+#         # Remove FC layer
+#         self.backbone.fc = Identity()
+
+#         # VAE heads
+#         self.fc_mu = nn.Linear(backbone_dim, latent_dim)
+#         self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
+
+#         self._freeze_bn()
+
+#     def _load_moco_weights(self):
+#         """Load MoCo v2 pretrained weights"""
+#         try:
+#             checkpoint = load_url(self.moco_v2_path, progress=True)
+#             state_dict = checkpoint["state_dict"]
+#             new_state_dict = {}
+
+#             for k in list(state_dict.keys()):
+#                 if k.startswith("module.encoder_q."):
+#                     new_state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+
+#             msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+#             print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
+
+#         except Exception as e:
+#             print(f"Error loading MoCo v2 weights: {str(e)}")
+#             print("Falling back to random initialization")
+
+#     def _freeze_bn(self):
+#         """Freeze BatchNorm layers"""
+#         for m in self.backbone.modules():
+#             if isinstance(m, nn.BatchNorm2d):
+#                 m.eval()
+
+#     def forward(self, x):
+#         features = self.backbone(x)
+#         return self.fc_mu(features), self.fc_logvar(features)
+
+#     def train(self, mode=True):
+#         """Override train mode to keep BN frozen"""
+#         super().train(mode)
+#         self._freeze_bn()
+#         return self
+
+import torch.nn as nn
+from einops import rearrange
+import timm
+
+
+import torch.nn as nn
+from einops import rearrange, repeat
+
+class VAEEncoder(nn.Module):
+    def __init__(self, input_shape, latent_dim):
+        super(VAEEncoder, self).__init__()
+
+        # MoCo v3 checkpoint URL for ViT-Base
+        self.moco_v3_path = (
+            "https://dl.fbaipublicfiles.com/moco-v3/vit-b-300ep/vit-b-300ep.pth.tar"
+        )
+
+        self.backbone = timm.create_model('vit_base_patch16_224', pretrained=False)
+        self.backbone.head = nn.Identity()  # Remove classification head
+
+        self._load_moco_v3_weights()
+
+        # VAE heads
+        self.fc_mu = nn.Linear(self.backbone.num_features, latent_dim)
+        self.fc_logvar = nn.Linear(self.backbone.num_features, latent_dim)
+
+        self._freeze_bn()
+
+    def _load_moco_v3_weights(self):
+        """Load MoCo v3 pretrained weights for ViT"""
+        try:
+            checkpoint = load_url(self.moco_v3_path, progress=True)
+            state_dict = checkpoint["state_dict"]
+            new_state_dict = {}
+
+            for k in list(state_dict.keys()):
+                if k.startswith("module.encoder_k."):
+                    new_state_dict[k[len("module.encoder_k."):]] = state_dict[k]
+
+            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
+            print(f"Loaded MoCo v3 weights for ViT. Missing keys: {msg.missing_keys}")
+
+        except Exception as e:
+            print(f"Error loading MoCo v3 weights: {str(e)}")
+            print("Falling back to random initialization")
+
+    def _freeze_bn(self):
+        """Freeze BatchNorm layers"""
+        for m in self.backbone.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.fc_mu(features), self.fc_logvar(features)
+
+    def train(self, mode=True):
+        """Override train mode to keep BN frozen"""
+        super().train(mode)
+        self._freeze_bn()
+        return self
+
 
 class GradientReversal(torch.autograd.Function):
     """
@@ -849,7 +915,9 @@ class CYCLEMIX(Algorithm):
             recon_x = self.decoder(mixed_z)
 
             if self.current_epoch % 100 == 0:
-                save_images(all_x, recon_x, self.current_epoch)
+                batch_size = all_x.shape[0]
+                nrow = 10 if batch_size % 10 == 0 else 8
+                save_images(all_x, recon_x, self.current_epoch, nrow)
 
             # Compute losses
             vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
