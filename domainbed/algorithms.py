@@ -233,17 +233,16 @@ def save_images(x, x_generated, current_epoch):
         x_generated = x_generated.repeat(1, 3, 1, 1)
 
     # Save original images
-    original_img_path = f"generated_images/original_{current_epoch}.png"
+    original_img_path = f"generated_images/{current_epoch}_original.png"
     save_image(x, original_img_path, nrow=8, normalize=True)
-    print(f"Original images saved to {original_img_path}")
 
     # Scale generated images from [-1, 1] to [0, 1]
     images = (x_generated.detach().cpu() + 1) / 2
 
     # Save generated images
-    generated_img_path = f"generated_images/generated_{current_epoch}.png"
+    generated_img_path = f"generated_images/{current_epoch}_generated.png"
     save_image(images, generated_img_path, nrow=8, normalize=True)
-    print(f"Generated images saved to {generated_img_path}")
+    print("Original and generated images saved at epoch", current_epoch)
 
 # class VAEEncoder(nn.Module):
 #     """VAE Encoder using ResNet50 with ImageNet pretraining"""
@@ -512,7 +511,7 @@ class MultiDomainVAEEncoder(nn.Module):
         self.domain_gates = nn.Parameter(torch.ones(num_domains) / num_domains)
         self.feature_norm = nn.LayerNorm(latent_dim)
 
-        # Giữ nguyên các components hiện tại
+        # Existing components
         self.domain_encoders = nn.ModuleList(
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
@@ -520,6 +519,8 @@ class MultiDomainVAEEncoder(nn.Module):
         self.grl = GRL(alpha=1.0)
         self.domain_discriminator = DomainDiscriminator(latent_dim)
         self.ot_loss = OTLoss(reg_e=0.1)
+
+        # Existing feature transform
         self.feature_transform = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
@@ -527,7 +528,20 @@ class MultiDomainVAEEncoder(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
-        # Thêm hierarchical mixing components
+        # Progressive Alignment module
+        self.progressive_align = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.ReLU(),
+                nn.Linear(latent_dim, latent_dim)
+            ) for _ in range(3)  # 3 progressive levels
+        ])
+        self.prog_gates = nn.ParameterList([
+            nn.Parameter(torch.ones(1)) for _ in range(3)
+        ])
+
+        # Enhanced hierarchical mixing - Level 1
         self.hierarchical_level1 = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(latent_dim * 2, latent_dim),
@@ -537,7 +551,22 @@ class MultiDomainVAEEncoder(nn.Module):
             ) for _ in range(num_domains)
         ])
 
-        # MI Estimator cho regularization
+        # Contrastive mixing
+        self.contrastive_projector = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+        self.contrastive_temperature = nn.Parameter(torch.ones(1) * 0.07)
+
+        # Dynamic domain aggregation
+        self.domain_attention = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+        # MI Estimator
         self.mi_estimator = nn.Sequential(
             nn.Linear(latent_dim * 2, 512),
             nn.ReLU(),
@@ -546,31 +575,128 @@ class MultiDomainVAEEncoder(nn.Module):
             nn.Linear(256, 1)
         )
 
+    def progressive_alignment(self, features, progress):
+        """Progressive feature alignment across domains"""
+        aligned = features
+        for i, (align_layer, gate) in enumerate(zip(self.progressive_align, self.prog_gates)):
+            # Progressive gating based on training progress
+            gate_val = torch.sigmoid(gate * progress)
+            aligned_step = align_layer(aligned)
+            aligned = gate_val * aligned_step + (1 - gate_val) * aligned
+        return aligned
+
+    def compute_contrastive_loss(self, features, domain_labels=None):
+        """
+        Compute contrastive loss between domain features using InfoNCE loss
+        Args:
+            features: Feature vectors (N x D)
+            domain_labels: Domain labels (N), can be None
+        Returns:
+            Contrastive loss value
+        """
+        # Project and normalize features
+        proj_features = self.contrastive_projector(features)
+        proj_features = F.normalize(proj_features, dim=-1)
+
+        # If domain labels not provided, create artificial ones
+        if domain_labels is None:
+            batch_size = features.size(0)
+            domain_labels = torch.zeros(batch_size, dtype=torch.long, device=features.device)
+        else:
+            domain_labels = domain_labels.view(-1)
+
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(proj_features, proj_features.T)
+        sim_matrix = sim_matrix / self.contrastive_temperature
+
+        # Create domain label mask matrix
+        domain_mask = (domain_labels.unsqueeze(0) ==
+                      domain_labels.unsqueeze(1))
+
+        # Remove self-contrasting
+        mask_no_self = ~torch.eye(
+            domain_mask.shape[0],
+            dtype=torch.bool,
+            device=domain_mask.device
+        )
+        domain_mask = domain_mask & mask_no_self
+
+        # For numerical stability
+        sim_matrix_max, _ = torch.max(
+            sim_matrix,
+            dim=1,
+            keepdim=True
+        )
+        exp_sim = torch.exp(sim_matrix - sim_matrix_max.detach())
+
+        # Compute positive and negative similarity
+        pos_mask = domain_mask.float()
+        neg_mask = (~domain_mask & mask_no_self).float()
+
+        # Add debug logging and dimension checks
+        if torch.any(torch.isnan(exp_sim)):
+            print("Warning: exp_sim contains NaN values")
+
+        # Ensure masks and exp_sim have same dimensions
+        assert exp_sim.shape == pos_mask.shape, f"Shape mismatch: exp_sim {exp_sim.shape} vs pos_mask {pos_mask.shape}"
+        assert exp_sim.shape == neg_mask.shape, f"Shape mismatch: exp_sim {exp_sim.shape} vs neg_mask {neg_mask.shape}"
+
+        # Compute scores with dimension check
+        try:
+            pos_scores = (pos_mask * exp_sim).sum(dim=1)
+            neg_scores = (neg_mask * exp_sim).sum(dim=1)
+        except RuntimeError as e:
+            print("Error in score computation:")
+            print(f"pos_mask * exp_sim shapes: {(pos_mask * exp_sim).shape}")
+            raise e
+
+        # Handle zero division
+        denominator = pos_scores + neg_scores + 1e-8
+
+        # Compute loss only for samples with positive pairs
+        valid_mask = pos_mask.sum(dim=1) > 0
+        if valid_mask.sum() > 0:
+            log_probs = -torch.log(pos_scores / denominator)
+            loss = log_probs[valid_mask].mean()
+        else:
+            loss = torch.tensor(0.0, device=features.device)
+
+        return loss
+
+    def dynamic_domain_aggregation(self, features):
+        """Dynamic weighting of domain features"""
+        attention_weights = []
+        for feat in features:
+            weight = self.domain_attention(feat)
+            attention_weights.append(weight)
+
+        attention = torch.stack(attention_weights, dim=1)
+        attention = F.softmax(attention, dim=1)
+
+        aggregated = sum([a * f for a, f in zip(attention.unbind(1), features)])
+        return aggregated
+
     def compute_ot_loss(self, all_mus):
+        """Compute Optimal Transport loss between domains"""
         total_ot_loss = 0
         n_pairs = 0
 
-        # Get current temperature with numerical stability
         temperature = torch.nn.functional.softplus(self.temperature) + 1e-3
 
         for i in range(self.num_domains):
             for j in range(i + 1, self.num_domains):
-                # Transform and normalize features
                 source = self.feature_transform(all_mus[:, i, :])
                 source = self.feature_norm(source) / temperature
 
                 target = self.feature_transform(all_mus[:, j, :])
                 target = self.feature_norm(target) / temperature
 
-                # Compute cosine similarity with torch function
-                cos_sim = torch.nn.functional.cosine_similarity(source, target, dim=1).mean()
+                cos_sim = F.cosine_similarity(source, target, dim=1).mean()
 
                 try:
-                    # Compute OT loss with increased iterations/regularization
                     domain_ot_loss = self.ot_loss(source, target)
                 except Exception as e:
                     print(f"Warning: OT computation failed: {str(e)}")
-                    # Fallback to cosine distance if OT fails
                     domain_ot_loss = 1 - cos_sim
 
                 total_ot_loss += domain_ot_loss + 0.1 * (1 - cos_sim)
@@ -579,13 +705,13 @@ class MultiDomainVAEEncoder(nn.Module):
         return total_ot_loss / n_pairs if n_pairs > 0 else 0
 
     def compute_mi_loss(self, mixed_features, domain_features):
+        """Compute Mutual Information loss"""
         mi_loss = 0
         batch_size = mixed_features.shape[0]
 
         for domain_feat in domain_features:
             pos_score = self.mi_estimator(torch.cat([mixed_features, domain_feat], dim=1))
 
-            # Negative samples
             idx = torch.randperm(batch_size)
             neg_score = self.mi_estimator(torch.cat([mixed_features, domain_feat[idx]], dim=1))
 
@@ -593,10 +719,12 @@ class MultiDomainVAEEncoder(nn.Module):
 
         return mi_loss / len(domain_features)
 
-    def forward(self, x, domain_idx=None, alpha=1.0):
+    def forward(self, x, domain_idx=None, alpha=1.0, progress=None):
         batch_size = x.shape[0]
+        if progress is None:
+            progress = alpha  # Use mixing ratio as progress if not provided
 
-        # Encode từ domain encoders như cũ
+        # Encode from domain encoders
         all_mus = []
         all_logvars = []
         for i, encoder in enumerate(self.domain_encoders):
@@ -608,40 +736,47 @@ class MultiDomainVAEEncoder(nn.Module):
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Level 1 mixing với residual connection
+        # Progressive alignment
+        aligned_mus = self.progressive_alignment(all_mus, progress)
+
+        # Level 1 mixing with residual connection
         level1_features = []
         for i in range(self.num_domains):
             left_idx = (i - 1) % self.num_domains
             right_idx = (i + 1) % self.num_domains
 
             neighbor_features = torch.cat([
-                all_mus[:, left_idx, :],
-                all_mus[:, right_idx, :]
+                aligned_mus[:, left_idx, :],
+                aligned_mus[:, right_idx, :]
             ], dim=1)
 
             level1_mixed = self.hierarchical_level1[i](neighbor_features)
-            # Add residual connection
             level1_mixed = level1_mixed + neighbor_features[:, :self.latent_dim]
             level1_features.append(level1_mixed)
 
-        # Global mixing với dynamic gating
-        gates = F.softmax(self.domain_gates / self.temperature, dim=0)
-        mixed_features = []
-        for i, feat in enumerate(level1_features):
-            mixed_features.append(feat * gates[i])
-        mixed_z = sum(mixed_features)
+        # Compute contrastive loss
+        # Reshape features correctly for contrastive loss
+        stacked_features = torch.cat(level1_features, dim=0)
+        if domain_idx is not None:
+            domain_labels = torch.cat([torch.full((feat.size(0),), i, device=feat.device)
+                                    for i, feat in enumerate(level1_features)])
+        else:
+            domain_labels = None
 
-        # GRL và domain discrimination giữ nguyên
+        contrastive_loss = self.compute_contrastive_loss(stacked_features, domain_labels)
+
+        # Dynamic domain aggregation
+        mixed_z = self.dynamic_domain_aggregation(level1_features)
+
+        # GRL and domain discrimination
         grl_z = self.grl(mixed_z)
         domain_pred = self.domain_discriminator(grl_z)
 
-        # Compute OT loss giữ nguyên
+        # Compute losses
         ot_loss = self.compute_ot_loss(all_mus)
-
-        # Compute MI loss
         mi_loss = self.compute_mi_loss(mixed_z, level1_features)
 
-        return mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss
+        return mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss, contrastive_loss
 
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
@@ -700,7 +835,7 @@ class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
 
-        # Giữ nguyên các hyperparameters hiện tại
+        # Hyperparameters
         self.input_shape = input_shape
         self.latent_dim = hparams.get("latent_dim", 512)
         self.beta = hparams.get("beta", 4.0)
@@ -708,6 +843,7 @@ class CYCLEMIX(Algorithm):
         self.grl_weight = hparams.get("grl_weight", 1.0)
         self.ot_weight = hparams.get("ot_weight", 0.1)
         self.mi_weight = hparams.get("mi_weight", 0.1)
+        self.contrastive_weight = hparams.get("contrastive_weight", 0.1)
         self.grad_clip = hparams.get("grad_clip", 1.0)
 
         # Spatial dimensions
@@ -783,12 +919,8 @@ class CYCLEMIX(Algorithm):
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
         """Compute VAE loss with KL divergence"""
-        # Reconstruction loss (pixel-wise MSE)
         recon_loss = F.mse_loss(recon_x, x)
-
-        # KL divergence
         kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
         return recon_loss + self.beta * kl_loss
 
     def update(self, minibatches, unlabeled=None):
@@ -803,18 +935,19 @@ class CYCLEMIX(Algorithm):
         )
 
         # Curriculum learning progress
-        p = self.current_epoch / self.total_steps
-        mix_ratio = min(self.mix_ratio * (2. / (1. + np.exp(-10 * p))), 1.0)
+        progress = self.current_epoch / self.total_steps
+        mix_ratio = min(self.mix_ratio * (2. / (1. + np.exp(-10 * progress))), 1.0)
 
         # Dynamic loss weights
-        domain_weight = self.grl_weight * (2. / (1. + np.exp(-10 * p)))
-        ot_weight = self.ot_weight * p
-        mi_weight = self.mi_weight * p
+        domain_weight = self.grl_weight * (2.0 / (1.0 + np.exp(-10 * progress)))
+        ot_weight = self.ot_weight * progress
+        mi_weight = self.mi_weight * progress
+        contrastive_weight = self.contrastive_weight * progress
 
         # Forward pass
         with torch.amp.autocast('cuda'):
-            mixed_z, mu, logvar, domain_pred, ot_loss, mi_loss = \
-                self.encoder(all_x, domain_labels, alpha=mix_ratio)
+            mixed_z, mu, logvar, domain_pred, ot_loss, mi_loss, contrastive_loss = \
+                self.encoder(all_x, domain_labels, mix_ratio, progress)
 
             recon_x = self.decoder(mixed_z)
 
@@ -832,7 +965,8 @@ class CYCLEMIX(Algorithm):
                 vae_loss +
                 domain_weight * domain_loss +
                 ot_weight * ot_loss +
-                mi_weight * mi_loss
+                mi_weight * mi_loss +
+                contrastive_weight * contrastive_loss
             )
 
         self.optimizer.zero_grad()
@@ -856,11 +990,12 @@ class CYCLEMIX(Algorithm):
             "ot_loss": ot_loss.item(),
             "mi_loss": mi_loss.item(),
             "mix_ratio_loss": mix_ratio,
+            "contrastive_loss": contrastive_loss.item(),
             "temperature_loss": self.encoder.temperature.item()
         }
 
     def predict(self, x):
-        mixed_z, _, _, _, _, _ = self.encoder(x)
+        mixed_z, _, _, _, _, _, _ = self.encoder(x)
         return self.classifier(mixed_z)
 
 
