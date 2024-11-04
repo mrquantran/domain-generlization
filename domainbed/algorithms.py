@@ -509,7 +509,6 @@ class MultiDomainVAEEncoder(nn.Module):
         self.num_domains = num_domains
         self.latent_dim = latent_dim
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
-        self.domain_gates = nn.Parameter(torch.ones(num_domains) / num_domains)
         self.feature_norm = nn.LayerNorm(latent_dim)
 
         # Giữ nguyên các components hiện tại
@@ -527,15 +526,31 @@ class MultiDomainVAEEncoder(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
-        # Thêm hierarchical mixing components
-        self.hierarchical_level1 = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(latent_dim * 2, latent_dim),
-                nn.LayerNorm(latent_dim),
-                nn.ReLU(),
-                nn.Linear(latent_dim, latent_dim)
-            ) for _ in range(num_domains)
+        # 1. Enhanced Local Mixing với attention
+        self.local_attention = nn.ModuleList(
+            [
+                nn.MultiheadAttention(latent_dim, num_heads=4, dropout=0.1)
+                for _ in range(num_domains)
+            ]
+        )
+
+        # 2. Improved Hierarchical Mixer với multiple levels
+        self.hierarchical_levels = nn.ModuleList([
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(latent_dim * 2, latent_dim),
+                    nn.LayerNorm(latent_dim),
+                    nn.ReLU(),
+                    nn.Linear(latent_dim, latent_dim)
+                ) for _ in range(num_domains)
+            ]) for _ in range(2)  # 2 hierarchical levels
         ])
+
+        # 3. Domain-specific temperature parameters
+        self.domain_temperatures = nn.Parameter(torch.ones(num_domains) * 0.1)
+
+        # 4. Adaptive mixing weights
+        self.mixing_weights = nn.Parameter(torch.ones(num_domains, num_domains) / num_domains)
 
         # MI Estimator cho regularization
         self.mi_estimator = nn.Sequential(
@@ -596,7 +611,7 @@ class MultiDomainVAEEncoder(nn.Module):
     def forward(self, x, domain_idx=None, alpha=1.0):
         batch_size = x.shape[0]
 
-        # Encode từ domain encoders như cũ
+        # Get encoded features như cũ
         all_mus = []
         all_logvars = []
         for i, encoder in enumerate(self.domain_encoders):
@@ -608,38 +623,78 @@ class MultiDomainVAEEncoder(nn.Module):
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Level 1 mixing với residual connection
-        level1_features = []
+        # 1. Enhanced Local Mixing với attention
+        local_features = []
         for i in range(self.num_domains):
+            # Get neighboring features
             left_idx = (i - 1) % self.num_domains
             right_idx = (i + 1) % self.num_domains
 
-            neighbor_features = torch.cat([
-                all_mus[:, left_idx, :],
-                all_mus[:, right_idx, :]
-            ], dim=1)
+            # Apply attention over local neighborhood
+            neighborhood = torch.stack([
+                all_mus[:, left_idx],
+                all_mus[:, i],
+                all_mus[:, right_idx]
+            ], dim=0)  # [3, B, L]
 
-            level1_mixed = self.hierarchical_level1[i](neighbor_features)
-            # Add residual connection
-            level1_mixed = level1_mixed + neighbor_features[:, :self.latent_dim]
-            level1_features.append(level1_mixed)
+            attn_out, _ = self.local_attention[i](
+                neighborhood[1:2], neighborhood, neighborhood
+            )  # Use center as query
+            local_features.append(attn_out.squeeze(0))
 
-        # Global mixing với dynamic gating
-        gates = F.softmax(self.domain_gates / self.temperature, dim=0)
+        local_features = torch.stack(local_features, dim=1)  # [B, D, L]
+
+        # 2. Multi-level Hierarchical Mixing
+        current_features = local_features
+        for level_idx, level in enumerate(self.hierarchical_levels):
+            level_features = []
+            for i in range(self.num_domains):
+                # Calculate start and end indices for hierarchical mixing
+                start_idx = i - 2 ** level_idx
+                end_idx = i + 2 ** level_idx + 1
+                indices = torch.arange(
+                    start=start_idx,
+                    end=end_idx
+                ).to(current_features.device)
+                mix_indices = indices % self.num_domains
+
+                features_to_mix = current_features[:, mix_indices]
+
+                # Apply mixing
+                mixed = level[i](
+                    torch.cat([
+                        current_features[:, i:i+1].expand(-1, len(mix_indices), -1),
+                        features_to_mix
+                    ], dim=-1)
+                )
+
+                # Reshape mixed to match current_features shape
+                mixed = mixed.mean(dim=1)  # Average across the mix_indices dimension
+
+                # Add residual
+                mixed = mixed + current_features[:, i]
+                level_features.append(mixed)
+
+            current_features = torch.stack(level_features, dim=1)
+
+        # 3. Final Adaptive Mixing với domain-specific temperatures
+        mixing_weights = F.softmax(
+            self.mixing_weights / self.domain_temperatures.unsqueeze(1),
+            dim=1
+        )
+
         mixed_features = []
-        for i, feat in enumerate(level1_features):
-            mixed_features.append(feat * gates[i])
-        mixed_z = sum(mixed_features)
+        for i in range(self.num_domains):
+            weighted_sum = (current_features * mixing_weights[i].view(1, -1, 1)).sum(dim=1)
+            mixed_features.append(weighted_sum)
 
-        # GRL và domain discrimination giữ nguyên
+        mixed_z = sum(mixed_features) / self.num_domains
+
+        # Existing losses và GRL
         grl_z = self.grl(mixed_z)
         domain_pred = self.domain_discriminator(grl_z)
-
-        # Compute OT loss giữ nguyên
         ot_loss = self.compute_ot_loss(all_mus)
-
-        # Compute MI loss
-        mi_loss = self.compute_mi_loss(mixed_z, level1_features)
+        mi_loss = self.compute_mi_loss(mixed_z, mixed_features)
 
         return mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss
 
