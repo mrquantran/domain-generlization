@@ -588,7 +588,6 @@ class MultiDomainVAEEncoder(nn.Module):
         )
         self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
         self.grl = GRL(alpha=1.0)
-        self.domain_discriminator = DomainDiscriminator(latent_dim)
         self.ot_loss = OTLoss(reg_e=0.1)
 
         # Cải tiến 1: Adaptive Feature Transform
@@ -766,16 +765,11 @@ class MultiDomainVAEEncoder(nn.Module):
         mixed_features = [feat * gate for feat, gate in zip(level1_features, gates)]
         mixed_z = sum(mixed_features)
 
-        # Compute domain predictions for adversarial training
-        grl_z = self.grl(mixed_z)
-        domain_pred = self.domain_discriminator(grl_z)
-
-
         # Compute optimal transport and mutual information losses
         ot_loss = self.compute_ot_loss(all_mus)
         mi_loss = self.compute_mi_loss(mixed_z, level1_features)
 
-        return mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss
+        return mixed_z, all_mus, all_logvars, ot_loss, mi_loss
 
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -847,7 +841,7 @@ class CYCLEMIX(Algorithm):
             self.optimizer,
             max_lr=hparams["lr"] * 10,
             total_steps=total_steps,
-            pct_start=0.2,
+            pct_start=0.15,
             div_factor=25,
             three_phase=False,
             final_div_factor=1e4,
@@ -876,25 +870,25 @@ class CYCLEMIX(Algorithm):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
-        domain_labels = torch.cat(
-            [
-                torch.full((x.shape[0],), i, device=all_x.device)
-                for i, (x, y) in enumerate(minibatches)
-            ]
-        )
+        # domain_labels = torch.cat(
+        #     [
+        #         torch.full((x.shape[0],), i, device=all_x.device)
+        #         for i, (x, y) in enumerate(minibatches)
+        #     ]
+        # )
 
         # Curriculum learning progress
         p = self.current_epoch / self.total_steps
         mix_ratio = min(self.mix_ratio * (2. / (1. + np.exp(-10 * p))), 1.0)
 
         # Dynamic loss weights
-        domain_weight = self.grl_weight * (2. / (1. + np.exp(-10 * p)))
+        # domain_weight = self.grl_weight * (2. / (1. + np.exp(-10 * p)))
         ot_weight = self.ot_weight * p
         mi_weight = self.mi_weight * p
 
         # Forward pass
         with torch.amp.autocast('cuda'):
-            mixed_z, mu, logvar, domain_pred, ot_loss, mi_loss = \
+            mixed_z, mu, logvar, ot_loss, mi_loss = \
                 self.encoder(all_x)
 
             recon_x = self.decoder(mixed_z)
@@ -905,13 +899,11 @@ class CYCLEMIX(Algorithm):
             # Compute losses
             vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
             class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-            domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
 
             # Combined loss với dynamic weighting
             total_loss = (
                 class_loss +
                 vae_loss +
-                domain_weight * domain_loss +
                 ot_weight * ot_loss +
                 mi_weight * mi_loss
             )
@@ -933,7 +925,7 @@ class CYCLEMIX(Algorithm):
             "loss": total_loss.item(),
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
-            "domain_loss": domain_loss.item(),
+            # "domain_loss": domain_loss.item(),
             "ot_loss": ot_loss.item(),
             "mi_loss": mi_loss.item(),
             "mix_ratio_loss": mix_ratio,
@@ -941,7 +933,7 @@ class CYCLEMIX(Algorithm):
         }
 
     def predict(self, x):
-        mixed_z, _, _, _, _, _ = self.encoder(x)
+        mixed_z, _, _, _, _ = self.encoder(x)
         return self.classifier(mixed_z)
 
 
