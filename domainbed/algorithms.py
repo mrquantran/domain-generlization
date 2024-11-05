@@ -359,13 +359,15 @@ class VAEEncoder(nn.Module):
         self._freeze_bn()
 
 class AdaptiveDomainNorm(nn.Module):
-    """Enhanced normalization with batch statistics and domain-specific parameters"""
-    def __init__(self, num_features, num_domains, eps=1e-5, momentum=0.1):
+    """Enhanced normalization with batch statistics, domain-specific parameters, and regularization"""
+    def __init__(self, num_features, num_domains, eps=1e-5, momentum=0.1, l2_lambda=0.01, dropout_rate=0.2):
         super().__init__()
         self.num_features = num_features
         self.num_domains = num_domains
         self.eps = eps
         self.momentum = momentum
+        self.l2_lambda = l2_lambda # L2 regularization coefficient
+        self.regularization_loss = 0.0
 
         # Domain-specific layers
         self.norm = nn.ModuleList(
@@ -384,6 +386,9 @@ class AdaptiveDomainNorm(nn.Module):
 
         # Instance normalization for unknown domains
         self.instance_norm = nn.InstanceNorm1d(num_features, affine=False)
+
+        # Dropout layer for regularization
+        self.dropout = nn.Dropout(p=dropout_rate)
 
     def _update_stats(self, x, domain_idx):
         if self.training:
@@ -404,6 +409,12 @@ class AdaptiveDomainNorm(nn.Module):
                     ) * self.running_var[domain_idx] + self.momentum * batch_var
                 self.num_batches_tracked[domain_idx] += 1
 
+    def compute_l2_loss(self):
+        """Compute L2 regularization loss for scale and bias parameters"""
+        l2_scale_loss = self.l2_lambda * torch.sum(self.scale ** 2)
+        l2_bias_loss = self.l2_lambda * torch.sum(self.bias ** 2)
+        return l2_scale_loss + l2_bias_loss
+
     def forward(self, x, domain_idx=None):
         if domain_idx is not None:
             # Update statistics
@@ -417,17 +428,44 @@ class AdaptiveDomainNorm(nn.Module):
                 mean = self.running_mean[domain_idx]
                 var = self.running_var[domain_idx]
 
+            # Normalize and apply domain-specific adjustments
             normalized = (x - mean) / torch.sqrt(var + self.eps)
             normalized = self.norm[domain_idx](normalized)
-            return self.scale[domain_idx] * normalized + self.bias[domain_idx]
 
+            # Apply dropout during training
+            if self.training:
+                normalized = self.dropout(normalized)
+
+            # Apply scale and bias
+            out = self.scale[domain_idx] * normalized + self.bias[domain_idx]
+
+            # Add L2 regularization loss if in training mode
+            if self.training:
+                self.regularization_loss = self.compute_l2_loss()
+            else:
+                self.regularization_loss = 0.0
+
+            return out
+
+        # For unknown domains, use instance norm and weighted combination
         inst_norm = self.instance_norm(x.unsqueeze(1)).squeeze(1)
         gates = F.softmax(self.domain_gates, dim=0)
+
+        # Apply dropout to instance normalized features during training
+        if self.training:
+            inst_norm = self.dropout(inst_norm)
 
         out = 0
         for i in range(self.num_domains):
             domain_norm = self.norm[i](inst_norm)
             out += gates[i] * (self.scale[i] * domain_norm + self.bias[i])
+
+        # Add L2 regularization loss if in training mode
+        if self.training:
+            self.regularization_loss = self.compute_l2_loss()
+        else:
+            self.regularization_loss = 0.0
+
         return out
 
 class MultiDomainVAEEncoder(nn.Module):
@@ -459,7 +497,10 @@ class MultiDomainVAEEncoder(nn.Module):
         # Layer norm for attention
         self.attention_norm = nn.LayerNorm(latent_dim)
 
-        # Hierarchical mixing with attention
+        # Dynamic Neighborhood Aggregation
+        self.domain_attention = nn.Linear(latent_dim, num_domains)
+
+        # Hierarchical mixing with attention and dynamic aggregation
         self.hierarchical_level1 = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(latent_dim * 2, latent_dim),
@@ -491,6 +532,30 @@ class MultiDomainVAEEncoder(nn.Module):
 
         return self.o_proj(context)
 
+    def dynamic_neighborhood_aggregation(self, features):
+        """Aggregate features dynamically based on attention weights.
+
+        Args:
+            features: Input features tensor of shape [batch_size, num_domains, feature_dim]
+
+        Returns:
+            weighted_features: Aggregated features tensor of shape [batch_size, feature_dim]
+        """
+        # Calculate attention weights [batch_size, num_domains, num_domains]
+        attn_weights = F.softmax(
+            self.domain_attention(features) / self.temperature,
+            dim=-1  # Apply softmax on last dimension
+        )
+
+        # Clamp weights for stability [batch_size, num_domains, num_domains]
+        attn_weights = torch.clamp(attn_weights, min=0.1, max=0.9)
+        attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True)
+
+        # Weight aggregation
+        weighted_features = torch.einsum('ijk,ijl->ik', features, attn_weights)
+
+        return weighted_features
+
     def forward(self, x):
         batch_size = x.shape[0]
 
@@ -514,23 +579,23 @@ class MultiDomainVAEEncoder(nn.Module):
         attended_features = self.attention(q, k, v)
         attended_features = self.attention_norm(attended_features + all_mus)  # Add residual
 
-        # Level 1 mixing with attended features
+        # Dynamic neighborhood aggregation
+        aggregated_features = self.dynamic_neighborhood_aggregation(attended_features)
+
+        # Level 1 mixing with dynamic aggregation
         level1_features = []
         for i in range(self.num_domains):
-            left_idx = (i - 1) % self.num_domains
-            right_idx = (i + 1) % self.num_domains
-
-            # Use attended features for mixing
-            neighbor_features = torch.cat([
-                attended_features[:, left_idx, :],
-                attended_features[:, right_idx, :]
+            # Combine aggregated features with original domain features
+            domain_features = torch.cat([
+                attended_features[:, i, :],
+                aggregated_features
             ], dim=1)
 
-            level1_mixed = self.hierarchical_level1[i](neighbor_features)
-            level1_mixed = level1_mixed + neighbor_features[:, :self.latent_dim]  # Residual
+            level1_mixed = self.hierarchical_level1[i](domain_features)
+            level1_mixed = level1_mixed + attended_features[:, i, :]  # Residual connection
             level1_features.append(level1_mixed)
 
-        # Global mixing with dynamic temperature-scaled gating
+        # Global mixing with temperature-scaled gating
         gates = F.softmax(self.domain_gates / self.temperature, dim=0)
         mixed_features = []
         for i, feat in enumerate(level1_features):
@@ -668,14 +733,45 @@ class CYCLEMIX(Algorithm):
         self.grad_scaler = torch.amp.GradScaler('cuda')
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
-        """Compute VAE loss with KL divergence"""
-        # Reconstruction loss (pixel-wise MSE)
-        recon_loss = F.mse_loss(recon_x, x)
+        """
+        Compute VAE loss with MMD (Maximum Mean Discrepancy) for better domain generalization
+        Args:
+            x: Input data
+            recon_x: Reconstructed data
+            mu: Mean of latent distribution
+            logvar: Log variance of latent distribution
+        Returns:
+            Total loss combining reconstruction loss and MMD loss
+        """
+        # Reconstruction loss (MSE for continuous data)
+        recon_loss = F.mse_loss(recon_x, x, reduction='mean')
 
-        # KL divergence
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        # Sample from latent distribution
+        std = torch.exp(0.5 * logvar)
+        z = mu + std * torch.randn_like(std)
 
-        return recon_loss + self.beta * kl_loss
+        # Sample from prior N(0,1)
+        z_prior = torch.randn_like(z)
+
+        # Compute MMD loss with Gaussian kernel
+        def gaussian_kernel(x, y, gamma=[0.001, 0.01, 0.1, 1, 10, 100]):
+            D = torch.cdist(x, y, p=2)
+            K = torch.zeros_like(D)
+            for g in gamma:
+                K.add_(torch.exp(-g * D))
+            return K
+
+        # MMD loss computation
+        x_kernel = gaussian_kernel(z, z)
+        y_kernel = gaussian_kernel(z_prior, z_prior)
+        xy_kernel = gaussian_kernel(z, z_prior)
+
+        mmd_loss = x_kernel.mean() + y_kernel.mean() - 2 * xy_kernel.mean()
+
+        # Total loss with beta weighting for MMD
+        total_loss = recon_loss + self.beta * mmd_loss
+
+        return total_loss
 
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
