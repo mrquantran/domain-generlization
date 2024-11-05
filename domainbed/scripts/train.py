@@ -316,6 +316,7 @@ if __name__ == "__main__":
             misc.print_row(["mean_out_acc", mean_out_acc], colwidth=12)
 
             results.update({"hparams": hparams, "args": vars(args)})
+            total_loss = results["loss"]
 
             epochs_path = os.path.join(args.output_dir, "results.jsonl")
             with open(epochs_path, "a") as f:
@@ -328,20 +329,20 @@ if __name__ == "__main__":
             if args.save_model_every_checkpoint:
                 save_checkpoint(f"model_step{step}.pkl")
 
-            # # Early stopping mechanism based on loss
-            # if 'best_loss' not in globals():
-            #     best_loss = float('inf')
-            #     patience_counter = 0
+            # Early stopping mechanism based on loss
+            if 'best_loss' not in globals():
+                best_loss = float('inf')
+                patience_counter = 0
 
-            # if loss < best_loss:
-            #     best_loss = loss
-            #     patience_counter = 0
-            # else:
-            #     patience_counter += 1
+            if total_loss < total_loss:
+                best_loss = total_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
 
-            # if patience_counter >= 50:
-            #     misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
-            #     break
+            if patience_counter >= 10:
+                misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
+                break
 
     save_checkpoint("model.pkl")
 
