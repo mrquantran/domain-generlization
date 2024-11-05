@@ -474,18 +474,35 @@ class MultiDomainVAEEncoder(nn.Module):
 
         self.num_domains = num_domains
         self.latent_dim = latent_dim
-        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+
+        # Adaptive temperature parameters
+        self.base_temperature = 0.1
+        self.temperature = nn.Parameter(torch.ones(1) * self.base_temperature)
+        self.min_temp = 0.01
+        self.max_temp = 10.0
+        self.temp_decay_rate = 0.99
+        self.convergence_threshold = 0.01
+
+        # Domain gates with temperature scaling
         self.domain_gates = nn.Parameter(torch.ones(num_domains) / num_domains)
+
+        # Previous loss tracking for convergence detection
+        self.register_buffer('prev_loss', torch.tensor(float('inf')))
+        self.register_buffer('convergence_counter', torch.tensor(0))
+        self.register_buffer('gradient_history', torch.zeros(num_domains))
 
         # Number of attention heads
         self.n_heads = 4
         self.head_dim = latent_dim // self.n_heads
         assert latent_dim % self.n_heads == 0, "latent_dim must be divisible by n_heads"
 
+        # Initialize gradient history buffer
+        self.register_buffer('gradient_history', torch.zeros(num_domains))
+
         # Domain encoders and norm
-        self.domain_encoders = nn.ModuleList(
-            [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
-        )
+        self.domain_encoders = nn.ModuleList([
+            VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)
+        ])
         self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
 
         # Multi-head attention components
@@ -494,13 +511,18 @@ class MultiDomainVAEEncoder(nn.Module):
         self.v_proj = nn.Linear(latent_dim, latent_dim)
         self.o_proj = nn.Linear(latent_dim, latent_dim)
 
-        # Layer norm for attention
+        # Attention normalization
         self.attention_norm = nn.LayerNorm(latent_dim)
 
-        # Dynamic Neighborhood Aggregation
+        # Dynamic Neighborhood Aggregation with gradient attention
         self.domain_attention = nn.Linear(latent_dim, num_domains)
+        self.gradient_gate = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, 1)
+        )
 
-        # Hierarchical mixing with attention and dynamic aggregation
+        # Hierarchical mixing with gradient-based attention
         self.hierarchical_level1 = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(latent_dim * 2, latent_dim),
@@ -510,6 +532,34 @@ class MultiDomainVAEEncoder(nn.Module):
             ) for _ in range(num_domains)
         ])
 
+    def compute_gradient_weights(self, features):
+        """Compute gradient-based attention weights"""
+        # Calculate gradient importance for each domain
+        gradient_importance = []
+        for feat in features:
+            if feat.requires_grad:
+                feat.retain_grad()  # Ensure gradients are retained
+                if feat.grad is not None:
+                    importance = torch.norm(feat.grad, p=2)
+                else:
+                    importance = torch.tensor(1.0).to(feat.device)
+            else:
+                importance = torch.tensor(1.0).to(feat.device)
+            gradient_importance.append(importance)
+
+        gradient_importance = torch.stack(gradient_importance)
+
+        # Apply temperature scaling and softmax
+        gradient_weights = F.softmax(gradient_importance / self.temperature, dim=0)
+
+        if not hasattr(self, 'gradient_history'):
+            self.register_buffer('gradient_history', torch.zeros_like(gradient_weights))
+
+        # Update gradient history with moving average
+        self.gradient_history = 0.9 * self.gradient_history + 0.1 * gradient_weights
+
+        return gradient_weights
+
     def attention(self, query, key, value, mask=None):
         batch_size = query.shape[0]
 
@@ -518,43 +568,19 @@ class MultiDomainVAEEncoder(nn.Module):
         key = key.view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention
+        # Scaled dot-product attention with temperature
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
-        attention_weights = F.softmax(scores, dim=-1)
+        attention_weights = F.softmax(scores / self.temperature, dim=-1)
 
-        # Apply attention weights
+        # Apply attention
         context = torch.matmul(attention_weights, value)
 
         # Combine heads
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.latent_dim)
 
         return self.o_proj(context)
-
-    def dynamic_neighborhood_aggregation(self, features):
-        """Aggregate features dynamically based on attention weights.
-
-        Args:
-            features: Input features tensor of shape [batch_size, num_domains, feature_dim]
-
-        Returns:
-            weighted_features: Aggregated features tensor of shape [batch_size, feature_dim]
-        """
-        # Calculate attention weights [batch_size, num_domains, num_domains]
-        attn_weights = F.softmax(
-            self.domain_attention(features) / self.temperature,
-            dim=-1  # Apply softmax on last dimension
-        )
-
-        # Clamp weights for stability [batch_size, num_domains, num_domains]
-        attn_weights = torch.clamp(attn_weights, min=0.1, max=0.9)
-        attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True)
-
-        # Weight aggregation
-        weighted_features = torch.einsum('ijk,ijl->ik', features, attn_weights)
-
-        return weighted_features
 
     def forward(self, x):
         batch_size = x.shape[0]
@@ -568,44 +594,62 @@ class MultiDomainVAEEncoder(nn.Module):
             all_mus.append(mu)
             all_logvars.append(logvar)
 
-        all_mus = torch.stack(all_mus, dim=1)  # [batch_size, num_domains, latent_dim]
+        all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Apply multi-head self-attention
+        # Apply multi-head attention
         q = self.q_proj(all_mus)
         k = self.k_proj(all_mus)
         v = self.v_proj(all_mus)
 
         attended_features = self.attention(q, k, v)
-        attended_features = self.attention_norm(attended_features + all_mus)  # Add residual
+        attended_features = self.attention_norm(attended_features + all_mus)
 
-        # Dynamic neighborhood aggregation
-        aggregated_features = self.dynamic_neighborhood_aggregation(attended_features)
-
-        # Level 1 mixing with dynamic aggregation
+        # Level 1 mixing with gradient tracking
         level1_features = []
         for i in range(self.num_domains):
-            # Combine aggregated features with original domain features
-            domain_features = torch.cat([
-                attended_features[:, i, :],
-                aggregated_features
-            ], dim=1)
+            domain_feat = attended_features[:, i, :].detach().clone().requires_grad_(True)
+            domain_feat.retain_grad()
 
-            level1_mixed = self.hierarchical_level1[i](domain_features)
-            level1_mixed = level1_mixed + attended_features[:, i, :]  # Residual connection
+            # Concatenate with dynamic neighborhood features
+            mixed = torch.cat([domain_feat, attended_features.mean(dim=1)], dim=1)
+            level1_mixed = self.hierarchical_level1[i](mixed)
+            level1_mixed = level1_mixed + domain_feat
             level1_features.append(level1_mixed)
 
-        # Global mixing with temperature-scaled gating
+        # Compute gradient-based attention weights
+        gradient_weights = self.compute_gradient_weights(level1_features)
+
+        # Combine with domain gates for final mixing weights
         gates = F.softmax(self.domain_gates / self.temperature, dim=0)
+        final_weights = F.softmax(gates * gradient_weights, dim=0)
+
+        # Global mixing with gradient-based attention
         mixed_features = []
         for i, feat in enumerate(level1_features):
-            mixed_features.append(feat * gates[i])
+            mixed_features.append(feat * final_weights[i])
 
         mixed_z = sum(mixed_features)
         mixed_mu = self.domain_norm(mixed_z, None)
         mixed_logvar = torch.zeros_like(mixed_mu)
 
         return mixed_z, mixed_mu, mixed_logvar
+
+    def update_temperature(self, current_loss):
+        """Update temperature based on loss convergence"""
+        loss_diff = abs(current_loss - self.prev_loss.item())
+
+        if loss_diff < self.convergence_threshold:
+            self.convergence_counter += 1
+            if self.convergence_counter > 5:
+                self.temperature.data *= self.temp_decay_rate
+        else:
+            self.convergence_counter.zero_()
+
+        self.temperature.data.clamp_(self.min_temp, self.max_temp)
+        self.prev_loss.copy_(torch.tensor(current_loss))
+
+        return self.temperature.item()
 
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
@@ -734,14 +778,10 @@ class CYCLEMIX(Algorithm):
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
         """
-        Compute VAE loss with MMD (Maximum Mean Discrepancy) for better domain generalization
-        Args:
-            x: Input data
-            recon_x: Reconstructed data
-            mu: Mean of latent distribution
-            logvar: Log variance of latent distribution
-        Returns:
-            Total loss combining reconstruction loss and MMD loss
+        MMD-VAE thay thế KL Divergence bằng Maximum Mean Discrepancy (MMD) để
+        so sánh giữa phân phối của latent space và một phân phối chuẩn (như Gaussian).
+            - Giảm hiện tượng "posterior collapse".
+            - MMD thường giúp latent space giữ được nhiều đặc trưng hơn của các domain.
         """
         # Reconstruction loss (MSE for continuous data)
         recon_loss = F.mse_loss(recon_x, x, reduction='mean')
@@ -808,6 +848,8 @@ class CYCLEMIX(Algorithm):
         self.grad_scaler.update()
         self.scheduler.step()
         self.current_epoch += 1
+
+        self.encoder.update_temperature(total_loss.item())
 
         return {
             "loss": total_loss.item(),
