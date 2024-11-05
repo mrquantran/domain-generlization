@@ -824,15 +824,15 @@ class CYCLEMIX(Algorithm):
             # Compute losses
             vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
             class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-            domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
+            # domain_loss = self.compute_domain_adversarial_loss(domain_pred, domain_labels)
 
             # Combined loss với dynamic weighting
             total_loss = (
                 class_loss +
-                vae_loss +
-                domain_weight * domain_loss +
-                ot_weight * ot_loss +
-                mi_weight * mi_loss
+                vae_loss
+                # domain_weight * domain_loss +
+                # ot_weight * ot_loss +
+                # mi_weight * mi_loss
             )
 
         self.optimizer.zero_grad()
@@ -852,9 +852,9 @@ class CYCLEMIX(Algorithm):
             "loss": total_loss.item(),
             "vae_loss": vae_loss.item(),
             "class_loss": class_loss.item(),
-            "domain_loss": domain_loss.item(),
-            "ot_loss": ot_loss.item(),
-            "mi_loss": mi_loss.item(),
+            # "domain_loss": domain_loss.item(),
+            # "ot_loss": ot_loss.item(),
+            # "mi_loss": mi_loss.item(),
             "mix_ratio_loss": mix_ratio,
             "temperature_loss": self.encoder.temperature.item()
         }
