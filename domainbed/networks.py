@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,61 +27,101 @@ import numpy as np
 from sklearn.decomposition import PCA
 
 class GLOGenerator(nn.Module):
-    """Generator network following GLO paper architecture"""
+    def __init__(self, latent_dim, output_shape):
+        super().__init__()
 
-    def __init__(self, latent_dim=1024, output_dim=3):
-        super(GLOGenerator, self).__init__()
+        self.output_shape = output_shape
+        init_channels = 512
 
-        # Following GLO paper architecture
-        self.fc = nn.Linear(latent_dim, 14 * 14 * 256)
+        self.fc = nn.Linear(latent_dim, init_channels * 4 * 4)
 
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), 
-            nn.ReLU(True),
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(init_channels, 256, 4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1), # size 56x56
-            nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(32, output_dim, 4, stride=2, padding=1), # size 112x112
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, output_shape[0], 4, stride=2, padding=1),
             nn.Tanh(),
         )
 
     def forward(self, z):
         x = self.fc(z)
-        x = x.view(-1, 256, 14, 14)
-        x = self.deconv(x)
-        return x
+        x = x.view(x.size(0), -1, 4, 4)
+        return self.decoder(x)
 
 class GLOModule(nn.Module):
-    def __init__(self, latent_dim=512, num_domains=3, batch_size=32):
+
+    def __init__(self, latent_dim=1024, num_domains=3, batch_size=32, temperature=0.07):
         super(GLOModule, self).__init__()
+        print('latent_dim:', latent_dim)
         self.latent_dim = latent_dim
         self.num_domains = num_domains
         self.batch_size = batch_size
+        self.temperature = temperature
 
         # Generator following GLO paper
         self.generator = GLOGenerator(latent_dim)
 
         # Learnable latent codes for each domain - key difference from original GLO
         # We maintain separate latent codes for each domain
-        self.domain_latents = nn.Parameter(
-            torch.randn(num_domains, batch_size, latent_dim)
-        )
+        self.encoder = Encoder(latent_dim)
+        self.domain_mu = nn.Parameter(torch.randn(num_domains, latent_dim))
+        self.domain_logvar = nn.Parameter(torch.randn(num_domains, latent_dim))
+        self.domain_latents = nn.Parameter(torch.randn(num_domains, batch_size, latent_dim))
 
         # Initialize with normal distribution as per GLO paper
         nn.init.normal_(self.domain_latents, mean=0.0, std=0.02)
 
     def forward(self, x, domain_idx):
+        """Forward pass of the GLO module.
+
+        Args:
+            x: Input tensor of shape [batch_size, channels, height, width]
+            domain_idx: Index of the current domain
+
+        Returns:
+            tuple: (generated images, latent vectors)
+        """
         batch_size = x.size(0)
 
-        # Get corresponding latent codes for the domain
-        z = self.domain_latents[domain_idx, :batch_size]
+        # Encode input images
+        mu, logvar = self.encoder(x)
+        z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+
+        # Create new domain latents tensor
+        new_domain_latents = self.domain_latents.clone()
+        new_domain_latents.data[domain_idx, :batch_size] = z.data
+        self.domain_latents = nn.Parameter(new_domain_latents)
 
         # Generate images
         generated = self.generator(z)
         return generated, z
+
+class Encoder(nn.Module):
+    def __init__(self, latent_dim):
+        super().__init__()
+        # Use EfficientNet as backbone
+        self.backbone = torchvision.models.efficientnet_b1(
+            weights=torchvision.models.EfficientNet_B1_Weights.DEFAULT
+        )
+        backbone_out_features = self.backbone.classifier[1].in_features
+
+        # Remove classifier
+        self.backbone.classifier = nn.Identity()
+
+        # VAE heads
+        self.fc_mu = nn.Linear(backbone_out_features, latent_dim)
+        self.fc_logvar = nn.Linear(backbone_out_features, latent_dim)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.fc_mu(features), self.fc_logvar(features)
+
 
 class CycleMixLayer(nn.Module):
     def __init__(self, hparams, device):
@@ -97,22 +138,14 @@ class CycleMixLayer(nn.Module):
             batch_size=hparams["batch_size"],
         ).to(device)
 
-        # Image normalization
-        self.norm = transforms.Compose(
-            [transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
-        )
-
-    def process_domain(self, batch, domain_idx):
+    def process_domain(self, batch, domain_idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Process single domain data"""
         x, y = batch
 
         # Generate domain-mixed samples
         x_hat, z = self.glo(x, domain_idx)
 
-        # Normalize generated samples
-        x_hat = self.norm(x_hat)
-
-        return (x, y), (x_hat, y)
+        return (x, y), (x_hat, y), (z, y)
 
     def forward(self, x: list):
         """
@@ -130,13 +163,10 @@ class CycleMixLayer(nn.Module):
         ]
 
         # Unzip results
-        original_samples, generated_samples = zip(*processed_domains)
-
-        # Combine original and generated samples
-        all_samples = list(original_samples) + list(generated_samples)
+        original_samples, generated_samples, z_samples = zip(*processed_domains)
 
         # Return in required format
-        return all_samples
+        return original_samples, generated_samples, z_samples
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
