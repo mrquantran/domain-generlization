@@ -502,6 +502,99 @@ class OTLoss(nn.Module):
         cost = torch.mean(pi * torch.cdist(source_features, target_features))
         return cost
 
+class AdaptiveNeighborSelector(nn.Module):
+    """Optimized neighbor selection with efficient batch processing"""
+    def __init__(self, latent_dim, num_domains, k_neighbors=2):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_domains = num_domains
+        self.k = min(k_neighbors, num_domains - 1)
+
+        # Simplified projection
+        self.domain_proj = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+
+    def forward(self, domain_features):
+        # [B, D, L] -> [B, D, L]
+        proj_features = self.domain_proj(domain_features)
+
+        # Normalize features for cosine similarity
+        proj_features = F.normalize(proj_features, p=2, dim=-1)
+
+        # Compute similarities in batch [B, D, D]
+        similarities = torch.bmm(proj_features, proj_features.transpose(1, 2))
+
+        # Mask self-similarities
+        mask = torch.eye(self.num_domains, device=similarities.device)[None, :, :]
+        similarities = similarities * (1 - mask) - mask
+
+        # Get top-k neighbors [B, D, K]
+        return similarities.topk(self.k, dim=-1)[1]
+
+class FeatureSelectionGate(nn.Module):
+    """Lightweight feature gating mechanism"""
+    def __init__(self, latent_dim):
+        super().__init__()
+        self.gate_net = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, context):
+        # Efficient gating without concatenation
+        # x: [B, K, L], context: [B, L]
+        gate = self.gate_net(context).unsqueeze(1)  # [B, 1, L]
+        return x * gate  # [B, K, L]
+
+class AdaptiveMixingBlock(nn.Module):
+    """Optimized mixing block with batch processing"""
+    def __init__(self, latent_dim, num_domains):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.num_domains = num_domains
+
+        # Domain-specific transform with shared parameters
+        self.transform = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim)
+        )
+
+        # Single shared temperature
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+
+    def forward(self, features, domain_idx, neighbor_indices):
+        """
+        Args:
+            features: [B, D, L]
+            domain_idx: int
+            neighbor_indices: [B, K]
+        Returns:
+            mixed_features: [B, L]
+        """
+        batch_size = features.size(0)
+
+        # Get domain features and neighbors
+        domain_features = features[:, domain_idx]  # [B, L]
+        neighbor_features = torch.gather(
+            features,
+            1,
+            neighbor_indices.unsqueeze(-1).expand(-1, -1, self.latent_dim)
+        )  # [B, K, L]
+
+        # Transform features
+        transformed = self.transform(neighbor_features)  # [B, K, L]
+
+        # Compute attention weights
+        temp = F.softplus(self.temperature) + 1e-6
+        logits = torch.bmm(transformed, domain_features.unsqueeze(-1)) / temp  # [B, K, 1]
+        weights = F.softmax(logits, dim=1)  # [B, K, 1]
+
+        # Weighted sum
+        return (transformed * weights).sum(1)  # [B, L]
+
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
         super(MultiDomainVAEEncoder, self).__init__()
@@ -516,6 +609,7 @@ class MultiDomainVAEEncoder(nn.Module):
         self.domain_encoders = nn.ModuleList(
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
+
         self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
         self.grl = GRL(alpha=1.0)
         self.domain_discriminator = DomainDiscriminator(latent_dim)
@@ -527,6 +621,13 @@ class MultiDomainVAEEncoder(nn.Module):
             nn.Linear(latent_dim, latent_dim)
         )
 
+        self.neighbor_selector = AdaptiveNeighborSelector(
+            latent_dim, num_domains, k_neighbors=2
+        )
+        self.mixing_block = AdaptiveMixingBlock(latent_dim, num_domains)
+        self.global_attention = nn.Parameter(torch.ones(num_domains) / num_domains)
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+
         # Thêm hierarchical mixing components
         self.hierarchical_level1 = nn.ModuleList([
             nn.Sequential(
@@ -536,6 +637,7 @@ class MultiDomainVAEEncoder(nn.Module):
                 nn.Linear(latent_dim, latent_dim)
             ) for _ in range(num_domains)
         ])
+
 
         # MI Estimator cho regularization
         self.mi_estimator = nn.Sequential(
@@ -579,69 +681,75 @@ class MultiDomainVAEEncoder(nn.Module):
         return total_ot_loss / n_pairs if n_pairs > 0 else 0
 
     def compute_mi_loss(self, mixed_features, domain_features):
-        mi_loss = 0
+        """Efficient mutual information loss computation"""
         batch_size = mixed_features.shape[0]
 
-        for domain_feat in domain_features:
-            pos_score = self.mi_estimator(torch.cat([mixed_features, domain_feat], dim=1))
+        # Compute MI loss for each domain
+        mi_losses = []
+        for i in range(self.num_domains):
+            domain_feat = domain_features[:, i]  # [B, L]
 
-            # Negative samples
-            idx = torch.randperm(batch_size)
-            neg_score = self.mi_estimator(torch.cat([mixed_features, domain_feat[idx]], dim=1))
+            # Positive samples
+            pos_pairs = torch.cat([mixed_features, domain_feat], dim=1)  # [B, 2L]
+            pos_score = self.mi_estimator(pos_pairs)  # [B, 1]
 
-            mi_loss += F.softplus(neg_score - pos_score).mean()
+            # Negative samples (use batch shuffling)
+            neg_idx = torch.randperm(batch_size, device=mixed_features.device)
+            neg_pairs = torch.cat([mixed_features, domain_feat[neg_idx]], dim=1)
+            neg_score = self.mi_estimator(neg_pairs)
 
-        return mi_loss / len(domain_features)
+            # InfoNCE loss
+            mi_losses.append(F.softplus(neg_score - pos_score).mean())
 
-    def forward(self, x, domain_idx=None, alpha=1.0):
+        return torch.stack(mi_losses).mean()
+
+    def forward(self, x, domain_idx=None, alpha=0.5):
         batch_size = x.shape[0]
 
-        # Encode từ domain encoders như cũ
+        # Encode features from all domains
         all_mus = []
         all_logvars = []
         for i, encoder in enumerate(self.domain_encoders):
             mu, logvar = encoder(x)
-            mu = self.domain_norm(mu, i)
+            mu = self.domain_norm(mu)
             all_mus.append(mu)
             all_logvars.append(logvar)
 
-        all_mus = torch.stack(all_mus, dim=1)
-        all_logvars = torch.stack(all_logvars, dim=1)
+        all_mus = torch.stack(all_mus, dim=1)  # [B, D, L]
+        all_logvars = torch.stack(all_logvars, dim=1)  # [B, D, L]
 
-        # Level 1 mixing với residual connection
+        # Level 1 mixing with neighbor selection
         level1_features = []
+        neighbor_indices = self.neighbor_selector(all_mus)  # [B, D, K]
+
         for i in range(self.num_domains):
-            left_idx = (i - 1) % self.num_domains
-            right_idx = (i + 1) % self.num_domains
+            # Mix with neighbors
+            domain_neighbors = neighbor_indices[:, i]  # [B, K]
+            mixed = self.mixing_block(all_mus, i, domain_neighbors)  # [B, L]
 
-            neighbor_features = torch.cat([
-                all_mus[:, left_idx, :],
-                all_mus[:, right_idx, :]
-            ], dim=1)
-
-            level1_mixed = self.hierarchical_level1[i](neighbor_features)
             # Add residual connection
-            level1_mixed = level1_mixed + neighbor_features[:, :self.latent_dim]
-            level1_features.append(level1_mixed)
+            mixed = mixed + all_mus[:, i]  # [B, L]
+            level1_features.append(mixed)
 
-        # Global mixing với dynamic gating
-        gates = F.softmax(self.domain_gates / self.temperature, dim=0)
-        mixed_features = []
-        for i, feat in enumerate(level1_features):
-            mixed_features.append(feat * gates[i])
-        mixed_z = sum(mixed_features)
+        level1_features = torch.stack(level1_features, dim=1)  # [B, D, L]
 
-        # GRL và domain discrimination giữ nguyên
-        grl_z = self.grl(mixed_z)
-        domain_pred = self.domain_discriminator(grl_z)
+        # Global mixing with attention
+        temp = F.softplus(self.temperature) + 1e-6
+        global_weights = F.softmax(self.global_attention / temp, dim=0)
+        mixed_features = (level1_features * global_weights[None, :, None]).sum(
+            1
+        )  # [B, L]
 
-        # Compute OT loss giữ nguyên
+        # Domain adversarial
+        grl_features = self.grl(mixed_features)
+        domain_pred = self.domain_discriminator(grl_features)
+
+        # Compute losses
         ot_loss = self.compute_ot_loss(all_mus)
+        mi_loss = self.compute_mi_loss(mixed_features, level1_features)
 
-        # Compute MI loss
-        mi_loss = self.compute_mi_loss(mixed_z, level1_features)
+        return mixed_features, all_mus, all_logvars, domain_pred, ot_loss, mi_loss
 
-        return mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss
 
 class VAEDecoder(nn.Module):
     def __init__(self, latent_dim, output_shape, h_dim, w_dim):
