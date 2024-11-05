@@ -293,6 +293,47 @@ def save_images(x, x_generated, current_epoch):
 #         return self
 
 
+class VAEDecoder(nn.Module):
+    def __init__(self, latent_dim, output_shape, h_dim, w_dim):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.output_shape = output_shape
+
+        # Calculate starting dimensions
+        self.h_dim = h_dim
+        self.w_dim = w_dim
+        self.start_channels = 512
+
+        # Project and reshape
+        self.fc = nn.Linear(latent_dim, self.start_channels * self.h_dim * self.w_dim)
+
+        # Decoder layers - careful to match input dimensions
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(
+                self.start_channels, 256, kernel_size=4, stride=2, padding=1
+            ),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, output_shape[0], kernel_size=4, stride=2, padding=1),
+            nn.Tanh(),
+        )
+
+    def forward(self, z):
+        # Project and reshape
+        x = self.fc(z)
+        x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
+        # Decode
+        x = self.decoder(x)
+        return x
+
+
 class VAEEncoder(nn.Module):
     """VAE Encoder using ResNet with MoCo-v2 pretraining"""
 
@@ -480,27 +521,56 @@ class OTLoss(nn.Module):
         self.reg_e = reg_e
 
     def forward(self, source_features, target_features):
-        # Convert to numpy for POT library
-        source = source_features.detach().cpu().numpy()
-        target = target_features.detach().cpu().numpy()
+        # Keep features on GPU
+        # Calculate cost matrix directly on GPU
+        M = torch.cdist(source_features, target_features)
+        M = M / M.max()
 
-        # Calculate cost matrix
-        M = ot.dist(source, target)
-        M /= M.max()
+        # Uniform weights on GPU
+        n_source = source_features.shape[0]
+        n_target = target_features.shape[0]
+        a = torch.ones(n_source, device=source_features.device) / n_source
+        b = torch.ones(n_target, device=target_features.device) / n_target
 
-        # Uniform weights
-        n_source = source.shape[0]
-        n_target = target.shape[0]
-        a = np.ones(n_source) / n_source
-        b = np.ones(n_target) / n_target
+        # Use Sinkhorn on GPU
+        K = torch.exp(-M / self.reg_e)
+        u = torch.ones_like(a)
+
+        # Sinkhorn iterations
+        for _ in range(100):
+            u = a / (K @ (b / (K.t() @ u)))
+        v = b / (K.t() @ u)
 
         # Get transport plan
-        pi = ot.sinkhorn(a, b, M, self.reg_e)
-        pi = torch.from_numpy(pi).float().to(source_features.device)
+        pi = torch.diag(u) @ K @ torch.diag(v)
 
         # Calculate transport cost
-        cost = torch.mean(pi * torch.cdist(source_features, target_features))
+        cost = torch.mean(pi * M)
         return cost
+
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads=4, dropout=0.1)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        attn_out, _ = self.attn(x, x, x)
+        return self.norm(x + attn_out)
+
+class ResidualFFN(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(dim * 2, dim)
+        )
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        return self.norm(x + self.ffn(x))
 
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
@@ -520,38 +590,85 @@ class MultiDomainVAEEncoder(nn.Module):
         self.grl = GRL(alpha=1.0)
         self.domain_discriminator = DomainDiscriminator(latent_dim)
         self.ot_loss = OTLoss(reg_e=0.1)
+
+        # Cải tiến 1: Adaptive Feature Transform
         self.feature_transform = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),  # Thêm dropout để tăng tính robust
             nn.Linear(latent_dim, latent_dim)
         )
 
-        # Thêm hierarchical mixing components
+        # Enhanced Hierarchical Level 1 with attention and proper dimensions
         self.hierarchical_level1 = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(latent_dim * 2, latent_dim),
-                nn.LayerNorm(latent_dim),
-                nn.ReLU(),
-                nn.Linear(latent_dim, latent_dim)
-            ) for _ in range(num_domains)
+            nn.ModuleDict({
+                'project': nn.Linear(latent_dim * 2, latent_dim),  # Project concatenated features
+                'attention': nn.MultiheadAttention(latent_dim, 4, dropout=0.1),
+                'norm1': nn.LayerNorm(latent_dim),
+                'ffn': nn.Sequential(
+                    nn.Linear(latent_dim, latent_dim * 4),
+                    nn.LayerNorm(latent_dim * 4),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(latent_dim * 4, latent_dim)
+                ),
+                'norm2': nn.LayerNorm(latent_dim)
+            }) for _ in range(num_domains)
         ])
 
-        # MI Estimator cho regularization
+        # Cải tiến 3: Enhanced MI Estimator với gradient scaling
         self.mi_estimator = nn.Sequential(
             nn.Linear(latent_dim * 2, 512),
+            nn.BatchNorm1d(512),  # Thêm BN để ổn định training
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(256, 1)
         )
 
+    def compute_mi_loss(self, mixed_features, domain_features, scale_factor=0.1):
+        """Enhanced MI Loss với gradient scaling và numerical stability"""
+        mi_loss = 0
+        batch_size = mixed_features.shape[0]
+
+        # Normalize features để tăng stability
+        mixed_features = F.normalize(mixed_features, dim=1)
+        domain_features = [F.normalize(feat, dim=1) for feat in domain_features]
+
+        for domain_feat in domain_features:
+            # Positive samples
+            pos_pair = torch.cat([mixed_features, domain_feat], dim=1)
+            pos_score = self.mi_estimator(pos_pair)
+
+            # Hard negative mining
+            with torch.no_grad():
+                # Find hardest negative samples
+                similarity = torch.mm(mixed_features, domain_feat.t())
+                _, hard_idx = similarity.topk(min(batch_size//4, 16), dim=1, largest=False)
+                hard_idx = hard_idx[:, 0]
+
+            # Negative samples với hard mining
+            neg_feat = domain_feat[hard_idx]
+            neg_pair = torch.cat([mixed_features, neg_feat], dim=1)
+            neg_score = self.mi_estimator(neg_pair)
+
+            # InfoNCE loss với temperature scaling
+            temperature = F.softplus(self.temperature) + 1e-6
+            mi_loss += F.softplus(neg_score/temperature - pos_score/temperature).mean()
+
+        return scale_factor * mi_loss / len(domain_features)
+
     def compute_ot_loss(self, all_mus):
+        """Enhanced OT Loss with adaptive regularization"""
         total_ot_loss = 0
         n_pairs = 0
 
         # Get current temperature with numerical stability
-        temperature = torch.nn.functional.softplus(self.temperature) + 1e-3
+        temperature = torch.nn.functional.softplus(self.temperature) + 1e-6
 
         for i in range(self.num_domains):
             for j in range(i + 1, self.num_domains):
@@ -562,41 +679,35 @@ class MultiDomainVAEEncoder(nn.Module):
                 target = self.feature_transform(all_mus[:, j, :])
                 target = self.feature_norm(target) / temperature
 
-                # Compute cosine similarity with torch function
-                cos_sim = torch.nn.functional.cosine_similarity(source, target, dim=1).mean()
+                # Compute cosine similarity using torch functions
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    source.unsqueeze(1),
+                    target.unsqueeze(0),
+                    dim=2
+                ).mean()
 
                 try:
-                    # Compute OT loss with increased iterations/regularization
-                    domain_ot_loss = self.ot_loss(source, target)
-                except Exception as e:
+                    # Calculate optimal transport loss directly
+                    domain_ot_loss = self.ot_loss(source_features=source, target_features=target)
+                except (RuntimeError, ValueError) as e:
                     print(f"Warning: OT computation failed: {str(e)}")
-                    # Fallback to cosine distance if OT fails
                     domain_ot_loss = 1 - cos_sim
 
                 total_ot_loss += domain_ot_loss + 0.1 * (1 - cos_sim)
                 n_pairs += 1
 
-        return total_ot_loss / n_pairs if n_pairs > 0 else 0
+        return total_ot_loss / n_pairs if n_pairs > 0 else torch.tensor(0.0).to(all_mus.device)
 
-    def compute_mi_loss(self, mixed_features, domain_features):
-        mi_loss = 0
-        batch_size = mixed_features.shape[0]
+    def forward(self, x: torch.Tensor) -> tuple:
+        """Forward pass of the multi-domain VAE encoder.
 
-        for domain_feat in domain_features:
-            pos_score = self.mi_estimator(torch.cat([mixed_features, domain_feat], dim=1))
+        Args:
+            x: Input tensor of shape [batch_size, channels, height, width]
 
-            # Negative samples
-            idx = torch.randperm(batch_size)
-            neg_score = self.mi_estimator(torch.cat([mixed_features, domain_feat[idx]], dim=1))
-
-            mi_loss += F.softplus(neg_score - pos_score).mean()
-
-        return mi_loss / len(domain_features)
-
-    def forward(self, x, domain_idx=None, alpha=1.0):
-        batch_size = x.shape[0]
-
-        # Encode từ domain encoders như cũ
+        Returns:
+            tuple: (mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss)
+        """
+        # Encode from domain encoders
         all_mus = []
         all_logvars = []
         for i, encoder in enumerate(self.domain_encoders):
@@ -608,93 +719,63 @@ class MultiDomainVAEEncoder(nn.Module):
         all_mus = torch.stack(all_mus, dim=1)
         all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Level 1 mixing với residual connection
         level1_features = []
         for i in range(self.num_domains):
             left_idx = (i - 1) % self.num_domains
             right_idx = (i + 1) % self.num_domains
 
+            # Prepare neighbor features
             neighbor_features = torch.cat([
                 all_mus[:, left_idx, :],
                 all_mus[:, right_idx, :]
-            ], dim=1)
+            ], dim=1)  # Shape: [batch_size, latent_dim * 2]
 
-            level1_mixed = self.hierarchical_level1[i](neighbor_features)
-            # Add residual connection
-            level1_mixed = level1_mixed + neighbor_features[:, :self.latent_dim]
+            # Project to correct dimension
+            projected_features = self.hierarchical_level1[i]['project'](neighbor_features)
+            # Shape: [batch_size, latent_dim]
+
+            # Add sequence dimension for attention
+            projected_features = projected_features.unsqueeze(0)
+            # Shape: [1, batch_size, latent_dim]
+
+            # Self-attention on projected features
+            attn_out, _ = self.hierarchical_level1[i]['attention'](
+                projected_features,
+                projected_features,
+                projected_features
+            )
+            attn_out = attn_out.squeeze(0)  # Remove sequence dimension
+            attn_out = self.hierarchical_level1[i]['norm1'](attn_out)
+
+            # FFN with residual
+            level1_mixed = self.hierarchical_level1[i]['ffn'](attn_out)
+            level1_mixed = self.hierarchical_level1[i]['norm2'](level1_mixed + attn_out)
+
             level1_features.append(level1_mixed)
 
-        # Global mixing với dynamic gating
-        gates = F.softmax(self.domain_gates / self.temperature, dim=0)
-        mixed_features = []
-        for i, feat in enumerate(level1_features):
-            mixed_features.append(feat * gates[i])
+        # Global mixing with enhanced temperature scaling
+        # Using nn.functional.softplus for temperature scaling
+        temperature = torch.nn.functional.softplus(self.temperature) + 1e-6
+        gates = torch.nn.functional.softmax(self.domain_gates / temperature, dim=0)
+
+        # Ensure gates match the number of features
+        if len(gates) != len(level1_features):
+            raise ValueError(f"Number of gates ({len(gates)}) must match number of features ({len(level1_features)})")
+
+        # Mix features using gates
+        mixed_features = [feat * gate for feat, gate in zip(level1_features, gates)]
         mixed_z = sum(mixed_features)
 
-        # GRL và domain discrimination giữ nguyên
+        # Compute domain predictions for adversarial training
         grl_z = self.grl(mixed_z)
         domain_pred = self.domain_discriminator(grl_z)
 
-        # Compute OT loss giữ nguyên
-        ot_loss = self.compute_ot_loss(all_mus)
 
-        # Compute MI loss
+        # Compute optimal transport and mutual information losses
+        ot_loss = self.compute_ot_loss(all_mus)
         mi_loss = self.compute_mi_loss(mixed_z, level1_features)
 
         return mixed_z, all_mus, all_logvars, domain_pred, ot_loss, mi_loss
-
-class VAEDecoder(nn.Module):
-    def __init__(self, latent_dim, output_shape, h_dim, w_dim):
-        super().__init__()
-
-        self.latent_dim = latent_dim
-        self.output_shape = output_shape
-
-        # Calculate starting dimensions
-        self.h_dim = h_dim
-        self.w_dim = w_dim
-        self.start_channels = 512
-
-        # Project and reshape
-        self.fc = nn.Linear(latent_dim, self.start_channels * self.h_dim * self.w_dim)
-
-        # Decoder layers - careful to match input dimensions
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(
-                self.start_channels, 256,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                256, 128,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                128, 64,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                64, output_shape[0],
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.Tanh()
-        )
-
-    def forward(self, z):
-        # Project and reshape
-        x = self.fc(z)
-        x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
-        # Decode
-        x = self.decoder(x)
-        return x
 
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -814,7 +895,7 @@ class CYCLEMIX(Algorithm):
         # Forward pass
         with torch.amp.autocast('cuda'):
             mixed_z, mu, logvar, domain_pred, ot_loss, mi_loss = \
-                self.encoder(all_x, domain_labels, alpha=mix_ratio)
+                self.encoder(all_x)
 
             recon_x = self.decoder(mixed_z)
 
