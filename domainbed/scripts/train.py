@@ -340,7 +340,7 @@ if __name__ == "__main__":
             else:
                 patience_counter += 1
 
-            if patience_counter >= 501:
+            if patience_counter >= 101:
                 misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
                 break
 
