@@ -483,8 +483,12 @@ class MultiDomainVAEEncoder(nn.Module):
         self.temp_decay_rate = 0.99
         self.convergence_threshold = 0.01
 
-        # Domain gates with temperature scaling
-        self.domain_gates = nn.Parameter(torch.ones(num_domains) / num_domains)
+        # Initialize conditional gating parameters
+        self.conditional_gate_layer = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.ReLU(),
+            nn.Linear(latent_dim // 2, num_domains)
+        )
 
         # Previous loss tracking for convergence detection
         self.register_buffer('prev_loss', torch.tensor(float('inf')))
@@ -499,7 +503,7 @@ class MultiDomainVAEEncoder(nn.Module):
         # Initialize gradient history buffer
         self.register_buffer('gradient_history', torch.zeros(num_domains))
 
-        # Domain encoders and norm
+        # Domain encoders and normalization
         self.domain_encoders = nn.ModuleList([
             VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)
         ])
@@ -514,8 +518,7 @@ class MultiDomainVAEEncoder(nn.Module):
         # Attention normalization
         self.attention_norm = nn.LayerNorm(latent_dim)
 
-        # Dynamic Neighborhood Aggregation with gradient attention
-        self.domain_attention = nn.Linear(latent_dim, num_domains)
+        # Dynamic gradient-based neighborhood aggregation
         self.gradient_gate = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.ReLU(),
@@ -534,11 +537,10 @@ class MultiDomainVAEEncoder(nn.Module):
 
     def compute_gradient_weights(self, features):
         """Compute gradient-based attention weights"""
-        # Calculate gradient importance for each domain
         gradient_importance = []
         for feat in features:
             if feat.requires_grad:
-                feat.retain_grad()  # Ensure gradients are retained
+                feat.retain_grad()
                 if feat.grad is not None:
                     importance = torch.norm(feat.grad, p=2)
                 else:
@@ -551,9 +553,6 @@ class MultiDomainVAEEncoder(nn.Module):
 
         # Apply temperature scaling and softmax
         gradient_weights = F.softmax(gradient_importance / self.temperature, dim=0)
-
-        if not hasattr(self, 'gradient_history'):
-            self.register_buffer('gradient_history', torch.zeros_like(gradient_weights))
 
         # Update gradient history with moving average
         self.gradient_history = 0.9 * self.gradient_history + 0.1 * gradient_weights
@@ -594,7 +593,7 @@ class MultiDomainVAEEncoder(nn.Module):
             all_mus.append(mu)
             all_logvars.append(logvar)
 
-        all_mus = torch.stack(all_mus, dim=1)
+        all_mus = torch.stack(all_mus, dim=1)  # [batch_size, num_domains, latent_dim]
         all_logvars = torch.stack(all_logvars, dim=1)
 
         # Apply multi-head attention
@@ -614,17 +613,23 @@ class MultiDomainVAEEncoder(nn.Module):
             # Concatenate with dynamic neighborhood features
             mixed = torch.cat([domain_feat, attended_features.mean(dim=1)], dim=1)
             level1_mixed = self.hierarchical_level1[i](mixed)
-            level1_mixed = level1_mixed + domain_feat
+            level1_mixed = level1_mixed + domain_feat  # Residual connection
             level1_features.append(level1_mixed)
 
         # Compute gradient-based attention weights
         gradient_weights = self.compute_gradient_weights(level1_features)
 
-        # Combine with domain gates for final mixing weights
-        gates = F.softmax(self.domain_gates / self.temperature, dim=0)
-        final_weights = F.softmax(gates * gradient_weights, dim=0)
+        # Compute conditional gates based on batch features
+        batch_features = torch.stack(level1_features).mean(dim=0) # [batch_size, latent_dim]
+        conditional_gates = self.conditional_gate_layer(batch_features) # [batch_size, num_domains]
 
-        # Global mixing with gradient-based attention
+        # Temperature-scaled softmax for both gates
+        conditional_gates = F.softmax(conditional_gates / self.temperature, dim=-1)
+
+        # Combine gradient weights and conditional gates
+        final_weights = F.softmax(gradient_weights * conditional_gates.mean(dim=0), dim=0)
+
+        # Global mixing with both gradient and conditional weighting
         mixed_features = []
         for i, feat in enumerate(level1_features):
             mixed_features.append(feat * final_weights[i])
