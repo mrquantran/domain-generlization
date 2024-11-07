@@ -358,114 +358,6 @@ class VAEEncoder(nn.Module):
         super().train(mode)
         self._freeze_bn()
 
-class AdaptiveDomainNorm(nn.Module):
-    """Enhanced normalization with batch statistics, domain-specific parameters, and regularization"""
-    def __init__(self, num_features, num_domains, eps=1e-5, momentum=0.1, l2_lambda=0.01, dropout_rate=0.2):
-        super().__init__()
-        self.num_features = num_features
-        self.num_domains = num_domains
-        self.eps = eps
-        self.momentum = momentum
-        self.l2_lambda = l2_lambda # L2 regularization coefficient
-        self.regularization_loss = 0.0
-
-        # Domain-specific layers
-        self.norm = nn.ModuleList(
-            [nn.LayerNorm(num_features) for _ in range(num_domains)]
-        )
-
-        # Running statistics for each domain
-        self.register_buffer("running_mean", torch.zeros(num_domains, num_features))
-        self.register_buffer("running_var", torch.ones(num_domains, num_features))
-        self.register_buffer("num_batches_tracked", torch.zeros(num_domains))
-
-        # Learnable parameters
-        self.domain_gates = nn.Parameter(torch.ones(num_domains) / num_domains)
-        self.scale = nn.Parameter(torch.ones(num_domains, num_features))
-        self.bias = nn.Parameter(torch.zeros(num_domains, num_features))
-
-        self.instance_norm = nn.InstanceNorm1d(num_features, affine=False)
-
-        # Dropout layer for regularization
-        self.dropout = nn.Dropout(p=dropout_rate)
-
-    def _update_stats(self, x, domain_idx):
-        if self.training:
-            with torch.no_grad():
-                batch_mean = x.mean(0)
-                batch_var = x.var(0, unbiased=False)
-
-                # Update running stats
-                if self.num_batches_tracked[domain_idx] == 0:
-                    self.running_mean[domain_idx] = batch_mean
-                    self.running_var[domain_idx] = batch_var
-                else:
-                    self.running_mean[domain_idx] = (
-                        1 - self.momentum
-                    ) * self.running_mean[domain_idx] + self.momentum * batch_mean
-                    self.running_var[domain_idx] = (
-                        1 - self.momentum
-                    ) * self.running_var[domain_idx] + self.momentum * batch_var
-                self.num_batches_tracked[domain_idx] += 1
-
-    def compute_l2_loss(self):
-        """Compute L2 regularization loss for scale and bias parameters"""
-        l2_scale_loss = self.l2_lambda * torch.sum(self.scale ** 2)
-        l2_bias_loss = self.l2_lambda * torch.sum(self.bias ** 2)
-        return l2_scale_loss + l2_bias_loss
-
-    def forward(self, x, domain_idx=None):
-        if domain_idx is not None:
-            # Update statistics
-            self._update_stats(x, domain_idx)
-
-            # Normalize with domain-specific stats
-            if self.training:
-                mean = x.mean(0)
-                var = x.var(0, unbiased=False)
-            else:
-                mean = self.running_mean[domain_idx]
-                var = self.running_var[domain_idx]
-
-            # Normalize and apply domain-specific adjustments
-            normalized = (x - mean) / torch.sqrt(var + self.eps)
-            normalized = self.norm[domain_idx](normalized)
-
-            # Apply dropout during training
-            if self.training:
-                normalized = self.dropout(normalized)
-
-            # Apply scale and bias
-            out = self.scale[domain_idx] * normalized + self.bias[domain_idx]
-
-            # Add L2 regularization loss if in training mode
-            if self.training:
-                self.regularization_loss = self.compute_l2_loss()
-            else:
-                self.regularization_loss = 0.0
-
-            return out
-
-        # For unknown domains, use instance norm and weighted combination
-        inst_norm = self.instance_norm(x.unsqueeze(1)).squeeze(1)
-        gates = F.softmax(self.domain_gates, dim=0)
-
-        # Apply dropout to instance normalized features during training
-        if self.training:
-            inst_norm = self.dropout(inst_norm)
-
-        out = 0
-        for i in range(self.num_domains):
-            domain_norm = self.norm[i](inst_norm)
-            out += gates[i] * (self.scale[i] * domain_norm + self.bias[i])
-
-        # Add L2 regularization loss if in training mode
-        if self.training:
-            self.regularization_loss = self.compute_l2_loss()
-        else:
-            self.regularization_loss = 0.0
-
-        return out
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
         super(MultiDomainVAEEncoder, self).__init__()
@@ -484,7 +376,7 @@ class MultiDomainVAEEncoder(nn.Module):
         self.domain_encoders = nn.ModuleList(
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
-        self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
+        self.instance_norm = nn.InstanceNorm1d(latent_dim, affine=False)
 
         # Multi-head attention projections
         self.q_proj = nn.ModuleList([
@@ -593,7 +485,6 @@ class MultiDomainVAEEncoder(nn.Module):
         all_logvars = []
         for i, encoder in enumerate(self.domain_encoders):
             mu, logvar = encoder(x)
-            mu = self.domain_norm(mu, i)
             all_mus.append(mu)
             all_logvars.append(logvar)
 
@@ -619,7 +510,7 @@ class MultiDomainVAEEncoder(nn.Module):
 
             # Combine features
             domain_features = torch.cat([
-                domain_attended * uncertainty_weight,
+                domain_attended,
                 domain_aggregated
             ], dim=1)  # [batch_size, latent_dim*2]
 
@@ -637,7 +528,9 @@ class MultiDomainVAEEncoder(nn.Module):
             mixed_features.append(feat * gates[i] * uncertainty_weight.unsqueeze(1))
 
         mixed_z = sum(mixed_features)
-        mixed_mu = self.domain_norm(mixed_z, None)
+
+        # normalize mixed_mu from mixed_z
+        mixed_mu = mixed_z / torch.norm(mixed_z, dim=1, keepdim=True)
         mixed_logvar = torch.zeros_like(mixed_mu)
 
         return mixed_z, mixed_mu, mixed_logvar
@@ -702,7 +595,7 @@ class CYCLEMIX(Algorithm):
 
         # Giữ nguyên các hyperparameters hiện tại
         self.input_shape = input_shape
-        self.latent_dim = hparams.get("latent_dim", 256)
+        self.latent_dim = hparams.get("latent_dim", 512)
         self.beta = hparams.get("beta", 4.0)
         self.grad_clip = hparams.get("grad_clip", 1.0)
         print(f'LATENT DIM: {self.latent_dim}')
