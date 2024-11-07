@@ -402,6 +402,59 @@ class AdaptiveDomainNorm(nn.Module):
 
         return out
 
+class VAEDecoder(nn.Module):
+    def __init__(self, latent_dim, output_shape, h_dim, w_dim):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.output_shape = output_shape
+
+        # Calculate starting dimensions
+        self.h_dim = h_dim
+        self.w_dim = w_dim
+        self.start_channels = 512
+
+        # Project and reshape
+        self.fc = nn.Linear(latent_dim, self.start_channels * self.h_dim * self.w_dim)
+
+        # Decoder layers - careful to match input dimensions
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(
+                self.start_channels, 256,
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(
+                256, 128,
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(
+                128, 64,
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+
+            nn.ConvTranspose2d(
+                64, output_shape[0],
+                kernel_size=4, stride=2, padding=1
+            ),
+            nn.Tanh()
+        )
+
+    def forward(self, z):
+        # Project and reshape
+        x = self.fc(z)
+        x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
+        # Decode
+        x = self.decoder(x)
+        return x
+
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
         super(MultiDomainVAEEncoder, self).__init__()
@@ -420,7 +473,7 @@ class MultiDomainVAEEncoder(nn.Module):
         self.domain_encoders = nn.ModuleList(
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
-        self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
+        self.inference_encoder = VAEEncoder(input_shape, latent_dim)
 
         # Multi-head attention projections
         self.q_proj = nn.ModuleList([
@@ -449,6 +502,16 @@ class MultiDomainVAEEncoder(nn.Module):
                 nn.Linear(latent_dim, latent_dim)
             ) for _ in range(num_domains)
         ])
+
+        # Save average attention patterns during training
+        self.register_buffer('avg_attention_weights', torch.zeros(num_domains, num_domains))
+        self.register_buffer('attention_count', torch.zeros(1))
+
+    def update_attention_stats(self, attention_weights):
+        # Update running average of attention weights during training
+        if self.training:
+            self.avg_attention_weights = (self.avg_attention_weights * self.attention_count + attention_weights) / (self.attention_count + 1)
+            self.attention_count += 1
 
     def attention(self, mu, logvar, mask=None):
         """Multi-head attention with uncertainty weighting"""
@@ -525,109 +588,115 @@ class MultiDomainVAEEncoder(nn.Module):
 
     def forward(self, x):
         # Get encodings from domain encoders
-        all_mus = []
-        all_logvars = []
-        for i, encoder in enumerate(self.domain_encoders):
-            mu, logvar = encoder(x)
-            all_mus.append(mu)
-            all_logvars.append(logvar)
+        # x shape: [batch_size * num_domains, channels, height, width]
+        # get x for each domain [batch_size, channels, height, width]. List of num_domains have tensors of shape [batch_size, channels, height, width]
+        if self.training:
+            x_domain = list(x.chunk(self.num_domains, dim=0))
 
-        all_mus = torch.stack(all_mus, dim=1)     # [batch_size, num_domains, latent_dim]
-        all_logvars = torch.stack(all_logvars, dim=1)
+            all_mus = []
+            all_logvars = []
+            for i, encoder in enumerate(self.domain_encoders):
+                mu, logvar = encoder(x_domain[i])
+                all_mus.append(mu)
+                all_logvars.append(logvar)
 
-        # Apply attention with uncertainty
-        attended_features = self.attention(all_mus, all_logvars)
-        attended_features = self.attention_norm(attended_features + all_mus) # skip connection
+            all_mus = torch.stack(all_mus, dim=1)     # [batch_size, num_domains, latent_dim]
+            all_logvars = torch.stack(all_logvars, dim=1)
 
-        # Dynamic neighborhood aggregation
-        aggregated_features = self.dynamic_neighborhood_aggregation(attended_features, all_logvars)  # [batch_size, num_domains, latent_dim]
+            # Apply attention with uncertainty
+            attended_features = self.attention(all_mus, all_logvars)
+            attended_features = self.attention_norm(attended_features + all_mus) # skip connection
+            self.update_attention_stats(self.avg_attention_weights)
+            # Dynamic neighborhood aggregation
+            aggregated_features = self.dynamic_neighborhood_aggregation(attended_features, all_logvars)  # [batch_size, num_domains, latent_dim]
 
-        # Level 1 mixing with uncertainty-aware aggregation
-        level1_features = []
-        for i in range(self.num_domains):
-            # Extract features for current domain
-            domain_attended = attended_features[:, i, :]  # [batch_size, latent_dim]
-            domain_aggregated = aggregated_features[:, i, :]  # [batch_size, latent_dim]
+            # Level 1 mixing with uncertainty-aware aggregation
+            level1_features = []
+            for i in range(self.num_domains):
+                # Extract features for current domain
+                domain_attended = attended_features[:, i, :]  # [batch_size, latent_dim]
+                domain_aggregated = aggregated_features[:, i, :]  # [batch_size, latent_dim]
 
-            # Calculate uncertainty weight
-            uncertainty_weight = torch.exp(-all_logvars[:, i, :])  # [batch_size, latent_dim]
+                # Calculate uncertainty weight
+                uncertainty_weight = torch.exp(-all_logvars[:, i, :])  # [batch_size, latent_dim]
 
-            # Combine features
-            domain_features = torch.cat([
-                domain_attended * uncertainty_weight,
-                domain_aggregated
-            ], dim=1)  # [batch_size, latent_dim*2]
+                # Combine features
+                domain_features = torch.cat([
+                    domain_attended * uncertainty_weight,
+                    domain_aggregated
+                ], dim=1)  # [batch_size, latent_dim*2]
+
+                # Apply hierarchical mixing
+                level1_mixed = self.hierarchical_level1[i](domain_features)  # [batch_size, latent_dim]
+                level1_mixed = level1_mixed + domain_attended  # Residual connection
+                level1_features.append(level1_mixed)
+
+            # level 1 is list of num_domains tensors of shape [batch_size, latent_dim]
+            # get mixed_z and return [batch_size * num_domains, latent_dim]
+            mixed_z = torch.cat(level1_features, dim=0)
+            mixed_mu = mixed_z.mean(dim=1) if len(mixed_z.shape) > 2 else mixed_z
+            mixed_logvar = mixed_z.var(dim=1) if len(mixed_z.shape) > 2 else torch.zeros_like(mixed_z)
+            return mixed_z, mixed_mu, mixed_logvar
+        else:
+            # Inference flow
+            batch_size = x.shape[0]
+
+            # Direct projection to latent space
+            z_mu, z_logvar = self.inference_encoder(x)
+            # Shape: [batch_size, latent_dim]
+
+            # Sample from latent distribution
+            z_mixed = z_mu + torch.randn_like(z_mu) * torch.exp(0.5 * z_logvar)
+
+            # Expand z_mixed to match domain dimension
+            # Shape: [batch_size, num_domains, latent_dim]
+            z_expanded = z_mixed.unsqueeze(1).expand(-1, self.num_domains, -1)
+
+            # Apply stored attention patterns
+            # First, ensure attention weights are properly shaped
+            # Shape: [batch_size, num_domains, num_domains]
+            attention_weights = self.avg_attention_weights.softmax(dim=-1)
+            attention_weights = attention_weights.unsqueeze(0).expand(batch_size, -1, -1)
+
+            # Apply attention
+            # Shape after matmul: [batch_size, num_domains, latent_dim]
+            attended_features = torch.bmm(attention_weights, z_expanded)
+
+            # Use dynamic neighborhood aggregation with default uncertainty
+            default_logvar = torch.zeros_like(attended_features)
+            aggregated_features = self.dynamic_neighborhood_aggregation(
+                attended_features,
+                default_logvar
+            )
 
             # Apply hierarchical mixing
-            level1_mixed = self.hierarchical_level1[i](domain_features)  # [batch_size, latent_dim]
-            level1_mixed = level1_mixed + domain_attended  # Residual connection
-            level1_features.append(level1_mixed)
+            level1_features = []
+            for i in range(self.num_domains):
+                domain_attended = attended_features[:, i, :]    # [batch_size, latent_dim]
+                domain_aggregated = aggregated_features[:, i, :] # [batch_size, latent_dim]
 
-        # Global mixing with temperature-scaled gating
-        gates = F.softmax(self.domain_gates / self.temperature, dim=0)
-        mixed_features = []
-        for i, feat in enumerate(level1_features):
-            mixed_features.append(feat * gates[i])
+                # Combine features
+                domain_features = torch.cat([
+                    domain_attended,
+                    domain_aggregated
+                ], dim=1)
 
-        mixed_z = sum(mixed_features)
-        mixed_mu = self.domain_norm(mixed_z, None)
-        mixed_logvar = torch.zeros_like(mixed_mu)
+                # Apply hierarchical mixing
+                level1_mixed = self.hierarchical_level1[i](domain_features)
+                level1_mixed = level1_mixed + domain_attended  # Residual connection
+                level1_features.append(level1_mixed)
 
-        return mixed_z, mixed_mu, mixed_logvar
+            # Final mixing using learned gates
+            gates = F.softmax(self.domain_gates / self.temperature, dim=0)
+            mixed_features = []
+            for i, feat in enumerate(level1_features):
+                mixed_features.append(feat * gates[i])
 
+            mixed_z = sum(mixed_features)
+            mixed_mu = mixed_z.mean(dim=1) if len(mixed_z.shape) > 2 else mixed_z
+            mixed_logvar = mixed_z.var(dim=1) if len(mixed_z.shape) > 2 else torch.zeros_like(mixed_z)
 
-class VAEDecoder(nn.Module):
-    def __init__(self, latent_dim, output_shape, h_dim, w_dim):
-        super().__init__()
-
-        self.latent_dim = latent_dim
-        self.output_shape = output_shape
-
-        # Calculate starting dimensions
-        self.h_dim = h_dim
-        self.w_dim = w_dim
-        self.start_channels = 512
-
-        # Project and reshape
-        self.fc = nn.Linear(latent_dim, self.start_channels * self.h_dim * self.w_dim)
-
-        # Decoder layers - careful to match input dimensions
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(
-                self.start_channels, 256,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                256, 128,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                128, 64,
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-
-            nn.ConvTranspose2d(
-                64, output_shape[0],
-                kernel_size=4, stride=2, padding=1
-            ),
-            nn.Tanh()
-        )
-
-    def forward(self, z):
-        # Project and reshape
-        x = self.fc(z)
-        x = x.view(-1, self.start_channels, self.h_dim, self.w_dim)
-        # Decode
-        x = self.decoder(x)
-        return x
+            return mixed_z, mixed_mu, mixed_logvar
 
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -788,7 +857,6 @@ class CYCLEMIX(Algorithm):
     def predict(self, x):
         mixed_z, _, _ = self.encoder(x)
         return self.classifier(mixed_z)
-
 
 class Fish(Algorithm):
     """
