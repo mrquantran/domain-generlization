@@ -294,17 +294,16 @@ def save_images(x, x_generated, current_epoch):
 
 
 class VAEEncoder(nn.Module):
-    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
+    """VAE Encoder using ResNet50 with ImageNet pretraining"""
 
     def __init__(self, input_shape, latent_dim):
         super(VAEEncoder, self).__init__()
 
-        # MoCo v2 checkpoint URL
-        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
-
-        self.backbone = torchvision.models.resnet50(pretrained=False)
+        # Load pretrained ResNet50 from torchvision
+        self.backbone = torchvision.models.resnet50(
+            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
+        )
         backbone_dim = 2048
-        self._load_moco_weights()
 
         # Handle input channels
         nc = input_shape[0]
@@ -325,24 +324,6 @@ class VAEEncoder(nn.Module):
 
         self._freeze_bn()
 
-    def _load_moco_weights(self):
-        """Load MoCo v2 pretrained weights"""
-        try:
-            checkpoint = load_url(self.moco_v2_path, progress=True)
-            state_dict = checkpoint["state_dict"]
-            new_state_dict = {}
-
-            for k in list(state_dict.keys()):
-                if k.startswith("module.encoder_q."):
-                    new_state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
-
-            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
-
-        except Exception as e:
-            print(f"Error loading MoCo v2 weights: {str(e)}")
-            print("Falling back to random initialization")
-
     def _freeze_bn(self):
         """Freeze BatchNorm layers"""
         for m in self.backbone.modules():
@@ -357,6 +338,7 @@ class VAEEncoder(nn.Module):
         """Override train mode to keep BN frozen"""
         super().train(mode)
         self._freeze_bn()
+        return self
 
 class AdaptiveDomainNorm(nn.Module):
     """Enhanced normalization with batch statistics, domain-specific parameters, and regularization"""
