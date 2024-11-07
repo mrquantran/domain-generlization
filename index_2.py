@@ -1,69 +1,3 @@
-class VAEEncoder(nn.Module):
-    """VAE Encoder using ResNet with MoCo-v2 pretraining"""
-
-    def __init__(self, input_shape, latent_dim):
-        super(VAEEncoder, self).__init__()
-
-        # MoCo v2 checkpoint URL
-        self.moco_v2_path = "https://dl.fbaipublicfiles.com/moco/moco_checkpoints/moco_v2_800ep/moco_v2_800ep_pretrain.pth.tar"
-
-        self.backbone = torchvision.models.resnet50(pretrained=False)
-        backbone_dim = 2048
-        self._load_moco_weights()
-
-        # Handle input channels
-        nc = input_shape[0]
-        if nc != 3:
-            tmp = self.backbone.conv1.weight.data.clone()
-            self.backbone.conv1 = nn.Conv2d(
-                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
-            )
-            for i in range(nc):
-                self.backbone.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
-
-        # Remove FC layer
-        self.backbone.fc = Identity()
-
-        # VAE heads
-        self.fc_mu = nn.Linear(backbone_dim, latent_dim)
-        self.fc_logvar = nn.Linear(backbone_dim, latent_dim)
-
-        self._freeze_bn()
-
-    def _load_moco_weights(self):
-        """Load MoCo v2 pretrained weights"""
-        try:
-            checkpoint = load_url(self.moco_v2_path, progress=True)
-            state_dict = checkpoint["state_dict"]
-            new_state_dict = {}
-
-            for k in list(state_dict.keys()):
-                if k.startswith("module.encoder_q."):
-                    new_state_dict[k[len("module.encoder_q.") :]] = state_dict[k]
-
-            msg = self.backbone.load_state_dict(new_state_dict, strict=False)
-            print(f"Loaded MoCo v2 weights. Missing keys: {msg.missing_keys}")
-
-        except Exception as e:
-            print(f"Error loading MoCo v2 weights: {str(e)}")
-            print("Falling back to random initialization")
-
-    def _freeze_bn(self):
-        """Freeze BatchNorm layers"""
-        for m in self.backbone.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-    def forward(self, x):
-        features = self.backbone(x)
-        return self.fc_mu(features), self.fc_logvar(features)
-
-    def train(self, mode=True):
-        """Override train mode to keep BN frozen"""
-        super().train(mode)
-        self._freeze_bn()
-
-
 class MultiDomainVAEEncoder(nn.Module):
     def __init__(self, input_shape, latent_dim, num_domains):
         super(MultiDomainVAEEncoder, self).__init__()
@@ -82,7 +16,6 @@ class MultiDomainVAEEncoder(nn.Module):
         self.domain_encoders = nn.ModuleList(
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
-        self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
 
         # Multi-head attention projections
         self.q_proj = nn.ModuleList(
@@ -191,21 +124,14 @@ class MultiDomainVAEEncoder(nn.Module):
         x_domains = torch.split(
             x, batch_size
         )  # Split into list of [32, 3, 224, 224] tensors
-        print(f"X_DOMAINS: {len(x_domains)} {x_domains[0].shape}")
         all_mus = []
         all_logvars = []
 
-        if self.training:
-            for i, encoder in enumerate(self.domain_encoders):
-                # Process each domain's data separately
-                mu, logvar = encoder(x_domains[i])
-                all_mus.append(mu)
-                all_logvars.append(logvar)
-        else:
-            for i, encoder in enumerate(self.domain_encoders):
-                mu, logvar = encoder(x)
-                all_mus.append(mu)
-                all_logvars.append(logvar)
+        for i, encoder in enumerate(self.domain_encoders):
+            # Process each domain's data separately
+            mu, logvar = encoder(x_domains[i])
+            all_mus.append(mu)
+            all_logvars.append(logvar)
 
         all_mus = torch.stack(all_mus, dim=1)  # [batch_size, num_domains, latent_dim]
         all_logvars = torch.stack(all_logvars, dim=1)
@@ -244,9 +170,55 @@ class MultiDomainVAEEncoder(nn.Module):
         mixed_mu = mixed_z.mean(dim=0)  # [latent_dim]
         mixed_logvar = mixed_z.var(dim=0).log()
 
-        print(f"MIXED Z: {mixed_z.shape}")
-
         return mixed_z, mixed_mu, mixed_logvar
+
+
+class GeneralizedEncoder(nn.Module):
+    def __init__(self, input_shape, latent_dim):
+        super(GeneralizedEncoder, self).__init__()
+
+        print("Using ResNet50")
+        self.network = torchvision.models.resnet50(pretrained=False)
+        self.latent_dim = latent_dim
+
+        # adapt number of channels
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.network.conv1.weight.data.clone()
+
+            self.network.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+            )
+
+            for i in range(nc):
+                self.network.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # save memory
+        del self.network.fc
+        self.network.fc = nn.Linear(
+            2048, latent_dim
+        )  # Change to output latent_dim dimension
+
+        self.freeze_bn()
+
+    def forward(self, x):
+        """Encode x into a feature vector of size [batch_size, latent_dim]."""
+        features = self.network(x)
+        return features.view(
+            features.size(0), -1
+        )  # Reshape to [batch_size, latent_dim]
+
+    def train(self, mode=True):
+        """
+        Override the default train() to freeze the BN parameters
+        """
+        super().train(mode)
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        for m in self.network.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
 
 
 class CYCLEMIX(Algorithm):
@@ -268,6 +240,12 @@ class CYCLEMIX(Algorithm):
         self.encoder = MultiDomainVAEEncoder(
             input_shape=input_shape, latent_dim=self.latent_dim, num_domains=num_domains
         )
+
+        self.generalized_encoder = GeneralizedEncoder(
+            input_shape=input_shape, latent_dim=self.latent_dim
+        )
+
+        self.temperature = hparams.get("temperature", 2.0)
 
         # Giữ nguyên các components khác
         self.decoder = VAEDecoder(
@@ -295,40 +273,35 @@ class CYCLEMIX(Algorithm):
         # Optimizer và scheduling giữ nguyên
         self.optimizer = torch.optim.Adam(
             list(self.encoder.parameters())
-            + list(self.decoder.parameters())
             + list(self.classifier.parameters())
             + [self.domain_embeddings],
             lr=hparams["lr"],
             weight_decay=hparams["weight_decay"],
         )
 
-        steps_per_epoch = hparams["steps_per_epoch"]
-        num_epochs = hparams["num_epochs"]
-        total_steps = int(steps_per_epoch * num_epochs)
-
-        self.total_steps = total_steps
-
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=hparams["lr"] * 10,
-            total_steps=self.total_steps,
-            three_phase=False,
+        self.generalized_encoder_optimizer = torch.optim.Adam(
+            list(self.generalized_encoder.parameters()),
+            lr=hparams["lr"],
+            weight_decay=hparams["weight_decay"],
         )
+
+        # steps_per_epoch = hparams["steps_per_epoch"]
+        # num_epochs = hparams["num_epochs"]
+        # total_steps = int(steps_per_epoch * num_epochs)
+
+        # self.total_steps = total_steps
+
+        # self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        #     self.optimizer,
+        #     max_lr=hparams["lr"] * 10,
+        #     total_steps=self.total_steps,
+        #     three_phase=False,
+        # )
 
         self.current_epoch = 0
         self.grad_scaler = torch.amp.GradScaler("cuda")
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
-        """
-        Compute VAE loss with MMD (Maximum Mean Discrepancy) for better domain generalization
-        Args:
-            x: Input data
-            recon_x: Reconstructed data
-            mu: Mean of latent distribution
-            logvar: Log variance of latent distribution
-        Returns:
-            Total loss combining reconstruction loss and MMD loss
-        """
         # Reconstruction loss (MSE for continuous data)
         recon_loss = F.mse_loss(recon_x, x, reduction="mean")
 
@@ -337,45 +310,57 @@ class CYCLEMIX(Algorithm):
 
         return total_loss
 
+    def compute_distillation_loss(self, student_features, teacher_features):
+        """Knowledge distillation loss"""
+        return F.kl_div(
+            F.log_softmax(student_features / self.temperature, dim=-1),
+            F.softmax(teacher_features / self.temperature, dim=-1),
+            reduction="batchmean",
+        ) * (self.temperature**2)
+
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
+        class_loss = 0.0
+        distill_loss = 0.0
         # Forward pass
         with torch.amp.autocast("cuda"):
             mixed_z, mu, logvar = self.encoder(all_x)
 
-            recon_x = self.decoder(mixed_z)
+            # recon_x = self.decoder(mixed_z)
 
-            if self.current_epoch % 100 == 0:
-                save_images(all_x, recon_x, self.current_epoch)
+            # if self.current_epoch % 100 == 0:
+            #     save_images(all_x, recon_x, self.current_epoch)
+
+            gen_features = self.generalized_encoder(all_x)
+
+            distill_loss = self.compute_distillation_loss(
+                gen_features, mixed_z.detach()
+            )
 
             # Compute losses
             class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-            vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
+            # vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
 
-            # Combined loss với dynamic weighting
-            total_loss = class_loss + vae_loss
-
+        # Train classifier
         self.optimizer.zero_grad()
-        self.grad_scaler.scale(total_loss).backward()
+        class_loss.backward()
+        self.optimizer.step()
 
-        # Gradient clipping
-        self.grad_scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+        # Train encoder
+        self.generalized_encoder_optimizer.zero_grad()
+        distill_loss.backward()
+        self.generalized_encoder_optimizer.step()
 
-        # Optimizer step with gradient scaling
-        self.grad_scaler.step(self.optimizer)
-        self.grad_scaler.update()
-        self.scheduler.step()
+        # self.scheduler.step()
         self.current_epoch += 1
 
         return {
-            "loss": total_loss.item(),
-            "vae_loss": vae_loss.item(),
+            "distill_loss": distill_loss.item(),
             "class_loss": class_loss.item(),
         }
 
     def predict(self, x):
-        mixed_z, _, _ = self.encoder(x)
+        mixed_z = self.generalized_encoder(x)
         return self.classifier(mixed_z)

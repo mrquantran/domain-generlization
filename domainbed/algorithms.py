@@ -473,7 +473,6 @@ class MultiDomainVAEEncoder(nn.Module):
         self.domain_encoders = nn.ModuleList(
             [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
         )
-        self.domain_norm = AdaptiveDomainNorm(latent_dim, num_domains)
 
         # Multi-head attention projections
         self.q_proj = nn.ModuleList([
@@ -573,21 +572,14 @@ class MultiDomainVAEEncoder(nn.Module):
         # Split x into domains
         batch_size = x.shape[0] // self.num_domains  # 96 // 3 = 32
         x_domains = torch.split(x, batch_size)  # Split into list of [32, 3, 224, 224] tensors
-        print(f'X_DOMAINS: {len(x_domains)} {x_domains[0].shape}')
         all_mus = []
         all_logvars = []
 
-        if self.training:
-            for i, encoder in enumerate(self.domain_encoders):
-                # Process each domain's data separately
-                mu, logvar = encoder(x_domains[i])
-                all_mus.append(mu)
-                all_logvars.append(logvar)
-        else:
-            for i, encoder in enumerate(self.domain_encoders):
-                mu, logvar = encoder(x)
-                all_mus.append(mu)
-                all_logvars.append(logvar)
+        for i, encoder in enumerate(self.domain_encoders):
+            # Process each domain's data separately
+            mu, logvar = encoder(x_domains[i])
+            all_mus.append(mu)
+            all_logvars.append(logvar)
 
         all_mus = torch.stack(all_mus, dim=1)     # [batch_size, num_domains, latent_dim]
         all_logvars = torch.stack(all_logvars, dim=1)
@@ -622,9 +614,50 @@ class MultiDomainVAEEncoder(nn.Module):
         mixed_mu = mixed_z.mean(dim=0)  # [latent_dim]
         mixed_logvar = mixed_z.var(dim=0).log()
 
-        print(f'MIXED Z: {mixed_z.shape}')
-
         return mixed_z, mixed_mu, mixed_logvar
+
+class GeneralizedEncoder(nn.Module):
+    def __init__(self, input_shape, latent_dim):
+        super(GeneralizedEncoder, self).__init__()
+
+        print('Using ResNet50')
+        self.network = torchvision.models.resnet50(pretrained=False)
+        self.latent_dim = latent_dim
+
+        # adapt number of channels
+        nc = input_shape[0]
+        if nc != 3:
+            tmp = self.network.conv1.weight.data.clone()
+
+            self.network.conv1 = nn.Conv2d(
+                nc, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False
+            )
+
+            for i in range(nc):
+                self.network.conv1.weight.data[:, i, :, :] = tmp[:, i % 3, :, :]
+
+        # save memory
+        del self.network.fc
+        self.network.fc = nn.Linear(2048, latent_dim)  # Change to output latent_dim dimension
+
+        self.freeze_bn()
+
+    def forward(self, x):
+        """Encode x into a feature vector of size [batch_size, latent_dim]."""
+        features = self.network(x)
+        return features.view(features.size(0), -1)  # Reshape to [batch_size, latent_dim]
+
+    def train(self, mode=True):
+        """
+        Override the default train() to freeze the BN parameters
+        """
+        super().train(mode)
+        self.freeze_bn()
+
+    def freeze_bn(self):
+        for m in self.network.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
 
 class CYCLEMIX(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
@@ -647,6 +680,13 @@ class CYCLEMIX(Algorithm):
             latent_dim=self.latent_dim,
             num_domains=num_domains
         )
+
+        self.generalized_encoder = GeneralizedEncoder(
+            input_shape=input_shape,
+            latent_dim=self.latent_dim
+        )
+
+        self.temperature = hparams.get('temperature', 2.0)
 
         # Giữ nguyên các components khác
         self.decoder = VAEDecoder(
@@ -676,40 +716,35 @@ class CYCLEMIX(Algorithm):
         # Optimizer và scheduling giữ nguyên
         self.optimizer = torch.optim.Adam(
             list(self.encoder.parameters()) +
-            list(self.decoder.parameters()) +
             list(self.classifier.parameters()) +
             [self.domain_embeddings],
             lr=hparams["lr"],
             weight_decay=hparams["weight_decay"]
         )
 
-        steps_per_epoch = hparams["steps_per_epoch"]
-        num_epochs = hparams["num_epochs"]
-        total_steps = int(steps_per_epoch * num_epochs)
-
-        self.total_steps = total_steps
-
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=hparams["lr"] * 10,
-            total_steps=self.total_steps,
-            three_phase=False,
+        self.generalized_encoder_optimizer = torch.optim.Adam(
+            list(self.generalized_encoder.parameters()),
+            lr=hparams["lr"],
+            weight_decay=hparams["weight_decay"]
         )
+
+        # steps_per_epoch = hparams["steps_per_epoch"]
+        # num_epochs = hparams["num_epochs"]
+        # total_steps = int(steps_per_epoch * num_epochs)
+
+        # self.total_steps = total_steps
+
+        # self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        #     self.optimizer,
+        #     max_lr=hparams["lr"] * 10,
+        #     total_steps=self.total_steps,
+        #     three_phase=False,
+        # )
 
         self.current_epoch = 0
         self.grad_scaler = torch.amp.GradScaler('cuda')
 
     def compute_vae_loss(self, x, recon_x, mu, logvar):
-        """
-        Compute VAE loss with MMD (Maximum Mean Discrepancy) for better domain generalization
-        Args:
-            x: Input data
-            recon_x: Reconstructed data
-            mu: Mean of latent distribution
-            logvar: Log variance of latent distribution
-        Returns:
-            Total loss combining reconstruction loss and MMD loss
-        """
         # Reconstruction loss (MSE for continuous data)
         recon_loss = F.mse_loss(recon_x, x, reduction='mean')
 
@@ -718,158 +753,67 @@ class CYCLEMIX(Algorithm):
 
         return total_loss
 
+    def compute_distillation_loss(self, student_features, teacher_features):
+            """Knowledge distillation loss"""
+            return F.kl_div(
+                F.log_softmax(student_features / self.temperature, dim=-1),
+                F.softmax(teacher_features / self.temperature, dim=-1),
+                reduction='batchmean'
+            ) * (self.temperature ** 2)
+
     def update(self, minibatches, unlabeled=None):
         all_x = torch.cat([x for x, y in minibatches])
         all_y = torch.cat([y for x, y in minibatches])
 
+        class_loss = 0.0
+        distill_loss = 0.0
         # Forward pass
+        mixed_acc = 0.0
+        total_distill_loss = 0.0
         with torch.amp.autocast('cuda'):
             mixed_z, mu , logvar = self.encoder(all_x)
 
-            recon_x = self.decoder(mixed_z)
+            # recon_x = self.decoder(mixed_z)
 
-            if self.current_epoch % 100 == 0:
-                save_images(all_x, recon_x, self.current_epoch)
+            # if self.current_epoch % 100 == 0:
+            #     save_images(all_x, recon_x, self.current_epoch)
+
+            gen_features = self.generalized_encoder(all_x)
+
+            distill_loss = self.compute_distillation_loss(gen_features, mixed_z.detach())
 
             # Compute losses
             class_loss = F.cross_entropy(self.classifier(mixed_z), all_y)
-            vae_loss = self.compute_vae_loss(all_x, recon_x, mu, logvar)
+            class_distill_loss = F.cross_entropy(self.classifier(gen_features), all_y)
 
-            # Combined loss với dynamic weighting
-            total_loss = (
-                class_loss
-                + vae_loss
-            )
+            mixed_acc = (self.classifier(mixed_z).argmax(dim=1) == all_y).float().mean()
+            mixed_distill_acc = (self.classifier(gen_features).argmax(dim=1) == all_y).float().mean()
 
+            total_distill_loss = class_distill_loss + distill_loss
+
+        # Train classifier
         self.optimizer.zero_grad()
-        self.grad_scaler.scale(total_loss).backward()
+        class_loss.backward(retain_graph=True)
+        self.optimizer.step()
 
-        # Gradient clipping
-        self.grad_scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+        # Train encoder
+        self.generalized_encoder_optimizer.zero_grad()
+        total_distill_loss.backward(retain_graph=True)
+        self.generalized_encoder_optimizer.step()
 
-        # Optimizer step with gradient scaling
-        self.grad_scaler.step(self.optimizer)
-        self.grad_scaler.update()
-        self.scheduler.step()
+        # self.scheduler.step()
         self.current_epoch += 1
 
         return {
-            "loss": total_loss.item(),
-            "vae_loss": vae_loss.item(),
+            "distill_loss": distill_loss.item(),
             "class_loss": class_loss.item(),
+            "mixed_acc": mixed_acc.item(),
+            "mixed_distill_acc": mixed_distill_acc.item()
         }
 
     def predict(self, x):
-        mixed_z, _, _ = self.encoder(x)
+        mixed_z = self.generalized_encoder(x)
         return self.classifier(mixed_z)
-        class GeneralizedEncoder(nn.Module):
-            def __init__(self, input_shape, latent_dim, num_domains, encoders):
-                super(GeneralizedEncoder, self).__init__()
-                self.encoders = nn.ModuleList(encoders)
-                self.attention = nn.Sequential(
-                    nn.Linear(latent_dim, latent_dim),
-                    nn.ReLU(),
-                    nn.Linear(latent_dim, num_domains),
-                    nn.Softmax(dim=-1)
-                )
-
-            def forward(self, x):
-                # Get latent representations from all encoders
-                latent_representations = [encoder(x) for encoder in self.encoders]
-                latent_representations = torch.stack(latent_representations, dim=1)  # Shape: [batch_size, num_domains, latent_dim]
-
-                # Compute attention weights
-                attention_weights = self.attention(latent_representations.mean(dim=1))  # Shape: [batch_size, num_domains]
-
-                # Weighted sum of latent representations
-                weighted_latent = torch.sum(attention_weights.unsqueeze(-1) * latent_representations, dim=1)  # Shape: [batch_size, latent_dim]
-
-                return weighted_latent
-
-        # Example usage
-        input_shape = (3, 224, 224)
-        latent_dim = 512
-        num_domains = 3
-        encoders = [VAEEncoder(input_shape, latent_dim) for _ in range(num_domains)]
-        generalized_encoder = GeneralizedEncoder(input_shape, latent_dim, num_domains, encoders)
-
-        # Replace the original encoder with the generalized encoder in CYCLEMIX
-        class CYCLEMIX(Algorithm):
-            def __init__(self, input_shape, num_classes, num_domains, hparams):
-                super(CYCLEMIX, self).__init__(input_shape, num_classes, num_domains, hparams)
-
-                self.input_shape = input_shape
-                self.latent_dim = hparams.get("latent_dim", 512)
-                self.beta = hparams.get("beta", 4.0)
-                self.grad_clip = hparams.get("grad_clip", 1.0)
-
-                self.h_dim = input_shape[1] // 16
-                self.w_dim = input_shape[2] // 16
-
-                # Use GeneralizedEncoder
-                encoders = [VAEEncoder(input_shape, self.latent_dim) for _ in range(num_domains)]
-                self.encoder = GeneralizedEncoder(input_shape, self.latent_dim, num_domains, encoders)
-
-                self.decoder = VAEDecoder(
-                    latent_dim=self.latent_dim,
-                    output_shape=input_shape,
-                    h_dim=self.h_dim,
-                    w_dim=self.w_dim
-                )
-
-                self.domain_embeddings = nn.Parameter(
-                    torch.randn(num_domains, self.latent_dim)
-                )
-
-                self.classifier = nn.Sequential(
-                    nn.Unflatten(1, (self.latent_dim, 1)),
-                    nn.Conv1d(self.latent_dim, 512, kernel_size=1),
-                    nn.BatchNorm1d(512),
-                    nn.ReLU(),
-                    nn.Conv1d(512, 256, kernel_size=1),
-                    nn.BatchNorm1d(256),
-                    nn.ReLU(),
-                    nn.Conv1d(256, num_classes, kernel_size=1),
-                    nn.AdaptiveAvgPool1d(1),
-                    nn.Flatten(),
-                )
-
-                self.optimizer = torch.optim.Adam(
-                    list(self.encoder.parameters()) +
-                    list(self.decoder.parameters()) +
-                    list(self.classifier.parameters()) +
-                    [self.domain_embeddings],
-                    lr=hparams["lr"],
-                    weight_decay=hparams["weight_decay"]
-                )
-
-                steps_per_epoch = hparams["steps_per_epoch"]
-                num_epochs = hparams["num_epochs"]
-                total_steps = int(steps_per_epoch * num_epochs)
-
-                self.total_steps = total_steps
-
-                self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                    self.optimizer,
-                    max_lr=hparams["lr"] * 10,
-                    total_steps=self.total_steps,
-                    three_phase=False,
-                )
-
-                self.current_epoch = 0
-                self.grad_scaler = torch.amp.GradScaler('cuda')
-
-            def compute_vae_loss(self, x, recon_x, mu, logvar):
-                recon_loss = F.mse_loss(recon_x, x, reduction='mean')
-                total_loss = recon_loss
-                return total_loss
-
-            def update(self, minibatches, unlabeled=None):
-                all_x = torch.cat([x for x, y in minibatches])
-                all_y = torch.cat([y for x, y in minibatches])
-
-                with
 
 class Fish(Algorithm):
     """

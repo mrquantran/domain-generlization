@@ -308,15 +308,19 @@ if __name__ == "__main__":
                 mean_out_acc = np.mean([results[key] for key in out_acc_keys])
                 results["mean_out_acc"] = mean_out_acc
 
-            misc.print_row(["out_acc"] + [results[key] for key in out_acc_keys], colwidth=12)
+            out_loss_acc_keys = [key for key in results_keys if key.endswith("_loss_acc")]
+            if out_loss_acc_keys:
+                mean_out_loss_acc = np.mean([results[key] for key in out_loss_acc_keys])
+                results["mean_out_loss_acc"] = mean_out_loss_acc
 
+            misc.print_row(["out_acc"] + [results[key] for key in out_acc_keys], colwidth=12)
+            misc.print_row(["out_loss_acc"] + [results[key] for key in out_loss_acc_keys], colwidth=12)
             out_acc_keys = [key for key in results_keys if key.endswith("loss")]
             misc.print_row(["name"] + out_acc_keys, colwidth=12)
             misc.print_row(["loss"] + [results[key] for key in out_acc_keys], colwidth=12)
             misc.print_row(["mean_out_acc", mean_out_acc], colwidth=12)
 
             results.update({"hparams": hparams, "args": vars(args)})
-            total_loss = results["loss"]
 
             epochs_path = os.path.join(args.output_dir, "results.jsonl")
             with open(epochs_path, "a") as f:
@@ -329,20 +333,20 @@ if __name__ == "__main__":
             if args.save_model_every_checkpoint:
                 save_checkpoint(f"model_step{step}.pkl")
 
-            # Early stopping mechanism based on loss
-            if 'best_acc' not in globals():
-                best_acc = float('-inf')
-                patience_counter = 0
+            # # Early stopping mechanism based on loss
+            # if 'best_acc' not in globals():
+            #     best_acc = float('-inf')
+            #     patience_counter = 0
 
-            if mean_out_acc > best_acc:
-                best_acc = mean_out_acc
-                patience_counter = 0
-            else:
-                patience_counter += 1
+            # if mean_out_acc > best_acc:
+            #     best_acc = mean_out_acc
+            #     patience_counter = 0
+            # else:
+            #     patience_counter += 1
 
-            if patience_counter >= 101:
-                misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
-                break
+            # if patience_counter >= 101:
+            #     misc.print_row(['Early stopping at step {}'.format(step)], colwidth=12)
+            #     break
 
     save_checkpoint("model.pkl")
 
