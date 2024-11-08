@@ -9,6 +9,7 @@ from torchvision import transforms
 import torchvision
 from torchvision.transforms import v2
 from torchvision.utils import save_image
+from PIL import Image
 import copy
 import numpy as np
 from collections import OrderedDict
@@ -103,37 +104,102 @@ class Algorithm(torch.nn.Module):
         raise NotImplementedError
 
 
+# class ERM(Algorithm):
+#     """
+#     Empirical Risk Minimization (ERM)
+#     """
+
+#     def __init__(self, input_shape, num_classes, num_domains, hparams):
+#         super(ERM, self).__init__(input_shape, num_classes, num_domains, hparams)
+#         self.featurizer = networks.Featurizer(input_shape, self.hparams)
+#         self.classifier = networks.Classifier(
+#             self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
+#         )
+
+#         self.network = nn.Sequential(self.featurizer, self.classifier)
+#         self.optimizer = torch.optim.Adam(
+#             self.network.parameters(),
+#             lr=self.hparams["lr"],
+#             weight_decay=self.hparams["weight_decay"],
+#         )
+
+#     def update(self, minibatches, unlabeled=None):
+#         all_x = torch.cat([x for x, y in minibatches])
+#         all_y = torch.cat([y for x, y in minibatches])
+#         loss = F.cross_entropy(self.predict(all_x), all_y)
+
+#         self.optimizer.zero_grad()
+#         loss.backward()
+#         self.optimizer.step()
+
+#         return {"loss": loss.item()}
+
+#     def predict(self, x):
+#         return self.network(x)
+
+import cv2
+from transformers import pipeline
+
+
 class ERM(Algorithm):
     """
-    Empirical Risk Minimization (ERM)
+    An algorithm that incorporates segmentation using SAM before feature extraction and classification.
     """
 
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(ERM, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+        # Initialize SAM model
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.sam = pipeline("segmentation", model="facebook/sam-vit-base")
+
         self.featurizer = networks.Featurizer(input_shape, self.hparams)
         self.classifier = networks.Classifier(
             self.featurizer.n_outputs, num_classes, self.hparams["nonlinear_classifier"]
         )
 
         self.network = nn.Sequential(self.featurizer, self.classifier)
+
+        # Optimizer
         self.optimizer = torch.optim.Adam(
-            self.network.parameters(),
-            lr=self.hparams["lr"],
-            weight_decay=self.hparams["weight_decay"],
+            self.parameters(),
+            lr=hparams['lr'],
+            weight_decay=hparams['weight_decay']
         )
 
-    def update(self, minibatches, unlabeled=None):
-        all_x = torch.cat([x for x, y in minibatches])
-        all_y = torch.cat([y for x, y in minibatches])
-        loss = F.cross_entropy(self.predict(all_x), all_y)
+    def preprocess(self, x):
+        # Apply SAM segmentation to each image in the batch
+        segmented_images = []
+        for img in x:
+            img_pil = transforms.ToPILImage()(img.cpu())
+            masks = self.sam(img_pil)
+            mask = masks[0]['mask']  # Assuming we use the first mask
+            mask_tensor = transforms.ToTensor()(mask).to(self.device)
+            segmented_images.append(mask_tensor)
+        return torch.stack(segmented_images)
 
+    def update(self, minibatches, unlabeled=None):
+        all_x = torch.cat([x for x, _ in minibatches])
+        all_y = torch.cat([y for _, y in minibatches])
+
+        all_x = self.preprocess(all_x)  # [batch_size, 1, height, width]
+
+        # Forward pass through feature extractor and classifier
+        features = self.featurizer(all_x)
+        logits = self.classifier(features)
+
+        # Compute loss
+        loss = F.cross_entropy(logits, all_y)
+
+        # Backward pass and optimization
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        return {"loss": loss.item()}
+        return {'loss': loss.item()}
 
     def predict(self, x):
+        x = self.preprocess(x)
         return self.network(x)
 
 
